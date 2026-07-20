@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: Apache-2.0
+# cargo-deny configuration for sashite-sanki-arbiter-nostr-bot.
+# Config schema version 2 (cargo-deny >= 0.18). Run: `cargo deny check`.
+
+[advisories]
+version = 2
+# Fail on yanked crates. Vulnerabilities and unmaintained advisories fail by
+# default (config version 2); listed exceptions go in `ignore` below.
+yanked = "deny"
+ignore = [
+    # `instant` is unmaintained, but it is pulled in only transitively through
+    # `nostr`'s wasm/time path and cannot be swapped out from here. Revisit and
+    # remove this entry once `nostr` no longer depends on it.
+    "RUSTSEC-2024-0384",
+]
+
+[licenses]
+version = 2
+# Permissive licenses present in the dependency tree. Every OR-expression is
+# already satisfied by MIT / Apache-2.0; the remaining entries are *required*
+# (sole license, or one side of an AND), so they are listed explicitly:
+#   ISC                 -> ring ("Apache-2.0 AND ISC"), rustls-webpki
+#   Unicode-3.0         -> unicode-ident, icu_* (ICU data tables)
+#   BSD-3-Clause        -> instant
+#   CC0-1.0             -> bip39 / bitcoin_hashes family
+#   CDLA-Permissive-2.0 -> webpki-roots
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+# This crate is itself Apache-2.0 and is not published; skip licensing it.
+private = { ignore = true }
+
+[bans]
+# Duplicate versions are common across the nostr / rustls tree; surface them as
+# a warning rather than failing the build.
+multiple-versions = "warn"
+# Reject wildcard ("*") version requirements in our own manifest.
+wildcards = "deny"
+
+[sources]
+# All dependencies must resolve from crates.io; reject unknown registries/git.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

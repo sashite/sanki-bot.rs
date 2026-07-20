@@ -1,0 +1,81 @@
+# Sashité player fleet — EXAMPLE configuration (safe to commit; the real file
+# is not). Copy it OUTSIDE every git repository, fill it in, and point the
+# service at it:
+#
+#   cp fleet.example.toml ~/sanki-e2e/fleet.local.toml
+#   $EDITOR ~/sanki-e2e/fleet.local.toml
+#   set -a; source ~/sanki-e2e/bots.local.env; set +a
+#   FLEET_CONFIG_PATH=~/sanki-e2e/fleet.local.toml cargo run --bin players
+#
+# Keys are referenced by ENVIRONMENT VARIABLE NAME (`nsec_env`) — the file
+# itself never holds a secret. Generate production keys with `nak key generate`
+# and store them in the shared bots.local.env.
+
+[fleet]
+relay_url  = "ws://localhost:8080"
+matchmaker = "<matchmaker hex pubkey>"
+arbiter    = "<arbiter hex pubkey>"
+game       = "sanki"
+max_concurrent_bot_vs_bot = 3
+# The relay's NIP-13 minimum on player kinds (10 in production; 0 for a dev
+# relay that does not enforce PoW).
+pow_difficulty = 0
+
+[[bot]]
+name     = "kaoru"
+nsec_env = "PLAYER_NSEC_KAORU"
+
+  [bot.profile]
+  display_name = "Kaoru"
+  about        = "Ōgi enthusiast. Osaka evenings. (bot)"
+  # picture    = "https://…"
+
+  [bot.play]
+  variants        = { ogi = 0.8, chess = 0.15, xiongqi = 0.05 }
+  time_controls   = [
+    { spec = [["0", "10", "1"]], weight = 0.7 },   # 10 s / move
+    { spec = [["300", "3"]],     weight = 0.3 },   # 5 + 3 Fischer
+  ]
+  max_live            = 1
+  max_correspondence  = 4
+  strength            = { time_ms = 2000, depth = 6 }
+  resign_threshold    = -700
+  draw_offer          = "balanced"   # never | balanced | eager
+  challenge_policy    = "everyone"
+
+  [bot.schedule]
+  timezone = "Asia/Tokyo"
+  windows  = [{ days = "mon-sun", from = "20:30", to = "23:30" }]
+  jitter_minutes = 25
+  presence_probability = 0.85
+
+  [bot.tempo]
+  think = { median_s = 3.0, sigma = 0.6 }
+  correspondence_think = { median_s = 14400, sigma = 0.9 }
+
+[[bot]]
+name     = "lucie"
+nsec_env = "PLAYER_NSEC_LUCIE"
+
+  [bot.profile]
+  display_name = "Lucie"
+  about        = "Blitz chess, Paris nights. (bot)"
+
+  [bot.play]
+  variants        = { chess = 0.9, xiongqi = 0.1 }
+  time_controls   = [
+    { spec = [["300", "3"]], weight = 1.0 },
+  ]
+  strength            = { time_ms = 1200, depth = 5 }
+  resign_threshold    = -600
+  draw_offer          = "eager"
+
+  [bot.schedule]
+  timezone = "Europe/Paris"
+  windows  = [{ days = "mon-sun", from = "21:00", to = "23:59" }]
+  jitter_minutes = 15
+  presence_probability = 0.9
+
+  [bot.tempo]
+  think = { median_s = 2.0, sigma = 0.5 }
+  correspondence_think = { median_s = 7200, sigma = 0.8 }

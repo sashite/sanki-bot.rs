@@ -1,0 +1,46 @@
+[package]
+name = "sashite-sanki-player-nostr-bot"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/sashite/sanki-player-nostr-bot.rs"
+description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014). One supervisor, N personas — pool courtship (kind 6418), direct-challenge acceptance (6420/6421), full session play (6423) with clock discipline, predictive arbiter invocation (6424) — over the pure crates: sashite-sanki-engine (rules), sashite-sanki-arbiter (chain and clocks), sashite-sanki-player (move choice)."
+# Internal service, not a library for crates.io.
+publish = false
+
+# Short binary name (`cargo run` / `players`) while the package keeps the
+# descriptive name.
+[[bin]]
+name = "players"
+path = "src/main.rs"
+
+[dependencies]
+# Networking client; bundles `nostr` 0.44 (Event, EventBuilder, Tag, Kind, Keys, …).
+nostr-sdk = "0.44"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Timezone-aware presence windows (personas live in their own timezones).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+
+# The pure crates: rules, protocol semantics, move decision. The bot maps relay
+# events into their types and never reimplements game or protocol semantics
+# (ADR-0014 §Chain and clock logic).
+sashite-sanki-engine = "0.5"
+sashite-sanki-arbiter = "0.8"
+sashite-sanki-player = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
