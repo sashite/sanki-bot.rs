@@ -807,12 +807,15 @@ fn invocation_decision(
     match verdict.status() {
         // A rule-system ending reached by the chain: either player may
         // safely invoke — ratify whatever the outcome (it is already fact).
+        // `MoveCap` is the absolute 600-half-move draw (engine 0.6), last in
+        // the terminal order and just as ratifiable as the other rule endings.
         Status::Checkmate
         | Status::Stalemate
         | Status::NoMove
         | Status::Insufficient
         | Status::Repetition
-        | Status::MoveLimit => Some(Invocation::Ratify),
+        | Status::MoveLimit
+        | Status::MoveCap => Some(Invocation::Ratify),
         // Timeout: invoke only as the winner (publishing early risks
         // resigning; the loser never hurries their own flag).
         Status::Timeout => i_win.then_some(Invocation::WinOnTime),

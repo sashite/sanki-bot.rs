@@ -1,6 +1,6 @@
 [package]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -31,9 +31,9 @@ chrono-tz = "0.10"
 # The pure crates: rules, protocol semantics, move decision. The bot maps relay
 # events into their types and never reimplements game or protocol semantics
 # (ADR-0014 §Chain and clock logic).
-sashite-sanki-engine = "0.5"
-sashite-sanki-arbiter = "0.8"
-sashite-sanki-player = "0.1"
+sashite-sanki-engine = "0.6"
+sashite-sanki-arbiter = "0.9"
+sashite-sanki-player = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"

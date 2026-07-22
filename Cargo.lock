@@ -1141,18 +1141,18 @@ checksum = "7344dcd33c42046e032b0616065ea4016243fed770eb5854eccf941e8b02169e"
 
 [[package]]
 name = "sashite-sanki-arbiter"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a968d1780814e706ba57ced4b0e4888f4150d3c4ae94cf134c71538f15e0ef96"
+checksum = "fc6115aea628075bb8ec7d5a2b74307f6924d8ca0a1d367233e6c4dc1ff3c3f1"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-engine"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b361a4eec175aa1870877cc5eac07ff97b988f1856c000737a2394cc2a3b030"
+checksum = "b5d5b95ac166cdf47c055e4da9f55987399c91613c74a533cf644a92e4fc1d7a"
 dependencies = [
  "sashite-epin",
  "sashite-feen",
@@ -1164,16 +1164,16 @@ dependencies = [
 
 [[package]]
 name = "sashite-sanki-player"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcf97232b619ac4c1929d740b26eed1b3774170912488255c55fc2e07e87534"
+checksum = "523db91662c3a0c5a666418b562f2ae515aa5f7fdae859be6bda2a1a1684926f"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",

@@ -3,6 +3,20 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.0] — 2026-07-22
+
+### Changed
+
+- **Dependencies brought to the movecap release** (2026-07-22):
+  `sashite-sanki-engine` 0.5 → **0.6**, `sashite-sanki-arbiter` 0.8 → **0.9**,
+  `sashite-sanki-player` 0.1 → **0.2**.
+- **Predictive invocation now ratifies the `movecap` draw.** The engine's new
+  absolute 300-move (600-half-move) cap terminates as `Status::MoveCap`; the
+  invocation policy (`actor.rs`) folds it into the "rule-system ending → ratify"
+  arm, so a persona that plays a game to the cap invokes the arbiter to ratify
+  the draw, exactly as it does for the 50-move `movelimit`, threefold
+  repetition, and insufficiency.
+
 ## [0.1.0] — 2026-07-20
 
 ### Added
