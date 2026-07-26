@@ -39,6 +39,54 @@ pub fn event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
     marked_value(event, "e", marker).and_then(|v| EventId::parse(v).ok())
 }
 
+/// The event id of the `e` tag carrying the given marker, when the event carries
+/// **exactly one** such tag and its id parses — the shape a specification's
+/// "exactly one" requirement demands (e.g. a Rematch Offer's `concluded_by`,
+/// kind `6430` §Semantic constraints). `None` when the marker is absent,
+/// repeated, or carried by a tag whose id is missing or unparseable; a repeated
+/// marker is a malformation [`event_with_marker`] (first match wins) would let
+/// through.
+pub fn sole_event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
+    let mut marked = event.tags.iter().filter_map(|tag| {
+        let s = tag.as_slice();
+        if s.first().map(String::as_str) == Some("e")
+            && s.get(3).map(String::as_str) == Some(marker)
+        {
+            Some(s.get(1).map_or("", String::as_str))
+        } else {
+            None
+        }
+    });
+    let only = marked.next()?;
+    if marked.next().is_some() {
+        return None; // repeated marker: not "exactly one"
+    }
+    EventId::parse(only).ok()
+}
+
+/// Every event id of `e` tags carrying the given marker, in tag order — e.g. the
+/// **two** `rematch_offer`-marked tags of a rematch-founded Game Session (kind
+/// `6422` §Founding reference). `None` if any marked tag's id is missing or
+/// unparseable, so a caller checking "exactly N" against the returned length
+/// never sees a malformed reference silently drop out of the count.
+pub fn events_with_marker(event: &Event, marker: &str) -> Option<Vec<EventId>> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let s = tag.as_slice();
+            if s.first().map(String::as_str) == Some("e")
+                && s.get(3).map(String::as_str) == Some(marker)
+            {
+                Some(s.get(1).map_or("", String::as_str))
+            } else {
+                None
+            }
+        })
+        .map(|v| EventId::parse(v).ok())
+        .collect()
+}
+
 /// The event id of the first `e` tag, regardless of marker. Used for references
 /// that carry no marker, such as the Accepted Challenge's pointer to its Direct
 /// Challenge.
@@ -238,6 +286,94 @@ mod tests {
         assert_eq!(pubkey_with_role(&event, "timestamper"), None);
         assert_eq!(event_with_marker(&event, "game_session"), Some(gs));
         assert_eq!(event_with_marker(&event, "triggered_by"), None);
+    }
+
+    #[test]
+    fn sole_marker_requires_exactly_one_parseable_reference() {
+        let signer = keys();
+        let adjudication = an_event_id();
+        let other = an_event_id();
+
+        // Exactly one: read.
+        let one = signed(vec![e_marked(&adjudication, "concluded_by")], &signer);
+        assert_eq!(
+            sole_event_with_marker(&one, "concluded_by"),
+            Some(adjudication)
+        );
+        // Absent: none.
+        assert_eq!(sole_event_with_marker(&one, "rematch_of"), None);
+
+        // Repeated: none — where `event_with_marker` would take the first.
+        let two = signed(
+            vec![
+                e_marked(&adjudication, "concluded_by"),
+                e_marked(&other, "concluded_by"),
+            ],
+            &signer,
+        );
+        assert_eq!(sole_event_with_marker(&two, "concluded_by"), None);
+        assert_eq!(
+            event_with_marker(&two, "concluded_by"),
+            Some(adjudication),
+            "the lax reader still takes the first — the strict one is the guard"
+        );
+
+        // Present once but unparseable: none.
+        let bad = signed(
+            vec![Tag::custom(
+                TagKind::e(),
+                [
+                    "not-an-event-id".to_string(),
+                    String::new(),
+                    "concluded_by".to_string(),
+                ],
+            )],
+            &signer,
+        );
+        assert_eq!(sole_event_with_marker(&bad, "concluded_by"), None);
+    }
+
+    #[test]
+    fn collects_every_marked_reference_in_tag_order() {
+        let signer = keys();
+        let (a, b) = (an_event_id(), an_event_id());
+        // A rematch-founded Game Session carries exactly two `rematch_offer`s.
+        let session = signed(
+            vec![
+                e_marked(&a, "rematch_offer"),
+                e_marked(&b, "rematch_offer"),
+                e_marked(&an_event_id(), "pairing"),
+            ],
+            &signer,
+        );
+        assert_eq!(
+            events_with_marker(&session, "rematch_offer"),
+            Some(vec![a, b])
+        );
+        // Absent marker: an empty vector, not `None` — "exactly two" fails on
+        // the length, and the caller says so in its own words.
+        assert_eq!(
+            events_with_marker(&session, "accepted_challenge"),
+            Some(vec![])
+        );
+
+        // One unparseable id poisons the whole read: a silent drop would turn a
+        // malformed three-reference session into a well-formed-looking pair.
+        let malformed = signed(
+            vec![
+                e_marked(&a, "rematch_offer"),
+                Tag::custom(
+                    TagKind::e(),
+                    [
+                        "not-an-event-id".to_string(),
+                        String::new(),
+                        "rematch_offer".to_string(),
+                    ],
+                ),
+            ],
+            &signer,
+        );
+        assert_eq!(events_with_marker(&malformed, "rematch_offer"), None);
     }
 
     #[test]

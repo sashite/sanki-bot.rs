@@ -20,6 +20,7 @@ use tokio::sync::broadcast::error::RecvError;
 use sashite_sanki_arbiter::event as arb;
 use sashite_sanki_engine::domain::half_move::Move as EngineMove;
 use sashite_sanki_engine::domain::status::{Outcome3, Status};
+use sashite_sanki_engine::domain::time_control::TimeControl;
 use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Strength};
 
 use crate::chain::{predicted_verdict, session_view, SessionView};
@@ -29,6 +30,7 @@ use crate::fleet::Ledger;
 use crate::mapping;
 use crate::prng::SplitMix64;
 use crate::publish::{publish_self_timed, RelayClock};
+use crate::rematch;
 use crate::tags;
 
 const OPEN_CHALLENGE_KIND: u16 = 6418;
@@ -45,6 +47,11 @@ const CONTACTS_KIND: u16 = 3;
 /// Relay fetch budget.
 const FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 
+/// How far back a chain of rematches may be walked when resolving a session's
+/// inherited terms. A rematch of a rematch is legitimate; a relay serving a
+/// cycle of them is not, and only a bound tells the two apart.
+const MAX_REMATCH_HOPS: usize = 32;
+
 /// The actor's periodic heartbeat (schedules thinks, deadline wakes, courtship).
 const TICK_SECS: u64 = 5;
 
@@ -56,6 +63,23 @@ const SIGMA_CORRESPONDENCE_SECS: u64 = 60;
 /// `accept_until` window of our own entries (§6.2).
 const COURT_MARGIN_SECS: u64 = 30;
 const OWN_ENTRY_WINDOW_SECS: u64 = 180;
+
+/// The `accept_until` window of a rematch offer (§9). The bot makes ONE offer
+/// per game (proactive or in reply), so this is the opponent's whole window to
+/// answer and let the arbiter found the rematch.
+const REMATCH_WINDOW_SECS: u64 = 300;
+
+/// How far back the self-subscription replays when the bot starts. The
+/// subscription carries *live* traffic; the state a restart needs is rebuilt by
+/// the explicit recovery fetches, which are not bounded by this. Unbounded, the
+/// relay replays the bot's entire history the moment it connects — every Ply,
+/// verdict and offer it ever received — and the handlers work through a year of
+/// finished games as though they had just arrived. The window is not zero
+/// because `created_at` is the publisher's clock, not ours: the longest-lived
+/// thing that arrives here and still deserves acting on is a Rematch Offer
+/// inside its acceptance window, and three of those windows absorb both the skew
+/// and a slow start.
+const SELF_REPLAY_LOOKBACK_SECS: u64 = 3 * REMATCH_WINDOW_SECS;
 
 /// Grace before locally abandoning a session whose arbiter stays silent.
 const SILENT_ARBITER_GRACE_SECS: u64 = 15 * 60;
@@ -96,7 +120,31 @@ struct SessionMeta {
     /// The half-move the pending think was scheduled for (re-planned when
     /// the chain moves under a premoveless bot).
     planned_half_move: u32,
+    /// The ply we last published, keyed by the half-move it filled — the
+    /// same-slot idempotence guard (§6.5). See the guard in `service_session`.
+    published: Option<PublishedPly>,
 }
+
+/// The record behind `SessionMeta::published`: enough to RE-SEND the very
+/// same ply (never to search a new one) while the session fetch has not yet
+/// caught up with it.
+struct PublishedPly {
+    /// The half-move ordinal our ply filled (`view.next_half_move` at publish).
+    half_move: u32,
+    /// Our own step for that slot (the `step` tag).
+    step: u32,
+    /// The exact move content published.
+    content: String,
+    /// Whether the ply carried the `draw` offer tag.
+    offer_draw: bool,
+    /// When it was (last) sent — paces the lost-publish re-send.
+    at: u64,
+}
+
+/// Grace before re-sending an already-published ply whose echo has not come
+/// back (three coarse ticks): long enough for any realistic relay round trip,
+/// short enough never to threaten a clock even on a fast cadence.
+const REPUBLISH_GRACE_SECS: u64 = 15;
 
 /// Run the actor until shutdown. Errors bubble only for unrecoverable
 /// startup conditions; per-event errors are logged and absorbed.
@@ -117,6 +165,9 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let mut sessions: BTreeMap<EventId, SessionMeta> = BTreeMap::new();
     let mut courted_entries: BTreeSet<EventId> = BTreeSet::new();
     let mut accepted_challenges: BTreeSet<EventId> = BTreeSet::new();
+    // Games we have already offered a rematch for — one offer per game, whether
+    // it went out proactively (on the verdict) or in reply to the opponent's.
+    let mut offered_rematches: BTreeSet<EventId> = BTreeSet::new();
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -132,11 +183,17 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 GAME_SESSION_KIND,
                 PLY_KIND,
                 ADJUDICATION_KIND,
+                rematch::REMATCH_OFFER_KIND,
             ]
             .into_iter()
             .map(Kind::Custom),
         )
-        .pubkey(me);
+        .pubkey(me)
+        .since(Timestamp::from(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(SELF_REPLAY_LOOKBACK_SECS),
+        ));
     let pool_filter = Filter::new()
         .kind(Kind::Custom(OPEN_CHALLENGE_KIND))
         .pubkey(ctx.matchmaker);
@@ -153,6 +210,12 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, me).await {
         tracing::warn!(error = %error, "session recovery incomplete");
     }
+    // …and rebuild what we have already offered, for the same reason: the
+    // one-offer-per-game gate lives in memory, so a restart would otherwise
+    // reopen every game the bot ever finished.
+    if let Err(error) = recover_offered_rematches(&client, &mut offered_rematches, me).await {
+        tracing::warn!(error = %error, "rematch-offer recovery incomplete");
+    }
     tracing::info!(sessions = sessions.len(), "bot up");
 
     let mut notifications = client.notifications();
@@ -167,13 +230,17 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 }
             }
             _ = tick.tick() => {
-                service_all(&client, &ctx, &relay_clock, &mut sessions, &mut rng, me, &mut starred_today).await;
+                service_all(
+                    &client, &ctx, &relay_clock, &mut sessions, &mut rng, me,
+                    &mut starred_today, &mut offered_rematches,
+                )
+                .await;
             }
             notification = notifications.recv() => match notification {
                 Ok(RelayPoolNotification::Event { event, .. }) => {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
-                        &mut accepted_challenges, &mut rng, me, *event,
+                        &mut accepted_challenges, &mut offered_rematches, &mut rng, me, *event,
                     ).await;
                 }
                 Ok(_) => {}
@@ -274,6 +341,107 @@ async fn recover_sessions(
     Ok(())
 }
 
+/// Rebuild the set of games the bot has already offered a rematch for (§9,
+/// stateless restart). The gate that keeps the bot to **one** offer per game is
+/// a plain in-memory set; held only there it empties on every restart, and the
+/// bot re-offers for each finished game the moment it sees the verdict again —
+/// exactly the volley the gate exists to prevent. Our own Rematch Offers are the
+/// durable record of what we already offered, so they are what is read back.
+///
+/// A failure here is warned about, not fatal: the cost is a possible duplicate
+/// offer, which the arbiter's `(rematch, G)` idempotence absorbs — where the
+/// cost of refusing to start is that the bot plays nothing at all.
+async fn recover_offered_rematches(
+    client: &Client,
+    offered_rematches: &mut BTreeSet<EventId>,
+    me: PublicKey,
+) -> Result<()> {
+    let offers = fetch_many(
+        client,
+        Filter::new()
+            .kind(Kind::Custom(rematch::REMATCH_OFFER_KIND))
+            .author(me),
+    )
+    .await?;
+    for offer in &offers {
+        if let Some(concluded) = tags::sole_event_with_marker(offer, "rematch_of") {
+            offered_rematches.insert(concluded);
+        }
+    }
+    tracing::debug!(
+        games = offered_rematches.len(),
+        "recovered the already-offered rematch set"
+    );
+    Ok(())
+}
+
+/// The terms a Game Session inherits from its founding: the timing mode (a
+/// `timestamper`, present iff attested), the time control, and the raw
+/// `time_control` rows the courtship layer compares byte-for-byte.
+///
+/// A session is founded one of three ways (kind `6422` §Founding reference): a
+/// directed challenge (`accepted_challenge` → the Direct Challenge behind it), a
+/// matchmade one (`pairing`), or a **rematch** — exactly two `rematch_offer`
+/// references, which restate no terms at all and so must be followed back to the
+/// concluded session and, recursively, to *its* founding. `hops` bounds that
+/// recursion: a relay can serve a cycle of sessions that each claim to rematch
+/// the next, and an unbounded walk would never return.
+async fn resolve_founding(
+    client: &Client,
+    session: &Event,
+    hops: usize,
+) -> Result<(Option<PublicKey>, TimeControl, Vec<Vec<String>>)> {
+    if let Some(accepted_id) = tags::event_with_marker(session, "accepted_challenge") {
+        let accepted = fetch_event(client, accepted_id).await?;
+        let direct_id = tags::first_event_ref(&accepted)
+            .ok_or_else(|| anyhow!("acceptance references no challenge"))?;
+        let direct = fetch_event(client, direct_id).await?;
+        return Ok((
+            tags::pubkey_with_role(&accepted, "timestamper"),
+            mapping::time_control(&direct)?,
+            tags::time_control_rows(&direct),
+        ));
+    }
+    if let Some(pairing_id) = tags::event_with_marker(session, "pairing") {
+        let pairing = fetch_event(client, pairing_id).await?;
+        return Ok((
+            tags::pubkey_with_role(&pairing, "timestamper"),
+            mapping::time_control(&pairing)?,
+            tags::time_control_rows(&pairing),
+        ));
+    }
+
+    let Some(offer_ids) = tags::events_with_marker(session, "rematch_offer") else {
+        bail!("session references no founding");
+    };
+    let [first_id, second_id] = <[EventId; 2]>::try_from(offer_ids)
+        .map_err(|_| anyhow!("rematch session does not reference exactly two offers"))?;
+    let hops = hops
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("rematch chain longer than {MAX_REMATCH_HOPS} hops"))?;
+    let first = fetch_event(client, first_id).await?;
+    let second = fetch_event(client, second_id).await?;
+    let pair = rematch::founding_pair([&first, &second], &session.pubkey)
+        .map_err(|reason| anyhow!("non-conforming rematch founding: {reason}"))?;
+    let concluded = fetch_event(client, pair.concluded).await?;
+    if concluded.kind != Kind::Custom(GAME_SESSION_KIND) {
+        bail!("rematch_of is not a Game Session");
+    }
+    if concluded.pubkey != session.pubkey {
+        bail!("rematch replays another arbiter's session");
+    }
+    // The terms come from the concluded session's OWN chain, never from the
+    // offers (which restate none). The mode is then read back against what the
+    // pair claims — kind `6430` §Semantic constraints 6. Trusting the offers
+    // instead would let a pair claiming `None` found a session the arbiter can
+    // only rule as attested, which the bot would then play blind.
+    let (mode, time_control, rows) = Box::pin(resolve_founding(client, &concluded, hops)).await?;
+    if pair.timestamper != mode {
+        bail!("rematch offers do not mirror the concluded session's timing mode");
+    }
+    Ok((mode, time_control, rows))
+}
+
 /// Start tracking a Game Session: resolve its founding chain (time control,
 /// timing mode) and assemble the arbiter-grade `SessionParams` — the same
 /// walk the arbiter service performs before ruling (§6.4).
@@ -299,28 +467,10 @@ async fn track_session(
         .find(|player| **player != me)
         .ok_or_else(|| anyhow!("no opponent in the session"))?;
 
-    // Founding-chain resolution (time control + timing mode).
+    // Founding-chain resolution (time control + timing mode) — directed,
+    // matchmade, or rematch (kind `6422` §Founding reference).
     let (timestamper, time_control, rows) =
-        if let Some(accepted_id) = tags::event_with_marker(&session, "accepted_challenge") {
-            let accepted = fetch_event(client, accepted_id).await?;
-            let direct_id = tags::first_event_ref(&accepted)
-                .ok_or_else(|| anyhow!("acceptance references no challenge"))?;
-            let direct = fetch_event(client, direct_id).await?;
-            (
-                tags::pubkey_with_role(&accepted, "timestamper"),
-                mapping::time_control(&direct)?,
-                tags::time_control_rows(&direct),
-            )
-        } else if let Some(pairing_id) = tags::event_with_marker(&session, "pairing") {
-            let pairing = fetch_event(client, pairing_id).await?;
-            (
-                tags::pubkey_with_role(&pairing, "timestamper"),
-                mapping::time_control(&pairing)?,
-                tags::time_control_rows(&pairing),
-            )
-        } else {
-            bail!("session references no founding");
-        };
+        resolve_founding(client, &session, MAX_REMATCH_HOPS).await?;
     if timestamper.is_some() {
         bail!("attested session (v1 is self-timed) — abandoned");
     }
@@ -341,6 +491,7 @@ async fn track_session(
             my_side_evals: VecDeque::new(),
             next_action_at: 0,
             planned_half_move: 0,
+            published: None,
         },
     );
     Ok(())
@@ -355,6 +506,7 @@ async fn handle_event(
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     courted_entries: &mut BTreeSet<EventId>,
     accepted_challenges: &mut BTreeSet<EventId>,
+    offered_rematches: &mut BTreeSet<EventId>,
     rng: &mut SplitMix64,
     me: PublicKey,
     event: Event,
@@ -392,14 +544,216 @@ async fn handle_event(
             if let Some(session_id) = tags::event_with_marker(&event, "game_session") {
                 if event.pubkey == ctx.arbiter {
                     if let Some(meta) = sessions.remove(&session_id) {
-                        ctx.ledger.session_changed(&me, &meta.opponent, false);
                         tracing::info!(session = %session_id, status = %event.content, "session terminated");
+                        terminate_session(
+                            client,
+                            ctx,
+                            relay_clock,
+                            me,
+                            &session_id,
+                            &event.id,
+                            &meta.opponent,
+                            offered_rematches,
+                        )
+                        .await;
                     }
                 }
             }
         }
+        Kind::Custom(rematch::REMATCH_OFFER_KIND) => {
+            // A rematch offer addressed to us (§9, reciprocate).
+            if let Err(reason) =
+                consider_rematch_offer(client, ctx, relay_clock, me, &event, offered_rematches)
+                    .await
+            {
+                tracing::debug!(offer = %event.id, reason, "rematch offer not answered");
+            }
+        }
         _ => {}
     }
+}
+
+/// Terminate a tracked session on its verdict: release the fleet budget slot,
+/// then (if the persona is willing) proactively offer a rematch. BOTH paths
+/// that observe the terminal 6425 — the notification arm and the tick's session
+/// service — funnel through here, so the offer fires whichever wins the race to
+/// `sessions.remove`; that guard keeps it to one offer per game. Both carry the
+/// Adjudication that ended the session (`adjudication`): the offer must cite one
+/// as its `concluded_by` proof, and the verdict we just observed is exactly it —
+/// no re-fetch needed.
+#[allow(clippy::too_many_arguments)]
+async fn terminate_session(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    me: PublicKey,
+    concluded: &EventId,
+    adjudication: &EventId,
+    opponent: &PublicKey,
+    offered: &mut BTreeSet<EventId>,
+) {
+    ctx.ledger.session_changed(&me, opponent, false);
+    maybe_offer_rematch(
+        client,
+        ctx,
+        relay_clock,
+        concluded,
+        adjudication,
+        opponent,
+        offered,
+    )
+    .await;
+}
+
+/// Offer `opponent` a rematch of `concluded`, unless we already offered one for
+/// this game, the persona is unwilling (a per-game decision), or — against a
+/// sibling bot — the bot-vs-bot budget is spent. Shared by both triggers (the
+/// proactive offer on the verdict and the reply to an incoming offer), which is
+/// why the one-per-game guard lives here. Best-effort: a failure is logged,
+/// never propagated. The offer is self-timed (the bot never plays attested
+/// games) and mined by the publish path like any founding.
+///
+/// `adjudication` is the 6425 the offer cites as its `concluded_by` proof that
+/// `concluded` is over: the observed verdict on the proactive path, the (already
+/// verified) one the opponent cited on the reply path. Both adjudicate the same
+/// session, which is all the pair rule asks.
+async fn maybe_offer_rematch(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    concluded: &EventId,
+    adjudication: &EventId,
+    opponent: &PublicKey,
+    offered: &mut BTreeSet<EventId>,
+) {
+    // One offer per game — whether it goes out proactively or in reply, so two
+    // willing bots never volley mirrors forever.
+    if offered.contains(concluded) {
+        return;
+    }
+    if !rematch::wants_rematch(
+        ctx.bot_seed,
+        concluded,
+        rematch::DEFAULT_REMATCH_PROBABILITY,
+    ) {
+        return;
+    }
+    if ctx.ledger.is_member(opponent) && !ctx.ledger.may_court_sibling() {
+        tracing::debug!(against = %opponent, "rematch not offered: bot-vs-bot budget spent");
+        return;
+    }
+    let concluded = *concluded;
+    let adjudication = *adjudication;
+    let opponent = *opponent;
+    let arbiter = ctx.arbiter;
+    let result = publish_self_timed(
+        client,
+        &ctx.keys,
+        relay_clock,
+        Kind::Custom(rematch::REMATCH_OFFER_KIND),
+        ctx.fleet.pow_difficulty,
+        move |created_at| {
+            let accept_until = created_at.as_secs().saturating_add(REMATCH_WINDOW_SECS);
+            // No timestamper: the bot only plays self-timed games (attested
+            // challenges are declined in courtship), so the rematch mirrors that.
+            let tags = rematch::build_offer_tags(
+                &concluded,
+                &adjudication,
+                &opponent,
+                &arbiter,
+                None,
+                accept_until,
+            );
+            (tags, String::new())
+        },
+    )
+    .await;
+    match result {
+        Ok(offer) => {
+            offered.insert(concluded);
+            tracing::info!(
+                rematch_of = %concluded,
+                against = %opponent,
+                offer = %offer.id,
+                "offered a rematch"
+            );
+        }
+        Err(error) => tracing::warn!(error = %error, "rematch offer publish failed"),
+    }
+}
+
+/// Answer an incoming Rematch Offer (kind 6430) addressed to us (§9,
+/// reciprocate): verify it is a well-formed offer, from our arbiter, for a Game
+/// Session that BOTH of us actually played and that its `concluded_by`
+/// Adjudication really ended, then mirror it through the shared path (which
+/// applies the one-per-game, willingness and budget gates). Catches what the proactive offer misses — a restart that
+/// skipped the verdict, or the opponent offering first.
+async fn consider_rematch_offer(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    me: PublicKey,
+    event: &Event,
+    offered: &mut BTreeSet<EventId>,
+) -> std::result::Result<(), &'static str> {
+    let offer = rematch::parse_incoming_offer(event).ok_or("malformed rematch offer")?;
+    if offer.addressed_to != me {
+        return Err("addressed to someone else");
+    }
+    if offer.arbiter != ctx.arbiter {
+        return Err("foreign arbiter");
+    }
+    if offer.timestamper.is_some() {
+        return Err("attested rematch — we only play self-timed");
+    }
+    if offer.accept_until <= Timestamp::now().as_secs() {
+        return Err("already expired");
+    }
+    // The concluded session was purged on its verdict; re-fetch it and confirm
+    // it is our arbiter's Game Session that BOTH of us played — never mine a
+    // mirror for a game we did not play (spam defense).
+    let concluded = fetch_event(client, offer.concluded)
+        .await
+        .map_err(|_| "concluded session unavailable")?;
+    if concluded.kind != Kind::Custom(GAME_SESSION_KIND) || concluded.pubkey != ctx.arbiter {
+        return Err("rematch_of is not our arbiter's game session");
+    }
+    if tags::seat_for(&concluded, &me).is_none()
+        || tags::seat_for(&concluded, &offer.offerer).is_none()
+    {
+        return Err("not both players of the concluded session");
+    }
+    // The offer's proof that the game is over: its `concluded_by` must really be
+    // an Adjudication OF that session, signed by the arbiter who signed it (kind
+    // 6425 §Semantic constraints). Without this the reference is a free-form
+    // pointer, and a stranger could dress any event up as a verdict. Re-checked
+    // here even though our own arbiter is honest: what we mirror is what we saw,
+    // not what we assume.
+    let adjudication = fetch_event(client, offer.concluded_by)
+        .await
+        .map_err(|_| "concluded_by adjudication unavailable")?;
+    if adjudication.kind != Kind::Custom(ADJUDICATION_KIND) {
+        return Err("concluded_by is not an adjudication");
+    }
+    if tags::event_with_marker(&adjudication, "game_session") != Some(concluded.id) {
+        return Err("concluded_by adjudicates another session");
+    }
+    if adjudication.pubkey != concluded.pubkey {
+        return Err("concluded_by is not signed by the session's arbiter");
+    }
+    // Cite the very Adjudication the opponent cited: verified above, and the
+    // pair matches on `rematch_of` regardless.
+    maybe_offer_rematch(
+        client,
+        ctx,
+        relay_clock,
+        &offer.concluded,
+        &offer.concluded_by,
+        &offer.offerer,
+        offered,
+    )
+    .await;
+    Ok(())
 }
 
 /// React to a live pool entry (§6.2): compatibility, fleet budget, async
@@ -565,8 +919,9 @@ async fn consider_direct_challenge(
 
     let challenge_id = challenge.id;
     let challenger = plan.challenger;
+    let arbiter = ctx.arbiter;
     let me_hex = me.to_hex();
-    let my_variant = plan.my_variant.clone();
+    let supply_mine = plan.supply_my_variant.clone();
     let supply_their = plan.supply_challenger_variant.clone();
     let supply_seat = plan.supply_seat;
     publish_self_timed(
@@ -579,11 +934,22 @@ async fn consider_direct_challenge(
             let mut event_tags = vec![
                 Tag::custom(TagKind::e(), [challenge_id.to_hex()]),
                 p_role(&challenger, "opponent"),
-                Tag::custom(
-                    TagKind::custom("variant"),
-                    [me_hex.clone(), my_variant.clone()],
-                ),
+                // The arbiter subscribes on `#p = self` and founds the game only
+                // from an Accepted Challenge that names it: without this tag the
+                // acceptance is published and OK'd by the relay, but the arbiter
+                // never sees it and no Game Session (6422) is ever founded.
+                p_role(&arbiter, "arbiter"),
             ];
+            // A player's variant is declared ONLY when the challenge left it open
+            // (kind 6421 constraint 7): re-declaring a variant the challenge already
+            // fixed puts the same tag in both events and invalidates the pair — the
+            // arbiter then never founds the game.
+            if let Some(mine) = &supply_mine {
+                event_tags.push(Tag::custom(
+                    TagKind::custom("variant"),
+                    [me_hex.clone(), mine.clone()],
+                ));
+            }
             if let Some(theirs) = &supply_their {
                 event_tags.push(Tag::custom(
                     TagKind::custom("variant"),
@@ -616,6 +982,7 @@ async fn service_all(
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
+    offered_rematches: &mut BTreeSet<EventId>,
 ) {
     let ids: Vec<EventId> = sessions.keys().copied().collect();
     for id in ids {
@@ -623,12 +990,24 @@ async fn service_all(
             continue;
         };
         match service_session(client, ctx, relay_clock, meta, rng, me, starred_today).await {
-            Ok(done) if done => {
+            // The verdict that ended it — carried through, since the rematch
+            // offer must cite it as its `concluded_by` proof.
+            Ok(Some(verdict_id)) => {
                 if let Some(meta) = sessions.remove(&id) {
-                    ctx.ledger.session_changed(&me, &meta.opponent, false);
+                    terminate_session(
+                        client,
+                        ctx,
+                        relay_clock,
+                        me,
+                        &id,
+                        &verdict_id,
+                        &meta.opponent,
+                        offered_rematches,
+                    )
+                    .await;
                 }
             }
-            Ok(_) => {}
+            Ok(None) => {}
             Err(error) => {
                 tracing::debug!(session = %id, error = %error, "session service hiccup");
             }
@@ -636,8 +1015,9 @@ async fn service_all(
     }
 }
 
-/// Service one session. Returns `Ok(true)` when the session is finished and
-/// may be dropped.
+/// Service one session. Returns `Ok(Some(verdict))` — the id of the Adjudication
+/// that ended it — when the session is finished and may be dropped, `Ok(None)`
+/// while it is still running.
 #[allow(clippy::too_many_arguments)]
 async fn service_session(
     client: &Client,
@@ -647,7 +1027,7 @@ async fn service_session(
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
-) -> Result<bool> {
+) -> Result<Option<EventId>> {
     let session_id = meta.session.id;
     let now = Timestamp::now().as_secs();
 
@@ -663,7 +1043,7 @@ async fn service_session(
     if let Some(verdict) = verdicts.first() {
         maybe_star(client, ctx, relay_clock, meta, rng, verdict, starred_today).await;
         tracing::info!(session = %session_id, status = %verdict.content, "verdict observed");
-        return Ok(true);
+        return Ok(Some(verdict.id));
     }
 
     // The session's plies and requests (session-scoped `#e` fetch — §6.4).
@@ -700,11 +1080,47 @@ async fn service_session(
             publish_request(client, ctx, relay_clock, session_id).await?;
             tracing::info!(session = %session_id, ?invocation, "invoked the arbiter");
         }
-        return Ok(false); // dropped when the 6425 lands
+        return Ok(None); // dropped when the 6425 lands
     }
 
     if view.terminal || view.on_move != my_key {
-        return Ok(false);
+        return Ok(None);
+    }
+
+    // Same-slot idempotence guard (§6.5). Our ply for this very half-move may
+    // already be out while the session fetch has not caught up with it (the
+    // relay indexes and echoes asynchronously; a second trigger can land within
+    // the same second). Without the guard that re-entry SEARCHED AGAIN — a fresh
+    // seed, so usually a DIFFERENT move — and published a second content for the
+    // same slot, leaving every consumer's selection to race the two (observed:
+    // c2c4+b2b4, c2c4+e2e4, c7c5+d7d5). One slot, one search: hold until the
+    // chain advances past it, and after a grace period re-send the SAME content
+    // — identical contents collapse to one candidate in the selection rule, so
+    // the re-send is harmless where a fresh search is not, and a genuinely lost
+    // publish cannot deadlock the seat.
+    if let Some(published) = &mut meta.published {
+        if published.half_move == view.next_half_move {
+            if now.saturating_sub(published.at) >= REPUBLISH_GRACE_SECS {
+                publish_ply(
+                    client,
+                    ctx,
+                    relay_clock,
+                    session_id,
+                    meta.opponent,
+                    published.step,
+                    published.content.clone(),
+                    published.offer_draw,
+                )
+                .await?;
+                published.at = now;
+                tracing::info!(
+                    session = %session_id,
+                    half_move = view.next_half_move,
+                    "re-sent the unacknowledged ply (same content)"
+                );
+            }
+            return Ok(None);
+        }
     }
 
     // Our turn. Pace it: presence for correspondence, think delay for all.
@@ -746,9 +1162,26 @@ async fn service_session(
         meta.next_action_at = play_at.min(latest_start);
     }
     if now < meta.next_action_at {
-        return Ok(false); // the tick will come back
+        let wait = meta.next_action_at.saturating_sub(now);
+        // Defer to the coarse tick when the wake is still more than a tick away
+        // (cheap, non-blocking), and always for correspondence (its 60 s σ dwarfs
+        // the tick). But a LIVE game whose planned move falls WITHIN one tick must
+        // not defer: the next coarse tick would fire up to `TICK_SECS` AFTER
+        // `next_action_at`, overshooting the flag on a fast cadence (a 10 s/move
+        // game has no room for a 5 s tick slip). Sleep the sub-tick residual and
+        // play in-call so we hit the planned instant precisely — `play_ply` itself
+        // clamps the search to `latest_start - now`, so publication still lands
+        // before the flag. Bounded by `TICK_SECS`, so the loop never blocks for
+        // more than one tick.
+        if meta.correspondence || wait >= TICK_SECS {
+            return Ok(None); // a later tick will come back
+        }
+        tokio::time::sleep(StdDuration::from_secs(wait)).await;
     }
 
+    // Recompute `now` after any pacing sleep so `play_ply` sizes its search budget
+    // against the time that actually remains, not the pre-sleep estimate.
+    let play_now = Timestamp::now().as_secs();
     play_ply(
         client,
         ctx,
@@ -757,11 +1190,11 @@ async fn service_session(
         &view,
         rng,
         me,
-        now,
+        play_now,
         latest_start,
     )
     .await?;
-    Ok(false)
+    Ok(None)
 }
 
 /// What a 6424 published now would achieve, if it is worth publishing
@@ -807,8 +1240,8 @@ fn invocation_decision(
     match verdict.status() {
         // A rule-system ending reached by the chain: either player may
         // safely invoke — ratify whatever the outcome (it is already fact).
-        // `MoveCap` is the absolute 600-half-move draw (engine 0.6), last in
-        // the terminal order and just as ratifiable as the other rule endings.
+        // `MoveCap` (engine 0.6): the absolute 300-full-move global cap — a
+        // rule-system draw like `MoveLimit`, ratifiable the same way.
         Status::Checkmate
         | Status::Stalemate
         | Status::NoMove
@@ -850,6 +1283,49 @@ fn wants_to_resign(ctx: &BotContext, meta: &SessionMeta) -> bool {
         (recent.next(), recent.next()),
         (Some(&a), Some(&b)) if a < threshold && b < threshold
     )
+}
+
+/// Publish a Ply carrying `content` for our `step` slot — the single
+/// publication path, shared by `play_ply` (a fresh search) and the same-slot
+/// guard's idempotent re-send.
+#[allow(clippy::too_many_arguments)]
+async fn publish_ply(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    session_id: EventId,
+    opponent: PublicKey,
+    step: u32,
+    content: String,
+    offer_draw: bool,
+) -> Result<()> {
+    publish_self_timed(
+        client,
+        &ctx.keys,
+        relay_clock,
+        Kind::Custom(PLY_KIND),
+        ctx.fleet.pow_difficulty,
+        move |_created_at| {
+            let mut event_tags = vec![
+                Tag::custom(
+                    TagKind::e(),
+                    [
+                        session_id.to_hex(),
+                        String::new(),
+                        "game_session".to_owned(),
+                    ],
+                ),
+                p_role(&opponent, "opponent"),
+                Tag::custom(TagKind::custom("step"), [step.to_string()]),
+            ];
+            if offer_draw {
+                event_tags.push(Tag::custom(TagKind::custom("draw"), Vec::<String>::new()));
+            }
+            (event_tags, content.clone())
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 /// Choose and publish our ply (§6.5).
@@ -918,32 +1394,26 @@ async fn play_ply(
     let session_id = meta.session.id;
     let opponent = meta.opponent;
     let step = view.step;
-    publish_self_timed(
+    publish_ply(
         client,
-        &ctx.keys,
+        ctx,
         relay_clock,
-        Kind::Custom(PLY_KIND),
-        ctx.fleet.pow_difficulty,
-        move |_created_at| {
-            let mut event_tags = vec![
-                Tag::custom(
-                    TagKind::e(),
-                    [
-                        session_id.to_hex(),
-                        String::new(),
-                        "game_session".to_owned(),
-                    ],
-                ),
-                p_role(&opponent, "opponent"),
-                Tag::custom(TagKind::custom("step"), [step.to_string()]),
-            ];
-            if offer_draw {
-                event_tags.push(Tag::custom(TagKind::custom("draw"), Vec::<String>::new()));
-            }
-            (event_tags, content.clone())
-        },
+        session_id,
+        opponent,
+        step,
+        content.clone(),
+        offer_draw,
     )
     .await?;
+    // Arm the same-slot idempotence guard: this half-move is played — a
+    // re-entry before the echo must re-send THIS content, never search again.
+    meta.published = Some(PublishedPly {
+        half_move: view.next_half_move,
+        step,
+        content,
+        offer_draw,
+        at: now,
+    });
     let _ = me;
     tracing::info!(
         session = %session_id,

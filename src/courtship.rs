@@ -128,6 +128,11 @@ pub struct AcceptPlan {
     pub challenger: PublicKey,
     /// The bot's own variant: the challenge's imposition, or a persona draw.
     pub my_variant: String,
+    /// The bot's variant to DECLARE on the acceptance — `Some` only when the
+    /// challenge left it open. Kind 6421 constraint 7: the acceptance MUST NOT
+    /// re-declare a variant the challenge already fixed, or the pair is invalid
+    /// and the arbiter never founds the game.
+    pub supply_my_variant: Option<String>,
     /// The challenger's variant to supply on the acceptance (mirror rule),
     /// when the challenge delegated it.
     pub supply_challenger_variant: Option<String>,
@@ -177,10 +182,11 @@ pub fn evaluate_direct_challenge(
     }
 
     let rows = tags::time_control_rows(event);
-    if !play
-        .time_controls
-        .iter()
-        .any(|preference| preference.spec == rows)
+    if !play.accept_any_time_control
+        && !play
+            .time_controls
+            .iter()
+            .any(|preference| preference.spec == rows)
     {
         return Err("cadence outside the persona");
     }
@@ -192,7 +198,17 @@ pub fn evaluate_direct_challenge(
     let imposed_mine = tags::variant_for(event, me).map(str::to_owned);
     let my_variant = match (&their_variant, &imposed_mine) {
         (Some(theirs), Some(mine)) if theirs != mine => {
-            return Err("asymmetric variant imposition (persona policy)");
+            // Explicit cross-variant: the challenger plays `theirs` and assigns us
+            // the DIFFERENT `mine`. Refused as persona policy UNLESS the persona
+            // opts in (`accept_imposed_variant`), and even then only for a variant
+            // it actually plays.
+            if !play.accept_imposed_variant {
+                return Err("asymmetric variant imposition (persona policy)");
+            }
+            if play.variants.get(mine).copied().unwrap_or(0.0) <= 0.0 {
+                return Err("imposed variant outside the persona");
+            }
+            mine.clone()
         }
         (None, Some(_)) => return Err("imposed variant while theirs is open (asymmetric)"),
         (_, Some(mine)) => {
@@ -206,9 +222,16 @@ pub fn evaluate_direct_challenge(
             .to_owned(),
     };
 
-    // The acceptance supplies exactly what the challenge left open (kind
-    // 6421): the challenger's variant by the mirror rule, the seat by a
-    // uniform draw.
+    // The acceptance supplies exactly what the challenge left open, and MUST NOT
+    // re-declare a term the challenge already fixed (kind 6421 constraint 7 — the
+    // same-player variant tag present in BOTH events invalidates the pair): the
+    // bot's own variant only when it was not imposed, the challenger's by the
+    // mirror rule when delegated, the seat by a uniform draw when open.
+    let supply_my_variant = if imposed_mine.is_none() {
+        Some(my_variant.clone())
+    } else {
+        None
+    };
     let supply_challenger_variant = if their_variant.is_none() {
         Some(my_variant.clone())
     } else {
@@ -227,6 +250,7 @@ pub fn evaluate_direct_challenge(
     Ok(AcceptPlan {
         challenger,
         my_variant,
+        supply_my_variant,
         supply_challenger_variant,
         supply_seat,
         accept_until,
@@ -266,6 +290,8 @@ mod tests {
                     weight: 0.3,
                 },
             ],
+            accept_any_time_control: false,
+            accept_imposed_variant: false,
             max_live: 1,
             max_correspondence: 4,
             strength: StrengthConfig {
@@ -454,6 +480,11 @@ mod tests {
             plan.supply_challenger_variant.as_deref(),
             Some(plan.my_variant.as_str())
         );
+        // The bot's own variant was open too, so it is declared on the acceptance.
+        assert_eq!(
+            plan.supply_my_variant.as_deref(),
+            Some(plan.my_variant.as_str())
+        );
         assert!(plan.supply_seat.is_some());
         assert!(!plan.correspondence);
     }
@@ -512,10 +543,125 @@ mod tests {
         let plan = eval(&mirror).unwrap();
         assert_eq!(plan.my_variant, "ogi");
         assert_eq!(plan.supply_challenger_variant, None);
+        // Both variants fixed by the challenge — the acceptance declares neither.
+        assert_eq!(plan.supply_my_variant, None);
 
         // A challenge under another arbiter is ignored.
         let foreign = direct_challenge(&human, &me_pk, &Keys::generate().public_key(), vec![]);
         assert!(eval(&foreign).is_err());
+    }
+
+    #[test]
+    fn accept_any_time_control_bypasses_the_cadence_gate() {
+        let (me, human, arb) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate().public_key(),
+        );
+        let me_pk = me.public_key();
+        // A cadence absent from the persona (which has 10 s/move and 5 + 3).
+        let off_cadence = EventBuilder::new(Kind::Custom(6420), "")
+            .tags(vec![
+                p_role(&me_pk, "opponent"),
+                p_role(&arb, "arbiter"),
+                tag("game", &["sanki"]),
+                tag("time_control", &["600", "5"]),
+                tag("accept_until", &["2000000300"]),
+            ])
+            .sign_with_keys(&human)
+            .expect("sign");
+        let mut rng = SplitMix64::new(1);
+
+        // Default persona: an off-persona cadence is refused.
+        assert!(evaluate_direct_challenge(
+            &off_cadence,
+            &me_pk,
+            &arb,
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .is_err());
+
+        // With accept_any_time_control set, the same challenge is accepted.
+        let mut any = play();
+        any.accept_any_time_control = true;
+        assert!(evaluate_direct_challenge(
+            &off_cadence,
+            &me_pk,
+            &arb,
+            "sanki",
+            &any,
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn accept_imposed_variant_allows_explicit_cross_variant() {
+        let (me, human, arb) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate().public_key(),
+        );
+        let me_pk = me.public_key();
+        let human_pk = human.public_key();
+        // The challenger plays chess and imposes ogi on us — an explicit
+        // cross-variant game. The cadence is a persona one, so only the variant
+        // terms are under test.
+        let cross = EventBuilder::new(Kind::Custom(6420), "")
+            .tags(vec![
+                p_role(&me_pk, "opponent"),
+                p_role(&arb, "arbiter"),
+                tag("game", &["sanki"]),
+                tag("time_control", &["0", "10", "1"]),
+                tag("accept_until", &["2000000300"]),
+                Tag::custom(
+                    TagKind::custom("variant"),
+                    [human_pk.to_hex(), "chess".into()],
+                ),
+                Tag::custom(TagKind::custom("variant"), [me_pk.to_hex(), "ogi".into()]),
+            ])
+            .sign_with_keys(&human)
+            .expect("sign");
+        let mut rng = SplitMix64::new(1);
+
+        // Default persona: the asymmetric imposition is refused.
+        assert!(evaluate_direct_challenge(
+            &cross,
+            &me_pk,
+            &arb,
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .is_err());
+
+        // With accept_imposed_variant set, the bot takes the imposed ogi and
+        // supplies nothing (the challenger already fixed both variants).
+        let mut any = play();
+        any.accept_imposed_variant = true;
+        let plan = evaluate_direct_challenge(
+            &cross,
+            &me_pk,
+            &arb,
+            "sanki",
+            &any,
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .expect("accept the imposed variant");
+        assert_eq!(plan.my_variant, "ogi");
+        assert_eq!(plan.supply_challenger_variant, None);
+        // The imposed variant is NOT re-declared on the acceptance (6421 c7).
+        assert_eq!(plan.supply_my_variant, None);
     }
 
     #[test]

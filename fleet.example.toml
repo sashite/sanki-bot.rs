@@ -36,6 +36,16 @@ nsec_env = "PLAYER_NSEC_KAORU"
     { spec = [["0", "10", "1"]], weight = 0.7 },   # 10 s / move
     { spec = [["300", "3"]],     weight = 0.3 },   # 5 + 3 Fischer
   ]
+  # Accept a Direct Challenge at ANY cadence, not only those above (default
+  # false). `time_controls` still governs which cadences the bot OFFERS in the
+  # matchmaking pool; this only relaxes what it ACCEPTS on the direct path.
+  # accept_any_time_control = true
+  # Accept a Direct Challenge that IMPOSES a variant on the bot, even
+  # asymmetrically — you play one variant and assign the bot a DIFFERENT one
+  # (explicit cross-variant). Default false refuses an asymmetric imposition; the
+  # imposed variant must still appear in `variants` above. Leave the bot's variant
+  # OPEN instead and it draws its own — no flag needed for that.
+  # accept_imposed_variant = true
   max_live            = 1
   max_correspondence  = 4
   strength            = { time_ms = 2000, depth = 6 }

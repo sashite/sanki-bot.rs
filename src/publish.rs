@@ -106,12 +106,23 @@ where
 {
     for _attempt in 0..MAX_TIMING_ATTEMPTS {
         let created_at = relay_clock.stamp();
-        let (tags, content) = build(created_at);
-        let mut builder = EventBuilder::new(kind, content)
-            .tags(tags)
-            .custom_created_at(created_at);
+        let (mut tags, content) = build(created_at);
+        let mut builder = EventBuilder::new(kind, content).custom_created_at(created_at);
         if pow_difficulty > 0 {
-            builder = builder.pow(pow_difficulty);
+            // Mining adds the NIP-13 `nonce` tag as a side effect.
+            builder = builder.tags(tags).pow(pow_difficulty);
+        } else {
+            // The `nonce` tag is STRUCTURALLY required on a clock-timed suite event —
+            // a Ply (kind 6423, §Proof-of-work tag / constraint 6) and an Adjudication
+            // Request — independently of the relay's difficulty policy: a conforming
+            // client (e.g. the Sanki app's `parsePly`) rejects a Ply that carries none,
+            // so its half-move never joins the canonical chain and the board wedges.
+            // At difficulty 0 (a dev relay enforcing no PoW) `.pow()` is skipped, so the
+            // tag would be absent; add the trivially-satisfied 0-target nonce explicitly,
+            // mirroring the app's own miner, which emits `["nonce", "0", "0"]` at
+            // difficulty 0.
+            tags.push(Tag::custom(TagKind::custom("nonce"), ["0", "0"]));
+            builder = builder.tags(tags);
         }
         let event = builder
             .sign_with_keys(keys)

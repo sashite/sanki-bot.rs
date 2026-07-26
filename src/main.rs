@@ -32,6 +32,7 @@ mod mapping;
 mod persona;
 mod prng;
 mod publish;
+mod rematch;
 mod tags;
 
 use std::collections::BTreeSet;

@@ -96,6 +96,19 @@ pub struct PlayConfig {
     /// `time_control` tag rows — byte-identical to what the bot's Open
     /// Challenges carry (the matchmaker pairs identical configurations).
     pub time_controls: Vec<WeightedTimeControl>,
+    /// Accept a Direct Challenge at **any** cadence, not only those in
+    /// `time_controls`. Opt-in; default `false` keeps the persona's cadence
+    /// gate. `time_controls` is unaffected — it still governs which cadences
+    /// the bot **offers** in the matchmaking pool (and stays non-empty).
+    #[serde(default)]
+    pub accept_any_time_control: bool,
+    /// Accept a Direct Challenge that **imposes** a specific variant on the bot,
+    /// even asymmetrically — the challenger plays one variant and assigns the bot a
+    /// DIFFERENT one (an explicit cross-variant game). Opt-in; default `false` keeps
+    /// the persona policy of refusing an asymmetric imposition. The imposed variant
+    /// must still be one the persona plays (`variants` weight > 0).
+    #[serde(default)]
+    pub accept_imposed_variant: bool,
     /// Concurrent live games (per bot).
     #[serde(default = "default_max_live")]
     pub max_live: u32,
