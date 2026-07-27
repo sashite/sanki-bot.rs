@@ -843,6 +843,7 @@ async fn court_pool_entry(
     tokio::time::sleep(StdDuration::from_secs(delay.min(30))).await;
 
     let variant = candidate.variant.clone();
+    let mirror = candidate.mirror;
     let spec = candidate.spec.clone();
     let matchmaker = ctx.matchmaker;
     let arbiter = ctx.arbiter;
@@ -862,18 +863,26 @@ async fn court_pool_entry(
                     TagKind::custom("variant"),
                     ["self".to_owned(), variant.clone()],
                 ),
-                Tag::custom(
+            ];
+            // The free MIRROR form imposes the shared variant back; courting an
+            // ASYMMETRIC (premium) entry, our entry must leave the opponent
+            // unconstrained — their `self` differs from our variant, so imposing
+            // it back would make the pair variant-conflicting, and constraining
+            // the opponent at all is the premium form (see
+            // `courtship::PoolCandidate::mirror`).
+            if mirror {
+                event_tags.push(Tag::custom(
                     TagKind::custom("variant"),
                     ["opponent".to_owned(), variant.clone()],
-                ),
-                Tag::custom(
-                    TagKind::custom("accept_until"),
-                    [created_at
-                        .as_secs()
-                        .saturating_add(OWN_ENTRY_WINDOW_SECS)
-                        .to_string()],
-                ),
-            ];
+                ));
+            }
+            event_tags.push(Tag::custom(
+                TagKind::custom("accept_until"),
+                [created_at
+                    .as_secs()
+                    .saturating_add(OWN_ENTRY_WINDOW_SECS)
+                    .to_string()],
+            ));
             for row in &spec {
                 event_tags.push(Tag::custom(TagKind::custom("time_control"), row.clone()));
             }

@@ -18,8 +18,15 @@ use crate::tags;
 pub struct PoolCandidate {
     /// The counterparty (the entry's signer).
     pub challenger: PublicKey,
-    /// The mirror variant the bot would enter with.
+    /// The variant the bot would enter with — the shared one of a mirror
+    /// entry, or the one an asymmetric (premium) entry imposes on us.
     pub variant: String,
+    /// Whether our own entry may impose `variant` back on the opponent (the
+    /// free mirror form). `false` when courting an ASYMMETRIC entry: our entry
+    /// must fix `self` alone and leave the opponent unconstrained, both to
+    /// satisfy the pairing (their `self` differs from our variant) and to stay
+    /// in the free tier (constraining the opponent is the premium form).
+    pub mirror: bool,
     /// The `time_control` rows to carry — byte-identical to the entry's (the
     /// matchmaker pairs identical configurations).
     pub spec: Vec<Vec<String>>,
@@ -81,18 +88,25 @@ pub fn evaluate_open_challenge(
         Some(_) => return Err("rating filter (unrated, fail-closed)"),
     };
 
-    // Variant resolution toward a MIRROR session (the only form the fleet
-    // emits — §4 Notes): both resolved variants equal `v`. Their `self` term
-    // fixes their side; their `opponent` term fixes ours; both must agree on
-    // `v`, and the persona must actually play it.
+    // Variant resolution (§4 Notes). A MIRROR entry (both terms equal, or a
+    // single term) resolves to the shared `v` — the only form the fleet EMITS
+    // spontaneously. An ASYMMETRIC entry (the premium form: their `self`
+    // differs from the `opponent` variant they impose) is COURTED when the
+    // persona opts in (`accept_imposed_variant`, the same knob as the directed
+    // path): our variant is the imposed one, and our own entry must then fix
+    // `self` alone (see [`PoolCandidate::mirror`]). Either way the persona
+    // must actually play the resolved variant.
     let their_self = tags::role_variant(event, "self");
     let their_opponent = tags::role_variant(event, "opponent");
-    let variant = match (their_self, their_opponent) {
+    let (variant, mirror) = match (their_self, their_opponent) {
         (Some(own), Some(imposed)) if own != imposed => {
-            return Err("asymmetric variant terms (never emitted nor courted)");
+            if !play.accept_imposed_variant {
+                return Err("asymmetric variant terms (persona opts out)");
+            }
+            (imposed, false)
         }
-        (Some(own), _) => own,
-        (None, Some(imposed)) => imposed,
+        (Some(own), _) => (own, true),
+        (None, Some(imposed)) => (imposed, true),
         (None, None) => {
             return Err("no variant term to mirror (persona draw is for spontaneous entries)")
         }
@@ -114,6 +128,7 @@ pub fn evaluate_open_challenge(
     Ok(PoolCandidate {
         challenger: event.pubkey,
         variant: variant.to_owned(),
+        mirror,
         spec: rows,
         accept_until,
         needs_following_check,
@@ -367,8 +382,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(candidate.variant, "ogi");
+        assert!(candidate.mirror);
         assert_eq!(candidate.spec, vec![vec!["0", "10", "1"]]);
         assert!(!candidate.needs_following_check);
+    }
+
+    #[test]
+    fn courts_an_asymmetric_entry_when_the_persona_opts_in() {
+        // The human plays ogi and imposes chess on us (the premium form). With
+        // `accept_imposed_variant`, the persona courts it: our variant is the
+        // imposed one, and our own entry must NOT impose back (`mirror: false`).
+        let (me, human, mm, arb) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate().public_key(),
+            Keys::generate().public_key(),
+        );
+        let entry = open_challenge(
+            &human,
+            &mm,
+            &arb,
+            vec![
+                tag("variant", &["self", "ogi"]),
+                tag("variant", &["opponent", "chess"]),
+            ],
+        );
+        let opted_in = PlayConfig {
+            accept_imposed_variant: true,
+            ..play()
+        };
+        let candidate = evaluate_open_challenge(
+            &entry,
+            &me.public_key(),
+            &mm,
+            &arb,
+            "sanki",
+            &opted_in,
+            2_000_000_000,
+            60,
+        )
+        .unwrap();
+        assert_eq!(candidate.variant, "chess");
+        assert!(!candidate.mirror);
+        // The imposed variant must still be one the persona plays.
+        let imposes_xiongqi = open_challenge(
+            &human,
+            &mm,
+            &arb,
+            vec![
+                tag("variant", &["self", "ogi"]),
+                tag("variant", &["opponent", "xiongqi"]),
+            ],
+        );
+        assert!(evaluate_open_challenge(
+            &imposes_xiongqi,
+            &me.public_key(),
+            &mm,
+            &arb,
+            "sanki",
+            &opted_in,
+            2_000_000_000,
+            60,
+        )
+        .is_err());
     }
 
     #[test]

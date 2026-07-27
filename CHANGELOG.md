@@ -7,6 +7,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Asymmetric open challenges are courted when the persona opts in.** A pool
+  entry imposing the opponent's variant asymmetrically (the premium form —
+  e.g. a human playing ōgi who imposes xiongqi) was refused outright
+  ("never emitted nor courted"), even by a persona with
+  `accept_imposed_variant = true` — the knob only governed the directed path.
+  The pool path now honours it: the bot courts the entry with the imposed
+  variant (persona weight still required), and its own entry fixes `self`
+  alone, leaving the opponent unconstrained — both to satisfy the pairing
+  (the imposer's `self` differs from ours) and to stay in the free tier.
+  The fleet still never EMITS asymmetric entries spontaneously.
 - **A human's Rematch click is always answered.** Two compounding gates could
   silence the reply path: the persona's per-game 75% willingness die also
   applied to INCOMING offers, and the one-offer-per-game guard blocked any
