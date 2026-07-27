@@ -64,10 +64,13 @@ const SIGMA_CORRESPONDENCE_SECS: u64 = 60;
 const COURT_MARGIN_SECS: u64 = 30;
 const OWN_ENTRY_WINDOW_SECS: u64 = 180;
 
-/// The `accept_until` window of a rematch offer (§9). The bot makes ONE offer
-/// per game (proactive or in reply), so this is the opponent's whole window to
-/// answer and let the arbiter found the rematch.
-const REMATCH_WINDOW_SECS: u64 = 300;
+/// The `accept_until` window of a rematch offer (§9). The bot keeps ONE LIVE
+/// offer per game (proactive or in reply), so this is the opponent's window to
+/// answer and let the arbiter found the rematch. Sized for a human lingering on
+/// the game-over screen — five minutes proved too short (an expired proactive
+/// offer used to silence the reply path; that guard is now deadline-aware, and
+/// the window generous).
+const REMATCH_WINDOW_SECS: u64 = 900;
 
 /// How far back the self-subscription replays when the bot starts. The
 /// subscription carries *live* traffic; the state a restart needs is rebuilt by
@@ -165,9 +168,11 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let mut sessions: BTreeMap<EventId, SessionMeta> = BTreeMap::new();
     let mut courted_entries: BTreeSet<EventId> = BTreeSet::new();
     let mut accepted_challenges: BTreeSet<EventId> = BTreeSet::new();
-    // Games we have already offered a rematch for — one offer per game, whether
-    // it went out proactively (on the verdict) or in reply to the opponent's.
-    let mut offered_rematches: BTreeSet<EventId> = BTreeSet::new();
+    // Games we have already offered a rematch for, keyed to OUR offer's
+    // `accept_until` — one LIVE offer per game, whether it went out proactively
+    // (on the verdict) or in reply to the opponent's; a lapsed offer may be
+    // renewed when the opponent offers after it expired.
+    let mut offered_rematches: BTreeMap<EventId, u64> = BTreeMap::new();
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -353,7 +358,7 @@ async fn recover_sessions(
 /// cost of refusing to start is that the bot plays nothing at all.
 async fn recover_offered_rematches(
     client: &Client,
-    offered_rematches: &mut BTreeSet<EventId>,
+    offered_rematches: &mut BTreeMap<EventId, u64>,
     me: PublicKey,
 ) -> Result<()> {
     let offers = fetch_many(
@@ -365,7 +370,16 @@ async fn recover_offered_rematches(
     .await?;
     for offer in &offers {
         if let Some(concluded) = tags::sole_event_with_marker(offer, "rematch_of") {
-            offered_rematches.insert(concluded);
+            let deadline: u64 = tags::accept_until(offer)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| {
+                    offer
+                        .created_at
+                        .as_secs()
+                        .saturating_add(REMATCH_WINDOW_SECS)
+                });
+            let entry = offered_rematches.entry(concluded).or_insert(0);
+            *entry = (*entry).max(deadline);
         }
     }
     tracing::debug!(
@@ -506,7 +520,7 @@ async fn handle_event(
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     courted_entries: &mut BTreeSet<EventId>,
     accepted_challenges: &mut BTreeSet<EventId>,
-    offered_rematches: &mut BTreeSet<EventId>,
+    offered_rematches: &mut BTreeMap<EventId, u64>,
     rng: &mut SplitMix64,
     me: PublicKey,
     event: Event,
@@ -590,7 +604,7 @@ async fn terminate_session(
     concluded: &EventId,
     adjudication: &EventId,
     opponent: &PublicKey,
-    offered: &mut BTreeSet<EventId>,
+    offered: &mut BTreeMap<EventId, u64>,
 ) {
     ctx.ledger.session_changed(&me, opponent, false);
     maybe_offer_rematch(
@@ -600,16 +614,19 @@ async fn terminate_session(
         concluded,
         adjudication,
         opponent,
+        false,
         offered,
     )
     .await;
 }
 
-/// Offer `opponent` a rematch of `concluded`, unless we already offered one for
-/// this game, the persona is unwilling (a per-game decision), or — against a
-/// sibling bot — the bot-vs-bot budget is spent. Shared by both triggers (the
-/// proactive offer on the verdict and the reply to an incoming offer), which is
-/// why the one-per-game guard lives here. Best-effort: a failure is logged,
+/// Offer `opponent` a rematch of `concluded`, unless our own offer for this
+/// game is still LIVE, the persona is unwilling (a per-game decision the
+/// `always` flag overrides — reciprocating a human's explicit offer is
+/// unconditional), or — against a sibling bot — the bot-vs-bot budget is
+/// spent. Shared by both triggers (the proactive offer on the verdict and the
+/// reply to an incoming offer), which is why the one-live-offer-per-game guard
+/// lives here. Best-effort: a failure is logged,
 /// never propagated. The offer is self-timed (the bot never plays attested
 /// games) and mined by the publish path like any founding.
 ///
@@ -617,6 +634,7 @@ async fn terminate_session(
 /// `concluded` is over: the observed verdict on the proactive path, the (already
 /// verified) one the opponent cited on the reply path. Both adjudicate the same
 /// session, which is all the pair rule asks.
+#[allow(clippy::too_many_arguments)]
 async fn maybe_offer_rematch(
     client: &Client,
     ctx: &BotContext,
@@ -624,18 +642,31 @@ async fn maybe_offer_rematch(
     concluded: &EventId,
     adjudication: &EventId,
     opponent: &PublicKey,
-    offered: &mut BTreeSet<EventId>,
+    always: bool,
+    offered: &mut BTreeMap<EventId, u64>,
 ) {
-    // One offer per game — whether it goes out proactively or in reply, so two
-    // willing bots never volley mirrors forever.
-    if offered.contains(concluded) {
+    // One LIVE offer per game — whether it goes out proactively or in reply, so
+    // two willing bots never volley mirrors forever. The guard carries our
+    // offer's own `accept_until`: once that window lapses the pair can no longer
+    // be founded from our side, so an opponent offering AFTER the lapse earns a
+    // fresh mirror instead of silence (the previously assumed limitation).
+    let now = Timestamp::now().as_secs();
+    if offered
+        .get(concluded)
+        .is_some_and(|deadline| *deadline > now)
+    {
         return;
     }
-    if !rematch::wants_rematch(
-        ctx.bot_seed,
-        concluded,
-        rematch::DEFAULT_REMATCH_PROBABILITY,
-    ) {
+    // The per-game die gates only what the bot VOLUNTEERS. Reciprocating an
+    // explicit offer from outside the fleet is unconditional (`always`): a
+    // human who clicks Rematch is answered, never diced away.
+    if !always
+        && !rematch::wants_rematch(
+            ctx.bot_seed,
+            concluded,
+            rematch::DEFAULT_REMATCH_PROBABILITY,
+        )
+    {
         return;
     }
     if ctx.ledger.is_member(opponent) && !ctx.ledger.may_court_sibling() {
@@ -670,7 +701,10 @@ async fn maybe_offer_rematch(
     .await;
     match result {
         Ok(offer) => {
-            offered.insert(concluded);
+            let deadline: u64 = tags::accept_until(&offer)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(|| now.saturating_add(REMATCH_WINDOW_SECS));
+            offered.insert(concluded, deadline);
             tracing::info!(
                 rematch_of = %concluded,
                 against = %opponent,
@@ -686,15 +720,18 @@ async fn maybe_offer_rematch(
 /// reciprocate): verify it is a well-formed offer, from our arbiter, for a Game
 /// Session that BOTH of us actually played and that its `concluded_by`
 /// Adjudication really ended, then mirror it through the shared path (which
-/// applies the one-per-game, willingness and budget gates). Catches what the proactive offer misses — a restart that
-/// skipped the verdict, or the opponent offering first.
+/// applies the one-live-offer-per-game and budget gates; the persona die is
+/// bypassed for an offerer from outside the fleet — a human who clicks Rematch
+/// is answered). Catches what the proactive offer misses — a restart that
+/// skipped the verdict, the opponent offering first, or our own offer having
+/// expired before the human answered.
 async fn consider_rematch_offer(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
     me: PublicKey,
     event: &Event,
-    offered: &mut BTreeSet<EventId>,
+    offered: &mut BTreeMap<EventId, u64>,
 ) -> std::result::Result<(), &'static str> {
     let offer = rematch::parse_incoming_offer(event).ok_or("malformed rematch offer")?;
     if offer.addressed_to != me {
@@ -750,6 +787,7 @@ async fn consider_rematch_offer(
         &offer.concluded,
         &offer.concluded_by,
         &offer.offerer,
+        !ctx.ledger.is_member(&offer.offerer),
         offered,
     )
     .await;
@@ -982,7 +1020,7 @@ async fn service_all(
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
-    offered_rematches: &mut BTreeSet<EventId>,
+    offered_rematches: &mut BTreeMap<EventId, u64>,
 ) {
     let ids: Vec<EventId> = sessions.keys().copied().collect();
     for id in ids {

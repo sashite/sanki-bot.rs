@@ -16,8 +16,10 @@
 //! - [`parse_incoming_offer`] reads an incoming 6430 into the handful of fields
 //!   the bot needs to decide and mirror it;
 //! - [`wants_rematch`] is the persona's *per-game* willingness — decided once
-//!   per concluded game so the two triggers (proactively offering on the
-//!   verdict, and answering an opponent's offer) always agree;
+//!   per concluded game so the bot's VOLUNTEERED offers are stable (the
+//!   proactive offer on the verdict, and bot-vs-bot mirrors); answering an
+//!   explicit offer from outside the fleet bypasses it (the actor's `always`
+//!   flag) — a human who clicks Rematch is answered, never diced away;
 //! - [`build_offer_tags`] builds the tags of the bot's OWN mirror offer.
 //!
 //! The actor wires these in the next sub-tasks: the 6425 handler offers

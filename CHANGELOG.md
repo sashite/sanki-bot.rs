@@ -5,6 +5,20 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.3.0] — 2026-07-27
 
+### Fixed
+
+- **A human's Rematch click is always answered.** Two compounding gates could
+  silence the reply path: the persona's per-game 75% willingness die also
+  applied to INCOMING offers, and the one-offer-per-game guard blocked any
+  fresh mirror once the bot's own proactive offer (a 300 s window) had
+  expired — the plan's assumed limitation. Reciprocating an offerer from
+  outside the fleet is now unconditional (the die keeps gating only
+  volunteered offers and bot-vs-bot mirrors), the offer window grows to
+  `REMATCH_WINDOW_SECS = 900`, and the guard is deadline-aware (keyed to our
+  offer's own `accept_until`): an opponent offering after our offer lapsed
+  earns a fresh mirror instead of silence. The startup recovery keeps the
+  latest deadline per game.
+
 ### Changed
 
 - **Rules kernels brought to the castling release** (2026-07-27):
