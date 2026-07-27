@@ -3,6 +3,16 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] — 2026-07-27
+
+### Changed
+
+- **Rules kernels brought to the castling release** (2026-07-27):
+  `sashite-sanki-engine` 0.6 → **0.7**, `sashite-sanki-arbiter` 0.9 →
+  **0.10**, `sashite-sanki-player` 0.2 → **0.3** — castling in ōgi and
+  xiongqi. The personas play (and answer) the new castlings; the founding
+  positions they join carry the `-R` corner markers.
+
 ## [0.2.0] — 2026-07-22
 
 ### Changed
