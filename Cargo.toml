@@ -35,6 +35,14 @@ sashite-sanki-engine = "0.6"
 sashite-sanki-arbiter = "0.9"
 sashite-sanki-player = "0.2"
 
+[dev-dependencies]
+# The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary
+# connects to, with the one fault injection the §6.5 incident needs. Versions
+# already in the dependency tree (via nostr-sdk), so nothing new compiles.
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+serde_json = "1"
+
 [lints.rust]
 unsafe_code = "forbid"
 
