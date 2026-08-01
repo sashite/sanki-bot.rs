@@ -1,6 +1,6 @@
 [package]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -31,9 +31,9 @@ chrono-tz = "0.10"
 # The pure crates: rules, protocol semantics, move decision. The bot maps relay
 # events into their types and never reimplements game or protocol semantics
 # (ADR-0014 §Chain and clock logic).
-sashite-sanki-engine = "0.7"
-sashite-sanki-arbiter = "0.10"
-sashite-sanki-player = "0.3"
+sashite-sanki-engine = "0.8"
+sashite-sanki-arbiter = "0.11"
+sashite-sanki-player = "0.4"
 
 [dev-dependencies]
 # The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary

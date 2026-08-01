@@ -3,6 +3,30 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] — 2026-07-31
+
+### Changed
+
+- **All three rules crates brought to their current releases:**
+  `sashite-sanki-engine` 0.7 → **0.8**, `sashite-sanki-arbiter` 0.10 →
+  **0.11**, `sashite-sanki-player` 0.3 → **0.4**. No code change here; the
+  suite (68 unit + the end-to-end relay test) passes unchanged. What the fleet
+  actually gains:
+  - *engine 0.8* — a checkmate is no longer misreported as `Ongoing` when a
+    cross-variant capture leaves an inert, opposite-cased token in the
+    capturer's hand tray. A persona reading that position saw a game still
+    running where it had in fact been mated, or had mated.
+  - *player 0.4* — three decision bugs fixed since 0.3.0: the root tie-break
+    could return a move that does not mate (a losing move tying a real mate's
+    fail-soft bound and winning the seeded draw); the dead-position gate was
+    inverted for mixed pairings and missed the unbounded same-coloured-bishops
+    rule, so dead positions scored as material edges; and an extreme
+    `contempt` could inflate a draw past `MATE` itself, letting a persona
+    prefer a repetition over an available checkmate.
+  - *arbiter 0.11* — the adjudication the bot reads back is now computed on the
+    corrected engine, so a session it played cross-variant is ruled the way it
+    was actually played.
+
 ## [0.3.0] — 2026-07-27
 
 ### Fixed

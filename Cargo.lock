@@ -307,13 +307,13 @@ dependencies = [
 
 [[package]]
 name = "displaydoc"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ac70aa55017e108007fbaf5aa0f54b021c98f92ff8af59d42eda9da96e3dd4f"
+checksum = "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -517,9 +517,9 @@ dependencies = [
 
 [[package]]
 name = "http"
-version = "1.4.2"
+version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6970f50e31d6fc17d3fa27329444bfa74e196cf62e95052a3f6fee181dba6425"
+checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
 dependencies = [
  "bytes",
  "itoa",
@@ -1072,9 +1072,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.42"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "once_cell",
  "ring",
@@ -1153,18 +1153,18 @@ checksum = "7344dcd33c42046e032b0616065ea4016243fed770eb5854eccf941e8b02169e"
 
 [[package]]
 name = "sashite-sanki-arbiter"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8481152009c1a017c7be5ea17efac7f6f8bf323f7bb1809eddde1d8781d93d4"
+checksum = "8ae18f9ece70604eafdecd50f002eaa23df69a293d7786dd0ed528c8bf3c29bc"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-engine"
-version = "0.7.0"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "395c63d0e663166d295c5476f4ad7d23c8ec3959d909695a221d38ae67df22d5"
+checksum = "0ddf96e32a5268022feab16d0d7956bedf45a57ca2e29195e29be9740cfd5303"
 dependencies = [
  "sashite-epin",
  "sashite-feen",
@@ -1176,16 +1176,16 @@ dependencies = [
 
 [[package]]
 name = "sashite-sanki-player"
-version = "0.3.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4c7bb84e8955e55762bba18b53e3895e1d32cd5b1104c3afb5f8c8d01752963"
+checksum = "fa106f75a90c42ed3c06b67aff4d4b9f28f242437bae1249be34445e5de66ccf"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1506,13 +1506,13 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.7.1"
+version = "2.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6328af13490e73a9b4694030fafd93f8c8c6a9dede33e821c3fc63eddf8042ba"
+checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
