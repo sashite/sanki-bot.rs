@@ -3,6 +3,32 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] — 2026-08-01
+
+### Changed
+
+- **All three rules crates brought to their reviewed releases:**
+  `sashite-sanki-engine` 0.8 → **0.9**, `sashite-sanki-arbiter` 0.11 →
+  **0.12**, `sashite-sanki-player` 0.4 → **0.5**, carrying with them
+  `sashite-feen` 0.1 → **0.2**, `sashite-qi` 0.1 → **0.2**, and
+  `sashite-sin` / `sashite-pin` / `sashite-epin` 1.0 → **1.1**. No code change
+  here; both test binaries (unit suite and the end-to-end relay test) pass
+  unchanged.
+
+  **No move selection changes.** The player's tactics, root tie-break and
+  property suites all pass identically across the bump, so this fleet plays the
+  same moves it played before.
+
+  What it gains is upstream correctness that had not reached it: every one of
+  those five notation crates was still pinned at its pre-review version in this
+  bot's lockfile, and for a binary the lockfile *is* the deployment. The two
+  that matter here are FEEN's encoder, which could return a string its own
+  parser rejects, and the engine's `Position::new`, which accepted boards that
+  are not 8×8. Neither was reachable from this bot — positions arrive through
+  `Position::parse` — but `chain.rs` keys its repetition map by
+  `Position::to_feen()`, and that key now comes from an encoder that cannot
+  produce something unreadable.
+
 ## [0.4.0] — 2026-07-31
 
 ### Changed

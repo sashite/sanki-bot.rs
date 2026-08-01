@@ -815,9 +815,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.44.1"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b2c039df4f96c4bf7dae52a74fd5516ad6dda83a11c0c69dea91b5255a4f37"
+checksum = "fb94d61a467a869a6790b907838a9bea82c813d567d9fcbac995f207be8cee4b"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -1121,18 +1121,18 @@ dependencies = [
 
 [[package]]
 name = "sashite-epin"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7753a4f1cfb4f5dd33bde131ad85d0d8b3d5840c605dfe28720d909cc53538fb"
+checksum = "2302c47126c9eefbeee6f0d770cb93085896313ed502c48dce71e118cbd890be"
 dependencies = [
  "sashite-pin",
 ]
 
 [[package]]
 name = "sashite-feen"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6a7818be026e5fdbf9b94eb35b311496a62c47a41fa9e021ff58fa24147477a"
+checksum = "ca5900930194a0ba7f2e347a1ba78a38803a8a34be6f3fd9d3000c5aa184b9e3"
 dependencies = [
  "sashite-epin",
  "sashite-qi",
@@ -1141,30 +1141,30 @@ dependencies = [
 
 [[package]]
 name = "sashite-pin"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "965f5c105a144349d47a2e3942fe68512e5465a388ea82070b83e0856d4942a3"
+checksum = "9461a26d05ce250547b391b989766272ab7b659ea1b3b79149b0312d724c857c"
 
 [[package]]
 name = "sashite-qi"
-version = "0.1.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7344dcd33c42046e032b0616065ea4016243fed770eb5854eccf941e8b02169e"
+checksum = "d3c64dab0f7e9471b7ace3b496da79024f44e2f4933ebe39d294d0984f309f3c"
 
 [[package]]
 name = "sashite-sanki-arbiter"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae18f9ece70604eafdecd50f002eaa23df69a293d7786dd0ed528c8bf3c29bc"
+checksum = "b8318895db992b57113800b5eb04ddea6d15028a12ec008e4c4eed03308a9fca"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-engine"
-version = "0.8.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ddf96e32a5268022feab16d0d7956bedf45a57ca2e29195e29be9740cfd5303"
+checksum = "af69334cfbe486d23d362b14115f1183b3bbd5ad66bfdcbfbeb6056161bab899"
 dependencies = [
  "sashite-epin",
  "sashite-feen",
@@ -1176,16 +1176,16 @@ dependencies = [
 
 [[package]]
 name = "sashite-sanki-player"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa106f75a90c42ed3c06b67aff4d4b9f28f242437bae1249be34445e5de66ccf"
+checksum = "80c26e6c595f313d93f6274b7860400b4563c152c2015029b433cf5431125818"
 dependencies = [
  "sashite-sanki-engine",
 ]
 
 [[package]]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1206,9 +1206,9 @@ dependencies = [
 
 [[package]]
 name = "sashite-sin"
-version = "1.0.0"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e83af8ac4ed81d515d15da7f0afd254a3e06eb66b6cd7bf795e0da5a7cc178c"
+checksum = "d33a4ec8ae9361a1ff80891a07dee0826a868d184fb94cf801c1e9974c90423c"
 
 [[package]]
 name = "scrypt"
