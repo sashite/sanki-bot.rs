@@ -42,7 +42,7 @@ pub fn event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
 /// The event id of the `e` tag carrying the given marker, when the event carries
 /// **exactly one** such tag and its id parses — the shape a specification's
 /// "exactly one" requirement demands (e.g. a Rematch Offer's `concluded_by`,
-/// kind `6430` §Semantic constraints). `None` when the marker is absent,
+/// kind `3430` §Semantic constraints). `None` when the marker is absent,
 /// repeated, or carried by a tag whose id is missing or unparseable; a repeated
 /// marker is a malformation [`event_with_marker`] (first match wins) would let
 /// through.
@@ -66,7 +66,7 @@ pub fn sole_event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
 
 /// Every event id of `e` tags carrying the given marker, in tag order — e.g. the
 /// **two** `rematch_offer`-marked tags of a rematch-founded Game Session (kind
-/// `6422` §Founding reference). `None` if any marked tag's id is missing or
+/// `3422` §Founding reference). `None` if any marked tag's id is missing or
 /// unparseable, so a caller checking "exactly N" against the returned length
 /// never sees a malformed reference silently drop out of the count.
 pub fn events_with_marker(event: &Event, marker: &str) -> Option<Vec<EventId>> {
@@ -190,7 +190,7 @@ pub fn time_control_rows(event: &Event) -> Vec<Vec<String>> {
 }
 
 /// The role-keyed variant of an Open Challenge (`["variant", "self"|"opponent",
-/// "<variant>"]` — kind 6418's role-based form, before pubkeys are known).
+/// "<variant>"]` — kind 3418's role-based form, before pubkeys are known).
 pub fn role_variant<'a>(event: &'a Event, role: &str) -> Option<&'a str> {
     event.tags.iter().find_map(|tag| {
         let s = tag.as_slice();
@@ -204,7 +204,7 @@ pub fn role_variant<'a>(event: &'a Event, role: &str) -> Option<&'a str> {
     })
 }
 
-/// The first `filter` tag's elements after the name, if any (kind 6418
+/// The first `filter` tag's elements after the name, if any (kind 3418
 /// §Match-terms tags: `["filter", "following"]` or
 /// `["filter", "rating", "<max_delta>", "<authority>", "<kind>"]`).
 pub fn filter_row(event: &Event) -> Option<Vec<String>> {
@@ -238,7 +238,7 @@ mod tests {
     }
 
     fn signed(tags: Vec<Tag>, signer: &Keys) -> Event {
-        EventBuilder::new(Kind::Custom(6422), "")
+        EventBuilder::new(Kind::Custom(3422), "")
             .tags(tags)
             .sign_with_keys(signer)
             .expect("sign test event")

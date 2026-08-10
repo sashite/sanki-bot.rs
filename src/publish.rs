@@ -113,7 +113,7 @@ where
             builder = builder.tags(tags).pow(pow_difficulty);
         } else {
             // The `nonce` tag is STRUCTURALLY required on a clock-timed suite event —
-            // a Ply (kind 6423, §Proof-of-work tag / constraint 6) and an Adjudication
+            // a Ply (kind 3423, §Proof-of-work tag / constraint 6) and an Adjudication
             // Request — independently of the relay's difficulty policy: a conforming
             // client (e.g. the Sanki app's `parsePly`) rejects a Ply that carries none,
             // so its half-move never joins the canonical chain and the board wedges.

@@ -6,9 +6,9 @@
 //! (bot-vs-bot budget, pool occupancy), and runs one bot actor per persona —
 //! each with its own keypair, relay client and subscriptions. The bots hold
 //! no privileged key and exercise exactly the public protocol: entering the
-//! matchmaking pool (kind 6418), answering Direct Challenges (6420/6421),
-//! exchanging Plies (6423) under the Time Accounting discipline, and
-//! invoking the arbiter (6424) only when the predicted verdict is wanted.
+//! matchmaking pool (kind 3418), answering Direct Challenges (3420/3421),
+//! exchanging Plies (3423) under the Time Accounting discipline, and
+//! invoking the arbiter (3424) only when the predicted verdict is wanted.
 //!
 //! Game and protocol semantics are REUSED, never reimplemented:
 //! `sashite-sanki-engine` (legality, application), `sashite-sanki-arbiter`

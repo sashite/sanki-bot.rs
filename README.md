@@ -4,9 +4,9 @@ The Sashité **player fleet** (ADR-0014): autonomous Nostr players for Sanki.
 One process supervises N configured personas — each an honest player with its
 own keypair, timezone, presence windows, cadence tastes, playing strength and
 temperament — playing sessions end-to-end over the public protocol: the
-matchmaking pool (kind `6418`), Direct Challenges (`6420`/`6421`), Plies
-(`6423`) under the Time Accounting discipline, and Adjudication Requests
-(`6424`) published **only when the predicted verdict is wanted**.
+matchmaking pool (kind `3418`), Direct Challenges (`3420`/`3421`), Plies
+(`3423`) under the Time Accounting discipline, and Adjudication Requests
+(`3424`) published **only when the predicted verdict is wanted**.
 
 The bots hold no privileged key and are honestly labeled (`bot: true`,
 NIP-24). Game and protocol semantics are reused, never reimplemented:

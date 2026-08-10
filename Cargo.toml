@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/sashite/sanki-player-nostr-bot.rs"
-description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014). One supervisor, N personas — pool courtship (kind 6418), direct-challenge acceptance (6420/6421), full session play (6423) with clock discipline, predictive arbiter invocation (6424) — over the pure crates: sashite-sanki-engine (rules), sashite-sanki-arbiter (chain and clocks), sashite-sanki-player (move choice)."
+description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014). One supervisor, N personas — pool courtship (kind 3418), direct-challenge acceptance (3420/3421), full session play (3423) with clock discipline, predictive arbiter invocation (3424) — over the pure crates: sashite-sanki-engine (rules), sashite-sanki-arbiter (chain and clocks), sashite-sanki-player (move choice)."
 # Internal service, not a library for crates.io.
 publish = false
 

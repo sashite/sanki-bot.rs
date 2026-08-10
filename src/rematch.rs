@@ -1,19 +1,19 @@
-//! Rematch offers (kind 6430) — the pure layer.
+//! Rematch offers (kind 3430) — the pure layer.
 //!
 //! When a game ends, either player may offer a **rematch** of the concluded
-//! session by publishing a kind-6430 Rematch Offer (an untimed founding
+//! session by publishing a kind-3430 Rematch Offer (an untimed founding
 //! designation, like an Open or Direct Challenge). Two *mutually-addressed*
 //! offers of the same concluded session let the arbiter found ONE new Game
 //! Session with the seats swapped and the terms inherited. An offer proves the
 //! game is over by pointing, besides its `rematch_of` session, at an
-//! Adjudication (kind 6425) of that same session — its `concluded_by`
-//! reference, REQUIRED and exactly one (kind `6430` §Semantic constraints). The
+//! Adjudication (kind 3425) of that same session — its `concluded_by`
+//! reference, REQUIRED and exactly one (kind `3430` §Semantic constraints). The
 //! two offers of a pair need not cite the *same* Adjudication: a session may
 //! carry several, so `concluded_by` is a proof, never a pair identifier — the
 //! pair is still keyed by `rematch_of`. This module is the bot's side of that,
 //! with no I/O:
 //!
-//! - [`parse_incoming_offer`] reads an incoming 6430 into the handful of fields
+//! - [`parse_incoming_offer`] reads an incoming 3430 into the handful of fields
 //!   the bot needs to decide and mirror it;
 //! - [`wants_rematch`] is the persona's *per-game* willingness — decided once
 //!   per concluded game so the bot's VOLUNTEERED offers are stable (the
@@ -22,8 +22,8 @@
 //!   flag) — a human who clicks Rematch is answered, never diced away;
 //! - [`build_offer_tags`] builds the tags of the bot's OWN mirror offer.
 //!
-//! The actor wires these in the next sub-tasks: the 6425 handler offers
-//! proactively (initiate), and a 6430 subscription answers an opponent's offer
+//! The actor wires these in the next sub-tasks: the 3425 handler offers
+//! proactively (initiate), and a 3430 subscription answers an opponent's offer
 //! (reciprocate). The `nonce` proof-of-work tag is added by the publish path's
 //! miner (`publish::publish_self_timed`), not here.
 
@@ -33,9 +33,9 @@ use crate::prng::SplitMix64;
 use crate::tags;
 
 /// Rematch Offer — the untimed founding a player publishes to rematch a
-/// concluded session (in the manner of an Open Challenge 6418 or Direct
-/// Challenge 6420).
-pub const REMATCH_OFFER_KIND: u16 = 6430;
+/// concluded session (in the manner of an Open Challenge 3418 or Direct
+/// Challenge 3420).
+pub const REMATCH_OFFER_KIND: u16 = 3430;
 
 /// Default share of concluded games a persona is willing to rematch. The
 /// caller passes it to [`wants_rematch`]; it can move to per-persona config
@@ -51,7 +51,7 @@ pub struct IncomingOffer {
     pub addressed_to: PublicKey,
     /// The concluded session this offer rematches (its `rematch_of` reference).
     pub concluded: EventId,
-    /// The Adjudication (kind 6425) the offer cites as proof that session ended
+    /// The Adjudication (kind 3425) the offer cites as proof that session ended
     /// (its `concluded_by` reference). That it really adjudicates `concluded`,
     /// and is signed by that session's arbiter, is the caller's check: it needs
     /// the event itself, which only the relay has.
@@ -66,7 +66,7 @@ pub struct IncomingOffer {
 }
 
 /// Read an event as an incoming Rematch Offer, extracting the fields the bot
-/// needs. Returns `None` unless it is a structurally well-formed 6430: exactly
+/// needs. Returns `None` unless it is a structurally well-formed 3430: exactly
 /// one `rematch_of` reference, exactly one `concluded_by` reference, an `opponent`
 /// distinct from the signer, an `arbiter`, and a parseable `accept_until` lying
 /// in the offer's own future.
@@ -80,7 +80,7 @@ pub fn parse_incoming_offer(event: &Event) -> Option<IncomingOffer> {
     if event.kind != Kind::Custom(REMATCH_OFFER_KIND) {
         return None;
     }
-    // REQUIRED, and exactly one (kind 6430 §Semantic constraints, constraint 1):
+    // REQUIRED, and exactly one (kind 3430 §Semantic constraints, constraint 1):
     // an offer naming two sessions does not say which one it replays, and taking
     // the first would let tag order decide what we are being invited to.
     let concluded = tags::sole_event_with_marker(event, "rematch_of")?;
@@ -113,9 +113,9 @@ pub fn parse_incoming_offer(event: &Event) -> Option<IncomingOffer> {
 }
 
 /// The founding a rematch-founded Game Session inherits, as read from its **pair**
-/// of Rematch Offers (kind `6422` §Founding reference: exactly two
+/// of Rematch Offers (kind `3422` §Founding reference: exactly two
 /// `rematch_offer`-marked references). A rematch session restates none of the
-/// terms (kind `6430` §Inherited terms), so the only things the pair itself
+/// terms (kind `3430` §Inherited terms), so the only things the pair itself
 /// settles are *which* session is being replayed and in *which* timing mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoundingPair {
@@ -126,7 +126,7 @@ pub struct FoundingPair {
 }
 
 /// Read the founding pair of a rematch-founded Game Session: the two offers must
-/// be conforming 6430s under `arbiter`, distinct, signed by two different
+/// be conforming 3430s under `arbiter`, distinct, signed by two different
 /// players, mutually addressed, replaying the same session, and agreeing on the
 /// timing mode.
 ///
@@ -202,13 +202,13 @@ pub fn wants_rematch(bot_seed: u64, concluded: &EventId, probability: f64) -> bo
 }
 
 /// Build the tags of the bot's OWN Rematch Offer of `concluded`: proving that
-/// session over with `adjudication` (the 6425 the bot observed, its
+/// session over with `adjudication` (the 3425 the bot observed, its
 /// `concluded_by`), addressed to `opponent`, designating `arbiter`, and — iff
 /// the concluded game was attested — the same `timestamper` (the offer mirrors
 /// the concluded game's timing mode). `accept_until` is an absolute unix-seconds
 /// deadline; the caller sets it from the stamped `created_at` plus its window.
 /// The `nonce` (NIP-13) is added by the publish path's miner, not here; the
-/// content is empty, as for a 6418/6420 founding.
+/// content is empty, as for a 3418/3420 founding.
 ///
 /// The caller passes whichever Adjudication of `concluded` it holds; it need not
 /// be the one the opponent's mirror cites, and the pair still matches on
@@ -284,11 +284,11 @@ mod tests {
             .id
     }
 
-    const GAME_SESSION_KIND: u16 = 6422;
-    const DIRECT_CHALLENGE_KIND: u16 = 6420;
-    const ADJUDICATION_KIND: u16 = 6425;
+    const GAME_SESSION_KIND: u16 = 3422;
+    const DIRECT_CHALLENGE_KIND: u16 = 3420;
+    const ADJUDICATION_KIND: u16 = 3425;
 
-    /// Build a signed 6430 the way the app or the load-test harness would, with
+    /// Build a signed 3430 the way the app or the load-test harness would, with
     /// `created_at` set an hour before its deadline (a live window).
     fn offer_event(
         signer: &Keys,
@@ -369,7 +369,7 @@ mod tests {
         let me = keys().public_key();
         let arbiter = keys().public_key();
         let concluded = a_concluded_id();
-        // The same tag shape carried by a Direct Challenge kind is not a 6430.
+        // The same tag shape carried by a Direct Challenge kind is not a 3430.
         let tags = build_offer_tags(
             &concluded,
             &an_adjudication_id(),
@@ -793,7 +793,7 @@ mod tests {
     #[test]
     fn rejects_offers_disagreeing_on_the_timing_mode() {
         // One offer claims attestation, the other self-timing: the pair founds a
-        // session nobody could rule (kind 6430 §Semantic constraints 6).
+        // session nobody could rule (kind 3430 §Semantic constraints 6).
         let alice = keys();
         let bob = keys();
         let arbiter = keys().public_key();

@@ -1,5 +1,5 @@
-//! Courtship decisions — pool entries (kind 6418) and Direct Challenges
-//! (kinds 6420/6421), per ADR-0014 §6.2–§6.3.
+//! Courtship decisions — pool entries (kind 3418) and Direct Challenges
+//! (kinds 3420/3421), per ADR-0014 §6.2–§6.3.
 //!
 //! Everything here is **pure** over borrowed events and persona data. The
 //! async layer performs the fetches a decision may require (contact lists,
@@ -12,7 +12,7 @@ use crate::config::PlayConfig;
 use crate::prng::SplitMix64;
 use crate::tags;
 
-/// A pool entry (kind 6418) judged compatible from the bot's side, up to the
+/// A pool entry (kind 3418) judged compatible from the bot's side, up to the
 /// async checks (mute lists; the counterparty's `following` filter).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolCandidate {
@@ -135,7 +135,7 @@ pub fn evaluate_open_challenge(
     })
 }
 
-/// A Direct Challenge (kind 6420) the persona would accept, with what the
+/// A Direct Challenge (kind 3420) the persona would accept, with what the
 /// acceptance must supply (§6.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptPlan {
@@ -144,7 +144,7 @@ pub struct AcceptPlan {
     /// The bot's own variant: the challenge's imposition, or a persona draw.
     pub my_variant: String,
     /// The bot's variant to DECLARE on the acceptance — `Some` only when the
-    /// challenge left it open. Kind 6421 constraint 7: the acceptance MUST NOT
+    /// challenge left it open. Kind 3421 constraint 7: the acceptance MUST NOT
     /// re-declare a variant the challenge already fixed, or the pair is invalid
     /// and the arbiter never founds the game.
     pub supply_my_variant: Option<String>,
@@ -238,7 +238,7 @@ pub fn evaluate_direct_challenge(
     };
 
     // The acceptance supplies exactly what the challenge left open, and MUST NOT
-    // re-declare a term the challenge already fixed (kind 6421 constraint 7 — the
+    // re-declare a term the challenge already fixed (kind 3421 constraint 7 — the
     // same-player variant tag present in BOTH events invalidates the pair): the
     // bot's own variant only when it was not imposed, the challenger's by the
     // mirror rule when delegated, the seat by a uniform draw when open.
@@ -347,7 +347,7 @@ mod tests {
             tag("accept_until", &["2000000300"]),
         ];
         tags.extend(extra);
-        EventBuilder::new(Kind::Custom(6418), "")
+        EventBuilder::new(Kind::Custom(3418), "")
             .tags(tags)
             .sign_with_keys(signer)
             .expect("sign")
@@ -481,7 +481,7 @@ mod tests {
         // Rating filter: fail-closed for an unrated bot.
         assert!(eval(&base(vec![
             tag("variant", &["self", "ogi"]),
-            tag("filter", &["rating", "200", &"c".repeat(64), "6426"]),
+            tag("filter", &["rating", "200", &"c".repeat(64), "3426"]),
         ]))
         .is_err());
         // A `following` filter defers to the async check.
@@ -524,7 +524,7 @@ mod tests {
             tag("accept_until", &["2000000300"]),
         ];
         tags.extend(extra);
-        EventBuilder::new(Kind::Custom(6420), "")
+        EventBuilder::new(Kind::Custom(3420), "")
             .tags(tags)
             .sign_with_keys(signer)
             .expect("sign")
@@ -636,7 +636,7 @@ mod tests {
         );
         let me_pk = me.public_key();
         // A cadence absent from the persona (which has 10 s/move and 5 + 3).
-        let off_cadence = EventBuilder::new(Kind::Custom(6420), "")
+        let off_cadence = EventBuilder::new(Kind::Custom(3420), "")
             .tags(vec![
                 p_role(&me_pk, "opponent"),
                 p_role(&arb, "arbiter"),
@@ -689,7 +689,7 @@ mod tests {
         // The challenger plays chess and imposes ogi on us — an explicit
         // cross-variant game. The cadence is a persona one, so only the variant
         // terms are under test.
-        let cross = EventBuilder::new(Kind::Custom(6420), "")
+        let cross = EventBuilder::new(Kind::Custom(3420), "")
             .tags(vec![
                 p_role(&me_pk, "opponent"),
                 p_role(&arb, "arbiter"),
@@ -736,7 +736,7 @@ mod tests {
         .expect("accept the imposed variant");
         assert_eq!(plan.my_variant, "ogi");
         assert_eq!(plan.supply_challenger_variant, None);
-        // The imposed variant is NOT re-declared on the acceptance (6421 c7).
+        // The imposed variant is NOT re-declared on the acceptance (3421 c7).
         assert_eq!(plan.supply_my_variant, None);
     }
 

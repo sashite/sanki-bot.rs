@@ -33,13 +33,13 @@ use crate::publish::{publish_self_timed, RelayClock};
 use crate::rematch;
 use crate::tags;
 
-const OPEN_CHALLENGE_KIND: u16 = 6418;
-const DIRECT_CHALLENGE_KIND: u16 = 6420;
-const ACCEPTED_CHALLENGE_KIND: u16 = 6421;
-const GAME_SESSION_KIND: u16 = 6422;
-const PLY_KIND: u16 = 6423;
-const ADJUDICATION_REQUEST_KIND: u16 = 6424;
-const ADJUDICATION_KIND: u16 = 6425;
+const OPEN_CHALLENGE_KIND: u16 = 3418;
+const DIRECT_CHALLENGE_KIND: u16 = 3420;
+const ACCEPTED_CHALLENGE_KIND: u16 = 3421;
+const GAME_SESSION_KIND: u16 = 3422;
+const PLY_KIND: u16 = 3423;
+const ADJUDICATION_REQUEST_KIND: u16 = 3424;
+const ADJUDICATION_KIND: u16 = 3425;
 const CHALLENGE_POLICY_KIND: u16 = 30420;
 const MUTE_LIST_KIND: u16 = 10000;
 const CONTACTS_KIND: u16 = 3;
@@ -116,7 +116,7 @@ struct SessionMeta {
     opponent: PublicKey,
     correspondence: bool,
     /// When we first saw it (silent-arbiter bookkeeping happens upstream —
-    /// a tracked session always has its 6422).
+    /// a tracked session always has its 3422).
     my_side_evals: VecDeque<i32>,
     /// Earliest instant we may act on the pending duty (think pacing).
     next_action_at: u64,
@@ -178,7 +178,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
 
     // Fixed-size subscriptions (§3): everything that p-tags the bot, plus the
-    // pool feed on the matchmaker. Session-scoped 6424/6425 coverage comes
+    // pool feed on the matchmaker. Session-scoped 3424/3425 coverage comes
     // from the per-service fetch (the tick), not a mutable subscription — the
     // bounded-subscription variant is an optimization this loop can add later.
     let self_filter = Filter::new()
@@ -393,7 +393,7 @@ async fn recover_offered_rematches(
 /// `timestamper`, present iff attested), the time control, and the raw
 /// `time_control` rows the courtship layer compares byte-for-byte.
 ///
-/// A session is founded one of three ways (kind `6422` §Founding reference): a
+/// A session is founded one of three ways (kind `3422` §Founding reference): a
 /// directed challenge (`accepted_challenge` → the Direct Challenge behind it), a
 /// matchmade one (`pairing`), or a **rematch** — exactly two `rematch_offer`
 /// references, which restate no terms at all and so must be followed back to the
@@ -446,7 +446,7 @@ async fn resolve_founding(
     }
     // The terms come from the concluded session's OWN chain, never from the
     // offers (which restate none). The mode is then read back against what the
-    // pair claims — kind `6430` §Semantic constraints 6. Trusting the offers
+    // pair claims — kind `3430` §Semantic constraints 6. Trusting the offers
     // instead would let a pair claiming `None` found a session the arbiter can
     // only rule as attested, which the bot would then play blind.
     let (mode, time_control, rows) = Box::pin(resolve_founding(client, &concluded, hops)).await?;
@@ -482,7 +482,7 @@ async fn track_session(
         .ok_or_else(|| anyhow!("no opponent in the session"))?;
 
     // Founding-chain resolution (time control + timing mode) — directed,
-    // matchmade, or rematch (kind `6422` §Founding reference).
+    // matchmade, or rematch (kind `3422` §Founding reference).
     let (timestamper, time_control, rows) =
         resolve_founding(client, &session, MAX_REMATCH_HOPS).await?;
     if timestamper.is_some() {
@@ -589,7 +589,7 @@ async fn handle_event(
 
 /// Terminate a tracked session on its verdict: release the fleet budget slot,
 /// then (if the persona is willing) proactively offer a rematch. BOTH paths
-/// that observe the terminal 6425 — the notification arm and the tick's session
+/// that observe the terminal 3425 — the notification arm and the tick's session
 /// service — funnel through here, so the offer fires whichever wins the race to
 /// `sessions.remove`; that guard keeps it to one offer per game. Both carry the
 /// Adjudication that ended the session (`adjudication`): the offer must cite one
@@ -630,7 +630,7 @@ async fn terminate_session(
 /// never propagated. The offer is self-timed (the bot never plays attested
 /// games) and mined by the publish path like any founding.
 ///
-/// `adjudication` is the 6425 the offer cites as its `concluded_by` proof that
+/// `adjudication` is the 3425 the offer cites as its `concluded_by` proof that
 /// `concluded` is over: the observed verdict on the proactive path, the (already
 /// verified) one the opponent cited on the reply path. Both adjudicate the same
 /// session, which is all the pair rule asks.
@@ -716,7 +716,7 @@ async fn maybe_offer_rematch(
     }
 }
 
-/// Answer an incoming Rematch Offer (kind 6430) addressed to us (§9,
+/// Answer an incoming Rematch Offer (kind 3430) addressed to us (§9,
 /// reciprocate): verify it is a well-formed offer, from our arbiter, for a Game
 /// Session that BOTH of us actually played and that its `concluded_by`
 /// Adjudication really ended, then mirror it through the shared path (which
@@ -762,7 +762,7 @@ async fn consider_rematch_offer(
     }
     // The offer's proof that the game is over: its `concluded_by` must really be
     // an Adjudication OF that session, signed by the arbiter who signed it (kind
-    // 6425 §Semantic constraints). Without this the reference is a free-form
+    // 3425 §Semantic constraints). Without this the reference is a free-form
     // pointer, and a stranger could dress any event up as a verdict. Re-checked
     // here even though our own arbiter is honest: what we mirror is what we saw,
     // not what we assume.
@@ -984,11 +984,11 @@ async fn consider_direct_challenge(
                 // The arbiter subscribes on `#p = self` and founds the game only
                 // from an Accepted Challenge that names it: without this tag the
                 // acceptance is published and OK'd by the relay, but the arbiter
-                // never sees it and no Game Session (6422) is ever founded.
+                // never sees it and no Game Session (3422) is ever founded.
                 p_role(&arbiter, "arbiter"),
             ];
             // A player's variant is declared ONLY when the challenge left it open
-            // (kind 6421 constraint 7): re-declaring a variant the challenge already
+            // (kind 3421 constraint 7): re-declaring a variant the challenge already
             // fixed puts the same tag in both events and invalidates the pair — the
             // arbiter then never founds the game.
             if let Some(mine) = &supply_mine {
@@ -1127,7 +1127,7 @@ async fn service_session(
             publish_request(client, ctx, relay_clock, session_id).await?;
             tracing::info!(session = %session_id, ?invocation, "invoked the arbiter");
         }
-        return Ok(None); // dropped when the 6425 lands
+        return Ok(None); // dropped when the 3425 lands
     }
 
     if view.terminal || view.on_move != my_key {
@@ -1244,7 +1244,7 @@ async fn service_session(
     Ok(None)
 }
 
-/// What a 6424 published now would achieve, if it is worth publishing
+/// What a 3424 published now would achieve, if it is worth publishing
 /// (§6.6): the bot invokes ONLY when it wants the predicted verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Invocation {
@@ -1474,7 +1474,7 @@ async fn play_ply(
     Ok(())
 }
 
-/// Publish the Adjudication Request (kind 6424).
+/// Publish the Adjudication Request (kind 3424).
 async fn publish_request(
     client: &Client,
     ctx: &BotContext,
@@ -1607,7 +1607,7 @@ async fn follows(client: &Client, follower: &PublicKey, followed: &PublicKey) ->
     })
 }
 
-/// The kind-6423 `content` of an engine move.
+/// The kind-3423 `content` of an engine move.
 fn move_content(mv: &EngineMove) -> String {
     match mv {
         EngineMove::Board { from, to, actor } => {
@@ -1677,7 +1677,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn move_content_matches_the_kind_6423_format() {
+    fn move_content_matches_the_kind_3423_format() {
         let board = EngineMove::parse(r#"["a1","a4",null]"#).unwrap();
         assert_eq!(move_content(&board), r#"["a1","a4",null]"#);
         let promo = EngineMove::parse(r#"["b7","b8","queen"]"#).unwrap();

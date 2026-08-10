@@ -49,7 +49,7 @@ pub struct SessionView {
     pub on_move: event::PublicKey,
     /// The mover's own step ordinal there.
     pub step: u32,
-    /// The chain already reached a terminal verdict (awaiting the 6425).
+    /// The chain already reached a terminal verdict (awaiting the 3425).
     pub terminal: bool,
     /// The tip position, for `sashite-sanki-player`.
     pub tip: sashite_sanki_engine::position::Position,

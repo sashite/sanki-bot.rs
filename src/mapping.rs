@@ -17,7 +17,7 @@ use sashite_sanki_engine::domain::time::Duration;
 use sashite_sanki_engine::domain::time_control::{Period, TimeControl};
 use sashite_sanki_engine::position::Position;
 
-/// Map a Ply (kind `6423`) to the arbiter's [`Ply`].
+/// Map a Ply (kind `3423`) to the arbiter's [`Ply`].
 pub fn ply(event: &Event) -> Result<Ply> {
     let session = tags::event_with_marker(event, "game_session")
         .ok_or_else(|| anyhow!("Ply references no Game Session"))?;
@@ -49,7 +49,7 @@ pub fn attestation(event: &Event) -> Result<Attestation> {
     ))
 }
 
-/// Map an Adjudication Request (kind `6424`) to the arbiter's
+/// Map an Adjudication Request (kind `3424`) to the arbiter's
 /// [`AdjudicationRequest`]. (Unused while the bot predicts through its
 /// synthetic probe; kept for parity with the sibling services.)
 #[allow(dead_code)]
@@ -71,14 +71,14 @@ pub fn request(event: &Event) -> Result<AdjudicationRequest> {
 /// Assemble [`SessionParams`] from the Game Session and the founding values the
 /// caller has already resolved. Founding-agnostic, so it serves both the directed
 /// (Accepted Challenge / Direct Challenge) and the matchmade (Pairing) paths:
-/// - `session` — the Game Session (kind `6422`): players, seats, arbiter
+/// - `session` — the Game Session (kind `3422`): players, seats, arbiter
 ///   (its signer), initial position (its content), and id;
 /// - `timestamper` — the designated timestamper, or `None` when the founding
 ///   designates none (self-timed — the default; attestation is a dormant
-///   capability): from the Accepted Challenge (kind `6421`) on the directed path,
-///   or from the Pairing (kind `6419`) on the matchmade path;
+///   capability): from the Accepted Challenge (kind `3421`) on the directed path,
+///   or from the Pairing (kind `3419`) on the matchmade path;
 /// - `time_control` — the agreed time control: from the Direct Challenge
-///   (kind `6420`), or from the Pairing (kind `6419`);
+///   (kind `3420`), or from the Pairing (kind `3419`);
 /// - `session_attestation` — in attested mode, the timestamper's Attestation
 ///   (kind `1041`) of the Game Session, whose `created_at` is t₀. `None` when
 ///   self-timed, in which case t₀ is the Game Session's own `created_at`.
@@ -144,7 +144,7 @@ pub fn session_params(
 }
 
 /// Build a [`TimeControl`] from the `time_control` tag(s) of a Direct Challenge
-/// (kind `6420`) or a Pairing (kind `6419`) — both carry the same tag format.
+/// (kind `3420`) or a Pairing (kind `3419`) — both carry the same tag format.
 pub fn time_control(event: &Event) -> Result<TimeControl> {
     let mut periods = Vec::new();
     for tag in event.tags.iter() {
@@ -181,7 +181,7 @@ pub fn time_control(event: &Event) -> Result<TimeControl> {
 }
 
 /// The `step` of a Ply: the signer's own move ordinal (a positive integer);
-/// the arbiter interprets it per kind `6423` §Step semantics and play order.
+/// the arbiter interprets it per kind `3423` §Step semantics and play order.
 fn step(event: &Event) -> Result<u32> {
     let value = tag_value(event, "step").ok_or_else(|| anyhow!("Ply has no `step` tag"))?;
     let step = value
@@ -280,7 +280,7 @@ mod tests {
         let mover = Keys::generate();
         let session_id = dummy_id();
         let event = sign(
-            6423,
+            3423,
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
@@ -303,7 +303,7 @@ mod tests {
         let mover = Keys::generate();
         let session_id = dummy_id();
         let with_draw = sign(
-            6423,
+            3423,
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
@@ -315,7 +315,7 @@ mod tests {
         assert!(ply(&with_draw).unwrap().draw);
 
         let step_zero = sign(
-            6423,
+            3423,
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
@@ -347,7 +347,7 @@ mod tests {
         let arbiter = Keys::generate().public_key();
         let session_id = dummy_id();
         let event = sign(
-            6424,
+            3424,
             "",
             vec![
                 marked_e(&session_id, "game_session"),
@@ -366,7 +366,7 @@ mod tests {
     fn parses_a_single_period_time_control() {
         let challenger = Keys::generate();
         let direct = sign(
-            6420,
+            3420,
             "",
             vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
             &challenger,
@@ -385,13 +385,13 @@ mod tests {
         let bob = Keys::generate(); // second
 
         let direct = sign(
-            6420,
+            3420,
             "",
             vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
             &alice,
         );
         let session = sign(
-            6422,
+            3422,
             CHESS_START,
             vec![
                 player(&alice.public_key()),
@@ -446,13 +446,13 @@ mod tests {
         let alice = Keys::generate();
         let bob = Keys::generate();
         let direct = sign(
-            6420,
+            3420,
             "",
             vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
             &alice,
         );
         let session = sign(
-            6422,
+            3422,
             CHESS_START,
             vec![
                 player(&alice.public_key()),
@@ -479,13 +479,13 @@ mod tests {
         let bob = Keys::generate();
 
         let direct = sign(
-            6420,
+            3420,
             "",
             vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
             &alice,
         );
         let session = sign(
-            6422,
+            3422,
             CHESS_START,
             vec![
                 player(&alice.public_key()),

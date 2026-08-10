@@ -59,7 +59,7 @@ pub struct MiniRelay {
     pub state: Arc<RelayState>,
 }
 
-const PLY_KIND: u64 = 6423;
+const PLY_KIND: u64 = 3423;
 
 impl MiniRelay {
     pub async fn start() -> Self {
@@ -81,7 +81,7 @@ impl MiniRelay {
         }
     }
 
-    /// Acknowledge-but-drop every Ply (kind 6423) from `pubkey_hex` — or stop.
+    /// Acknowledge-but-drop every Ply (kind 3423) from `pubkey_hex` — or stop.
     pub async fn swallow_plies_from(&self, pubkey_hex: Option<String>) {
         *self.state.swallow_plies_from.lock().await = pubkey_hex;
     }

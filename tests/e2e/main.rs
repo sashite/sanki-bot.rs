@@ -44,9 +44,9 @@ use mini_relay::MiniRelay;
 use nostr_sdk::prelude::*;
 use serde_json::Value;
 
-const GAME_SESSION_KIND: u16 = 6422;
-const PAIRING_KIND: u16 = 6419;
-const PLY_KIND: u16 = 6423;
+const GAME_SESSION_KIND: u16 = 3422;
+const PAIRING_KIND: u16 = 3419;
+const PLY_KIND: u16 = 3423;
 const REPUBLISH_GRACE_SECS: u64 = 15; // mirror of actor.rs — the contract under test
 
 /// Initial chess/chess position (the app fixtures' FEEN, byte-identical).

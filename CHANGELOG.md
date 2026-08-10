@@ -3,6 +3,29 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **BREAKING — the suite's kind numbers moved out of NIP-90's reserved range.**
+  The Game Sessions this bot plays are now kind `3422`, its Plies `3423`, the
+  Direct Challenges it answers `3420` with acceptances at `3421`, and the
+  Rematch Offers it exchanges `3430`. NIP-90 reserves `5000-7000` in one block
+  and pairs a job request with its result at a fixed offset of a thousand, so a
+  Ply at `6423` *was* the result of job request `5423` to anything that knows
+  NIP-90 (`web-specs.md` README §Kind numbers).
+
+  Nothing else changed, and nothing needed to: the numbers live in this crate,
+  not in its libraries — `sashite-sanki-engine`, `-arbiter` and `-player` carry
+  them only in doc comments, with no kind constant between them. The 68 unit
+  tests pass unchanged, and so does the per-slot idempotence e2e, which runs a
+  real session over a mini-relay and is therefore the first thing here to have
+  exercised the new numbers on a wire.
+
+  **Deploy with the arbiter and the matchmaker.** A kind number is the suite's
+  version identifier: a player on `3xxx` and an arbiter on `6xxx` are two
+  protocols, and no session forms between them.
+
 ## [0.5.0] — 2026-08-01
 
 ### Changed
