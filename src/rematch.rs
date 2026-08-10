@@ -237,23 +237,17 @@ pub fn build_offer_tags(
 
 /// A `["p", <pubkey>, "", <role>]` tag.
 fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
-    Tag::custom(
-        TagKind::p(),
-        [pubkey.to_hex(), String::new(), role.to_string()],
-    )
+    Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_string()])
 }
 
 /// A `["e", <id>, "", <marker>]` tag.
 fn marked_e(id: &EventId, marker: &str) -> Tag {
-    Tag::custom(
-        TagKind::e(),
-        [id.to_hex(), String::new(), marker.to_string()],
-    )
+    Tag::custom("e", [id.to_hex(), String::new(), marker.to_string()])
 }
 
 /// A `[<name>, <value>]` singleton tag.
 fn single(name: &str, value: &str) -> Tag {
-    Tag::custom(TagKind::custom(name), [value.to_string()])
+    Tag::custom(name, [value.to_string()])
 }
 
 #[cfg(test)]
@@ -271,7 +265,7 @@ mod tests {
     /// A real Game Session id to rematch (only its id is used).
     fn a_concluded_id() -> EventId {
         EventBuilder::new(Kind::Custom(GAME_SESSION_KIND), "feen")
-            .sign_with_keys(&keys())
+            .finalize(&keys())
             .expect("sign")
             .id
     }
@@ -279,7 +273,7 @@ mod tests {
     /// A real Adjudication id to cite as `concluded_by` (only its id is used).
     fn an_adjudication_id() -> EventId {
         EventBuilder::new(Kind::Custom(ADJUDICATION_KIND), "checkmate")
-            .sign_with_keys(&keys())
+            .finalize(&keys())
             .expect("sign")
             .id
     }
@@ -310,7 +304,7 @@ mod tests {
         EventBuilder::new(Kind::Custom(REMATCH_OFFER_KIND), "")
             .tags(tags)
             .custom_created_at(Timestamp::from_secs(accept_until.saturating_sub(3_600)))
-            .sign_with_keys(signer)
+            .finalize(signer)
             .expect("sign")
     }
 
@@ -380,7 +374,7 @@ mod tests {
         );
         let event = EventBuilder::new(Kind::Custom(DIRECT_CHALLENGE_KIND), "")
             .tags(tags)
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -397,7 +391,7 @@ mod tests {
                 p_role(&arbiter, "arbiter"),
                 single("accept_until", "2000000000"),
             ])
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -418,7 +412,7 @@ mod tests {
                 single("accept_until", "2000000000"),
             ])
             .custom_created_at(Timestamp::from_secs(1_999_996_400))
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -441,7 +435,7 @@ mod tests {
                 single("accept_until", "2000000000"),
             ])
             .custom_created_at(Timestamp::from_secs(1_999_996_400))
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -463,7 +457,7 @@ mod tests {
                 single("accept_until", "2000000000"),
             ])
             .custom_created_at(Timestamp::from_secs(1_999_996_400))
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -503,7 +497,7 @@ mod tests {
                 1_000,
             ))
             .custom_created_at(Timestamp::from_secs(1_000))
-            .sign_with_keys(&signer)
+            .finalize(&signer)
             .expect("sign");
         assert!(parse_incoming_offer(&event).is_none());
     }
@@ -550,7 +544,7 @@ mod tests {
         );
         let event = EventBuilder::new(Kind::Custom(REMATCH_OFFER_KIND), "")
             .tags(tags)
-            .sign_with_keys(&keys())
+            .finalize(&keys())
             .expect("sign");
         assert_eq!(
             tags::event_with_marker(&event, "rematch_of"),
@@ -644,7 +638,7 @@ mod tests {
         let (first, second, arbiter) = a_pair(&concluded, None);
         let impostor = EventBuilder::new(Kind::Custom(DIRECT_CHALLENGE_KIND), "")
             .tags(second.tags.to_vec())
-            .sign_with_keys(&keys())
+            .finalize(&keys())
             .expect("sign");
         assert_eq!(
             founding_pair([&first, &impostor], &arbiter),
@@ -773,7 +767,7 @@ mod tests {
                 p_role(&arbiter, "arbiter"),
                 single("accept_until", "2000000000"),
             ])
-            .sign_with_keys(&alice)
+            .finalize(&alice)
             .expect("sign");
         let second = offer_event(
             &bob,

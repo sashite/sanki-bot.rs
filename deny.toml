@@ -7,12 +7,12 @@ version = 2
 # Fail on yanked crates. Vulnerabilities and unmaintained advisories fail by
 # default (config version 2); listed exceptions go in `ignore` below.
 yanked = "deny"
-ignore = [
-    # `instant` is unmaintained, but it is pulled in only transitively through
-    # `nostr`'s wasm/time path and cannot be swapped out from here. Revisit and
-    # remove this entry once `nostr` no longer depends on it.
-    "RUSTSEC-2024-0384",
-]
+# The `instant` exception (RUSTSEC-2024-0384) went out with nostr-sdk 0.45: it
+# said to remove the entry once `nostr` no longer depends on the crate, and it no
+# longer does. A stale exception is worse than none — it keeps silencing an
+# advisory nobody is checking still applies, and cargo-deny flags it as
+# `advisory-not-detected`.
+ignore = []
 
 [licenses]
 version = 2

@@ -242,7 +242,7 @@ mod tests {
     fn sign(kind: u16, content: &str, tags: Vec<Tag>, signer: &Keys) -> Event {
         EventBuilder::new(Kind::Custom(kind), content)
             .tags(tags)
-            .sign_with_keys(signer)
+            .finalize(signer)
             .expect("sign test event")
     }
 
@@ -251,28 +251,19 @@ mod tests {
     }
 
     fn marked_e(id: &EventId, marker: &str) -> Tag {
-        Tag::custom(
-            TagKind::e(),
-            [id.to_hex(), String::new(), marker.to_string()],
-        )
+        Tag::custom("e", [id.to_hex(), String::new(), marker.to_string()])
     }
 
     fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
-        Tag::custom(
-            TagKind::p(),
-            [pubkey.to_hex(), String::new(), role.to_string()],
-        )
+        Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_string()])
     }
 
     fn player(pubkey: &PublicKey) -> Tag {
-        Tag::custom(
-            TagKind::p(),
-            [pubkey.to_hex(), String::new(), "player".to_string()],
-        )
+        Tag::custom("p", [pubkey.to_hex(), String::new(), "player".to_string()])
     }
 
     fn keyed(name: &str, pubkey: &PublicKey, value: &str) -> Tag {
-        Tag::custom(TagKind::custom(name), [pubkey.to_hex(), value.to_string()])
+        Tag::custom(name, [pubkey.to_hex(), value.to_string()])
     }
 
     #[test]
@@ -284,7 +275,7 @@ mod tests {
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
-                Tag::custom(TagKind::custom("step"), ["3"]),
+                Tag::custom("step", ["3"]),
             ],
             &mover,
         );
@@ -307,8 +298,8 @@ mod tests {
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
-                Tag::custom(TagKind::custom("step"), ["1"]),
-                Tag::custom(TagKind::custom("draw"), Vec::<String>::new()),
+                Tag::custom("step", ["1"]),
+                Tag::custom("draw", Vec::<String>::new()),
             ],
             &mover,
         );
@@ -319,7 +310,7 @@ mod tests {
             "e4",
             vec![
                 marked_e(&session_id, "game_session"),
-                Tag::custom(TagKind::custom("step"), ["0"]),
+                Tag::custom("step", ["0"]),
             ],
             &mover,
         );
@@ -368,7 +359,7 @@ mod tests {
         let direct = sign(
             3420,
             "",
-            vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
+            vec![Tag::custom("time_control", ["300", "5"])],
             &challenger,
         );
         let tc = time_control(&direct).unwrap();
@@ -387,7 +378,7 @@ mod tests {
         let direct = sign(
             3420,
             "",
-            vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
+            vec![Tag::custom("time_control", ["300", "5"])],
             &alice,
         );
         let session = sign(
@@ -448,7 +439,7 @@ mod tests {
         let direct = sign(
             3420,
             "",
-            vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
+            vec![Tag::custom("time_control", ["300", "5"])],
             &alice,
         );
         let session = sign(
@@ -481,7 +472,7 @@ mod tests {
         let direct = sign(
             3420,
             "",
-            vec![Tag::custom(TagKind::custom("time_control"), ["300", "5"])],
+            vec![Tag::custom("time_control", ["300", "5"])],
             &alice,
         );
         let session = sign(

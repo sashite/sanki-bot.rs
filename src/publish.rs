@@ -9,6 +9,7 @@
 //! is simply re-signed with a bumped `created_at` (raising the estimate for
 //! the next publish). Any other rejection is surfaced, never blind-retried.
 
+use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{anyhow, Result};
@@ -108,9 +109,14 @@ where
         let created_at = relay_clock.stamp();
         let (mut tags, content) = build(created_at);
         let mut builder = EventBuilder::new(kind, content).custom_created_at(created_at);
+        let mut difficulty: Option<NonZeroU8> = None;
         if pow_difficulty > 0 {
-            // Mining adds the NIP-13 `nonce` tag as a side effect.
-            builder = builder.tags(tags).pow(pow_difficulty);
+            // Mining adds the NIP-13 `nonce` tag as a side effect. Since nostr
+            // 0.45 it happens on the UNSIGNED event rather than on the builder
+            // (`EventBuilder::pow` is gone), so the target is carried down to
+            // the signing step below.
+            difficulty = NonZeroU8::new(pow_difficulty);
+            builder = builder.tags(tags);
         } else {
             // The `nonce` tag is STRUCTURALLY required on a clock-timed suite event —
             // a Ply (kind 3423, §Proof-of-work tag / constraint 6) and an Adjudication
@@ -121,11 +127,18 @@ where
             // tag would be absent; add the trivially-satisfied 0-target nonce explicitly,
             // mirroring the app's own miner, which emits `["nonce", "0", "0"]` at
             // difficulty 0.
-            tags.push(Tag::custom(TagKind::custom("nonce"), ["0", "0"]));
+            tags.push(Tag::custom("nonce", ["0", "0"]));
             builder = builder.tags(tags);
         }
-        let event = builder
-            .sign_with_keys(keys)
+        let unsigned = builder.finalize_unsigned(keys.public_key());
+        let unsigned = match difficulty {
+            Some(target) => unsigned
+                .mine(&SingleThreadPow, target)
+                .map_err(|e| anyhow!("mining failed: {e}"))?,
+            None => unsigned,
+        };
+        let event = unsigned
+            .finalize(keys)
             .map_err(|e| anyhow!("signing failed: {e}"))?;
 
         match client.send_event(&event).await {

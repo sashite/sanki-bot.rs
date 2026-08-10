@@ -16,8 +16,10 @@ name = "players"
 path = "src/main.rs"
 
 [dependencies]
-# Networking client; bundles `nostr` 0.44 (Event, EventBuilder, Tag, Kind, Keys, …).
-nostr-sdk = "0.44"
+# Networking client; bundles `nostr` 0.45 (Event, EventBuilder, Tag, Kind, Keys, …).
+# 0.45 is where the relay pool lives: the standalone `nostr-relay-pool` crate it
+# used to pull is unmaintained (RUSTSEC-2026-0243).
+nostr-sdk = "0.45"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 anyhow = "1"
 tracing = "0.1"

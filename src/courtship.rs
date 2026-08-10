@@ -321,16 +321,13 @@ mod tests {
 
     fn tag(name: &str, values: &[&str]) -> Tag {
         Tag::custom(
-            TagKind::custom(name),
+            name,
             values.iter().map(ToString::to_string).collect::<Vec<_>>(),
         )
     }
 
     fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
-        Tag::custom(
-            TagKind::p(),
-            [pubkey.to_hex(), String::new(), role.to_string()],
-        )
+        Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_string()])
     }
 
     fn open_challenge(
@@ -349,7 +346,7 @@ mod tests {
         tags.extend(extra);
         EventBuilder::new(Kind::Custom(3418), "")
             .tags(tags)
-            .sign_with_keys(signer)
+            .finalize(signer)
             .expect("sign")
     }
 
@@ -526,7 +523,7 @@ mod tests {
         tags.extend(extra);
         EventBuilder::new(Kind::Custom(3420), "")
             .tags(tags)
-            .sign_with_keys(signer)
+            .finalize(signer)
             .expect("sign")
     }
 
@@ -594,11 +591,8 @@ mod tests {
             &me_pk,
             &arb,
             vec![
-                Tag::custom(
-                    TagKind::custom("variant"),
-                    [human_pk.to_hex(), "chess".into()],
-                ),
-                Tag::custom(TagKind::custom("variant"), [me_pk.to_hex(), "ogi".into()]),
+                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
             ],
         );
         assert!(eval(&asymmetric).is_err());
@@ -609,11 +603,8 @@ mod tests {
             &me_pk,
             &arb,
             vec![
-                Tag::custom(
-                    TagKind::custom("variant"),
-                    [human_pk.to_hex(), "ogi".into()],
-                ),
-                Tag::custom(TagKind::custom("variant"), [me_pk.to_hex(), "ogi".into()]),
+                Tag::custom("variant", [human_pk.to_hex(), "ogi".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
             ],
         );
         let plan = eval(&mirror).unwrap();
@@ -644,7 +635,7 @@ mod tests {
                 tag("time_control", &["600", "5"]),
                 tag("accept_until", &["2000000300"]),
             ])
-            .sign_with_keys(&human)
+            .finalize(&human)
             .expect("sign");
         let mut rng = SplitMix64::new(1);
 
@@ -696,13 +687,10 @@ mod tests {
                 tag("game", &["sanki"]),
                 tag("time_control", &["0", "10", "1"]),
                 tag("accept_until", &["2000000300"]),
-                Tag::custom(
-                    TagKind::custom("variant"),
-                    [human_pk.to_hex(), "chess".into()],
-                ),
-                Tag::custom(TagKind::custom("variant"), [me_pk.to_hex(), "ogi".into()]),
+                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
             ])
-            .sign_with_keys(&human)
+            .finalize(&human)
             .expect("sign");
         let mut rng = SplitMix64::new(1);
 

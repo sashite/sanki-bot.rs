@@ -26,6 +26,44 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   version identifier: a player on `3xxx` and an arbiter on `6xxx` are two
   protocols, and no session forms between them.
 
+- **`nostr-sdk` 0.44 → 0.45.** Clears
+  [RUSTSEC-2026-0243](https://rustsec.org/advisories/RUSTSEC-2026-0243): 0.44
+  pulls the standalone `nostr-relay-pool`, no longer maintained since its
+  functionality moved into `nostr-sdk` itself. `cargo deny check` is green
+  again and the crate has left the lock file.
+
+  `ClientBuilder::signer` is gone, which costs this bot nothing — it already
+  signed every event itself before sending it (§Client obligations in
+  self-timed mode), so only the builder line changed.
+  `subscribe(filter, None)` became `subscribe(filter)`,
+  `fetch_events(filter, timeout)` became `fetch_events(filter).timeout(t)`,
+  `RelayPoolNotification` became `ClientNotification`, and `notifications()`
+  yields a `Stream` instead of a broadcast `Receiver`. On the `nostr` side,
+  `TagKind` is gone — a tag name is a string now, which is what `variant`,
+  `time_control`, `step`, `seat` and the rest always were — and
+  `sign_with_keys` became `finalize`.
+
+  `EventBuilder::pow` is the one that touches conduct rather than spelling: it
+  became `UnsignedEvent::mine`, so mining now happens on the **unsigned** event,
+  between building and signing. `publish_self_timed` carries the difficulty down
+  to the signing step instead of applying it to the builder. The order is the
+  honest one — the nonce is part of what the id commits to — and the
+  `created_at` retry loop is unaffected: a stale rejection still re-stamps,
+  re-mines and re-signs from scratch. The difficulty-0 path, which hand-writes
+  `["nonce", "0", "0"]` because a conforming client requires the tag whatever
+  the relay's policy, is untouched.
+
+  One thing is lost, and it is upstream's doing: the 0.45 notification stream
+  silently drops the broadcast lag error, so a bot that falls behind now misses
+  events without a warning where the loop used to emit one. The `TICK_SECS`
+  service pass is the safety net that was already there — it re-services every
+  session on a timer, so a missed Ply is noticed late rather than never — but
+  the relay pool is private in 0.45, and the signal is out of reach.
+
+  The 68 unit tests pass unchanged, and so does the per-slot idempotence e2e:
+  the real binary against a mini-relay, publishing mined Plies over a wire,
+  which is what actually exercises the new signing and mining path.
+
 ## [0.5.0] — 2026-08-01
 
 ### Changed

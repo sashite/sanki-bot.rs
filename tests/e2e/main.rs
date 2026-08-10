@@ -183,7 +183,7 @@ async fn republishes_the_same_content_after_grace_and_never_two_contents_per_slo
             tag(&["p", &arbiter.public_key().to_hex(), "", "arbiter"]),
             tag(&["time_control", "300", "3"]),
         ])
-        .sign_with_keys(&arbiter)
+        .finalize(&arbiter)
         .expect("sign founding");
     let session = EventBuilder::new(Kind::Custom(GAME_SESSION_KIND), START_FEEN)
         .tags([
@@ -196,7 +196,7 @@ async fn republishes_the_same_content_after_grace_and_never_two_contents_per_slo
             tag(&["variant", &opponent.public_key().to_hex(), "chess"]),
             tag(&["variant", &bot_hex, "chess"]),
         ])
-        .sign_with_keys(&arbiter)
+        .finalize(&arbiter)
         .expect("sign session");
     let session_id = session.id.to_hex();
     relay
@@ -214,7 +214,7 @@ async fn republishes_the_same_content_after_grace_and_never_two_contents_per_slo
             tag(&["step", "1"]),
             tag(&["nonce", "0", "0"]),
         ])
-        .sign_with_keys(&opponent)
+        .finalize(&opponent)
         .expect("sign opening ply");
     relay
         .inject(serde_json::to_value(&opening).expect("opening json"))

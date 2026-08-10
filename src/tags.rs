@@ -232,7 +232,7 @@ mod tests {
 
     fn an_event_id() -> EventId {
         EventBuilder::new(Kind::Custom(1), "")
-            .sign_with_keys(&keys())
+            .finalize(&keys())
             .expect("sign")
             .id
     }
@@ -240,30 +240,24 @@ mod tests {
     fn signed(tags: Vec<Tag>, signer: &Keys) -> Event {
         EventBuilder::new(Kind::Custom(3422), "")
             .tags(tags)
-            .sign_with_keys(signer)
+            .finalize(signer)
             .expect("sign test event")
     }
 
     fn p(pubkey: &PublicKey, role: &str) -> Tag {
-        Tag::custom(
-            TagKind::p(),
-            [pubkey.to_hex(), String::new(), role.to_string()],
-        )
+        Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_string()])
     }
 
     fn e_marked(id: &EventId, marker: &str) -> Tag {
-        Tag::custom(
-            TagKind::e(),
-            [id.to_hex(), String::new(), marker.to_string()],
-        )
+        Tag::custom("e", [id.to_hex(), String::new(), marker.to_string()])
     }
 
     fn kv(name: &str, pubkey: &PublicKey, value: &str) -> Tag {
-        Tag::custom(TagKind::custom(name), [pubkey.to_hex(), value.to_string()])
+        Tag::custom(name, [pubkey.to_hex(), value.to_string()])
     }
 
     fn single(name: &str, value: &str) -> Tag {
-        Tag::custom(TagKind::custom(name), [value.to_string()])
+        Tag::custom(name, [value.to_string()])
     }
 
     #[test]
@@ -321,7 +315,7 @@ mod tests {
         // Present once but unparseable: none.
         let bad = signed(
             vec![Tag::custom(
-                TagKind::e(),
+                "e",
                 [
                     "not-an-event-id".to_string(),
                     String::new(),
@@ -363,7 +357,7 @@ mod tests {
             vec![
                 e_marked(&a, "rematch_offer"),
                 Tag::custom(
-                    TagKind::e(),
+                    "e",
                     [
                         "not-an-event-id".to_string(),
                         String::new(),
@@ -381,7 +375,7 @@ mod tests {
         let signer = keys();
         let direct = an_event_id();
         // An Accepted Challenge points at its Direct Challenge with no marker.
-        let event = signed(vec![Tag::custom(TagKind::e(), [direct.to_hex()])], &signer);
+        let event = signed(vec![Tag::custom("e", [direct.to_hex()])], &signer);
         assert_eq!(first_event_ref(&event), Some(direct));
     }
 

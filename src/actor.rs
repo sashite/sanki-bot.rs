@@ -15,7 +15,6 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use nostr_sdk::prelude::*;
-use tokio::sync::broadcast::error::RecvError;
 
 use sashite_sanki_arbiter::event as arb;
 use sashite_sanki_engine::domain::half_move::Move as EngineMove;
@@ -156,7 +155,10 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let span = tracing::info_span!("bot", bot = %ctx.name);
     let _enter = span.enter();
 
-    let client = Client::builder().signer(ctx.keys.clone()).build();
+    // No signer on the client: nostr-sdk 0.45 removed `ClientBuilder::signer`
+    // along with `send_event_builder`. This bot already signed every event
+    // itself before sending it (see `publish`), so only the builder changes.
+    let client = Client::builder().build();
     client
         .add_relay(ctx.fleet.relay_url.as_str())
         .await
@@ -203,11 +205,11 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
         .kind(Kind::Custom(OPEN_CHALLENGE_KIND))
         .pubkey(ctx.matchmaker);
     client
-        .subscribe(self_filter, None)
+        .subscribe(self_filter)
         .await
         .context("subscribing to self kinds")?;
     client
-        .subscribe(pool_filter, None)
+        .subscribe(pool_filter)
         .await
         .context("subscribing to the pool")?;
 
@@ -241,18 +243,25 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 )
                 .await;
             }
-            notification = notifications.recv() => match notification {
-                Ok(RelayPoolNotification::Event { event, .. }) => {
+            notification = notifications.next() => match notification {
+                Some(ClientNotification::Event { event, .. }) => {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut accepted_challenges, &mut offered_rematches, &mut rng, me, *event,
                     ).await;
                 }
-                Ok(_) => {}
-                Err(RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "notifications lagged");
-                }
-                Err(RecvError::Closed) => break,
+                Some(_) => {}
+                // The stream ends when the client shuts down.
+                //
+                // There is no `Lagged` arm to write any more, and its absence is not an
+                // oversight: 0.45 hands out a Stream over the same broadcast channel and
+                // its adapter DROPS the lag error rather than surfacing it. A bot that
+                // falls behind now misses events silently, where this loop used to warn.
+                // The tick above is the safety net that was already there — it re-services
+                // every session on a timer, so a missed Ply is noticed late rather than
+                // never — but the pool is private in 0.45 and the raw receiver is out of
+                // reach.
+                None => break,
             },
         }
     }
@@ -299,7 +308,7 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
             (
                 vec![
                     Tag::identifier(game.clone()),
-                    Tag::custom(TagKind::custom("mode"), [mode.clone()]),
+                    Tag::custom("mode", [mode.clone()]),
                 ],
                 String::new(),
             )
@@ -858,11 +867,8 @@ async fn court_pool_entry(
             let mut event_tags = vec![
                 p_role(&matchmaker, "matchmaker"),
                 p_role(&arbiter, "arbiter"),
-                Tag::custom(TagKind::custom("game"), [game.clone()]),
-                Tag::custom(
-                    TagKind::custom("variant"),
-                    ["self".to_owned(), variant.clone()],
-                ),
+                Tag::custom("game", [game.clone()]),
+                Tag::custom("variant", ["self".to_owned(), variant.clone()]),
             ];
             // The free MIRROR form imposes the shared variant back; courting an
             // ASYMMETRIC (premium) entry, our entry must leave the opponent
@@ -872,19 +878,19 @@ async fn court_pool_entry(
             // `courtship::PoolCandidate::mirror`).
             if mirror {
                 event_tags.push(Tag::custom(
-                    TagKind::custom("variant"),
+                    "variant",
                     ["opponent".to_owned(), variant.clone()],
                 ));
             }
             event_tags.push(Tag::custom(
-                TagKind::custom("accept_until"),
+                "accept_until",
                 [created_at
                     .as_secs()
                     .saturating_add(OWN_ENTRY_WINDOW_SECS)
                     .to_string()],
             ));
             for row in &spec {
-                event_tags.push(Tag::custom(TagKind::custom("time_control"), row.clone()));
+                event_tags.push(Tag::custom("time_control", row.clone()));
             }
             (event_tags, String::new())
         },
@@ -979,7 +985,7 @@ async fn consider_direct_challenge(
         ctx.fleet.pow_difficulty,
         move |_created_at| {
             let mut event_tags = vec![
-                Tag::custom(TagKind::e(), [challenge_id.to_hex()]),
+                Tag::custom("e", [challenge_id.to_hex()]),
                 p_role(&challenger, "opponent"),
                 // The arbiter subscribes on `#p = self` and founds the game only
                 // from an Accepted Challenge that names it: without this tag the
@@ -992,19 +998,16 @@ async fn consider_direct_challenge(
             // fixed puts the same tag in both events and invalidates the pair — the
             // arbiter then never founds the game.
             if let Some(mine) = &supply_mine {
-                event_tags.push(Tag::custom(
-                    TagKind::custom("variant"),
-                    [me_hex.clone(), mine.clone()],
-                ));
+                event_tags.push(Tag::custom("variant", [me_hex.clone(), mine.clone()]));
             }
             if let Some(theirs) = &supply_their {
                 event_tags.push(Tag::custom(
-                    TagKind::custom("variant"),
+                    "variant",
                     [challenger.to_hex(), theirs.clone()],
                 ));
             }
             if let Some(seat) = supply_seat {
-                event_tags.push(Tag::custom(TagKind::custom("seat"), [seat.to_owned()]));
+                event_tags.push(Tag::custom("seat", [seat.to_owned()]));
             }
             (event_tags, String::new())
         },
@@ -1355,7 +1358,7 @@ async fn publish_ply(
         move |_created_at| {
             let mut event_tags = vec![
                 Tag::custom(
-                    TagKind::e(),
+                    "e",
                     [
                         session_id.to_hex(),
                         String::new(),
@@ -1363,10 +1366,10 @@ async fn publish_ply(
                     ],
                 ),
                 p_role(&opponent, "opponent"),
-                Tag::custom(TagKind::custom("step"), [step.to_string()]),
+                Tag::custom("step", [step.to_string()]),
             ];
             if offer_draw {
-                event_tags.push(Tag::custom(TagKind::custom("draw"), Vec::<String>::new()));
+                event_tags.push(Tag::custom("draw", Vec::<String>::new()));
             }
             (event_tags, content.clone())
         },
@@ -1492,7 +1495,7 @@ async fn publish_request(
             (
                 vec![
                     Tag::custom(
-                        TagKind::e(),
+                        "e",
                         [
                             session_id.to_hex(),
                             String::new(),
@@ -1544,14 +1547,14 @@ async fn maybe_star(
             (
                 vec![
                     Tag::custom(
-                        TagKind::e(),
+                        "e",
                         [
                             session_id.to_hex(),
                             String::new(),
                             "sashite:session".to_owned(),
                         ],
                     ),
-                    Tag::custom(TagKind::custom("k"), [GAME_SESSION_KIND.to_string()]),
+                    Tag::custom("k", [GAME_SESSION_KIND.to_string()]),
                 ],
                 "+".to_owned(),
             )
@@ -1621,10 +1624,7 @@ fn move_content(mv: &EngineMove) -> String {
 }
 
 fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
-    Tag::custom(
-        TagKind::p(),
-        [pubkey.to_hex(), String::new(), role.to_owned()],
-    )
+    Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_owned()])
 }
 
 fn mapping_key(pubkey: PublicKey) -> Result<arb::PublicKey> {
@@ -1652,7 +1652,8 @@ fn json_string(value: &str) -> String {
 
 async fn fetch_many(client: &Client, filter: Filter) -> Result<Vec<Event>> {
     let events = client
-        .fetch_events(filter, FETCH_TIMEOUT)
+        .fetch_events(filter)
+        .timeout(FETCH_TIMEOUT)
         .await
         .context("fetch failed")?;
     Ok(events.into_iter().collect())
