@@ -47,6 +47,7 @@ pub type Skip = &'static str;
 pub fn evaluate_open_challenge(
     event: &Event,
     me: &PublicKey,
+    relay_url: &str,
     matchmaker: &PublicKey,
     arbiter: &PublicKey,
     game: &str,
@@ -71,6 +72,19 @@ pub fn evaluate_open_challenge(
     }
     if tags::pubkey_with_role(event, "timestamper").is_some() {
         return Err("attested mode (v1 is self-timed)");
+    }
+    // Pairing also requires the two entries' `timing_relay` sets to be
+    // identical (kind 3419 §Consent constraints, constraint 5): ours designates
+    // exactly the configured relay, so an entry designating anything else can
+    // never pair with us. Trailing slashes are insignificant.
+    let entry_relays: std::collections::BTreeSet<String> = tags::timing_relays(event)
+        .iter()
+        .map(|url| tags::norm_relay(url).to_owned())
+        .collect();
+    let ours: std::collections::BTreeSet<String> =
+        std::iter::once(tags::norm_relay(relay_url).to_owned()).collect();
+    if entry_relays != ours {
+        return Err("timing_relay designation is not our relay");
     }
     let accept_until: u64 = tags::accept_until(event)
         .and_then(|value| value.parse().ok())
@@ -166,6 +180,7 @@ pub struct AcceptPlan {
 pub fn evaluate_direct_challenge(
     event: &Event,
     me: &PublicKey,
+    relay_url: &str,
     arbiter: &PublicKey,
     game: &str,
     play: &PlayConfig,
@@ -184,6 +199,20 @@ pub fn evaluate_direct_challenge(
     }
     if tags::pubkey_with_role(event, "timestamper").is_some() {
         return Err("attested mode (v1 is self-timed)");
+    }
+    // Self-timed requires a timing designation, and it must name our relay —
+    // otherwise our plies would land where no verifier is told to look
+    // (Canonical Timing NIP §Timing modes and mode selection). The acceptance
+    // mirrors the set verbatim, so a superset that includes our relay is fine.
+    let designated = tags::timing_relays(event);
+    if designated.is_empty() {
+        return Err("no timing designation (neither timestamper nor timing_relay)");
+    }
+    if !designated
+        .iter()
+        .any(|url| tags::norm_relay(url) == tags::norm_relay(relay_url))
+    {
+        return Err("timing designation does not name our relay");
     }
     let challenger = event.pubkey;
     if challenger == *me {
@@ -339,6 +368,7 @@ mod tests {
         let mut tags = vec![
             p_role(matchmaker, "matchmaker"),
             p_role(arbiter, "arbiter"),
+            tag("timing_relay", &["wss://relay.example.com"]),
             tag("game", &["sanki"]),
             tag("time_control", &["0", "10", "1"]),
             tag("accept_until", &["2000000300"]),
@@ -370,6 +400,7 @@ mod tests {
         let candidate = evaluate_open_challenge(
             &entry,
             &me.public_key(),
+            "wss://relay.example.com",
             &mm,
             &arb,
             "sanki",
@@ -411,6 +442,7 @@ mod tests {
         let candidate = evaluate_open_challenge(
             &entry,
             &me.public_key(),
+            "wss://relay.example.com",
             &mm,
             &arb,
             "sanki",
@@ -434,6 +466,7 @@ mod tests {
         assert!(evaluate_open_challenge(
             &imposes_xiongqi,
             &me.public_key(),
+            "wss://relay.example.com",
             &mm,
             &arb,
             "sanki",
@@ -458,6 +491,7 @@ mod tests {
             evaluate_open_challenge(
                 event,
                 &me_pk,
+                "wss://relay.example.com",
                 &mm,
                 &arb,
                 "sanki",
@@ -497,6 +531,7 @@ mod tests {
         assert!(evaluate_open_challenge(
             &base(vec![tag("variant", &["self", "ogi"])]),
             &me_pk,
+            "wss://relay.example.com",
             &mm,
             &arb,
             "sanki",
@@ -516,6 +551,7 @@ mod tests {
         let mut tags = vec![
             p_role(me, "opponent"),
             p_role(arbiter, "arbiter"),
+            tag("timing_relay", &["wss://relay.example.com"]),
             tag("game", &["sanki"]),
             tag("time_control", &["300", "3"]),
             tag("accept_until", &["2000000300"]),
@@ -539,6 +575,7 @@ mod tests {
         let plan = evaluate_direct_challenge(
             &challenge,
             &me.public_key(),
+            "wss://relay.example.com",
             &arb,
             "sanki",
             &play(),
@@ -576,6 +613,7 @@ mod tests {
             evaluate_direct_challenge(
                 event,
                 &me_pk,
+                "wss://relay.example.com",
                 &arb,
                 "sanki",
                 &play(),
@@ -631,6 +669,7 @@ mod tests {
             .tags(vec![
                 p_role(&me_pk, "opponent"),
                 p_role(&arb, "arbiter"),
+                tag("timing_relay", &["wss://relay.example.com"]),
                 tag("game", &["sanki"]),
                 tag("time_control", &["600", "5"]),
                 tag("accept_until", &["2000000300"]),
@@ -643,6 +682,7 @@ mod tests {
         assert!(evaluate_direct_challenge(
             &off_cadence,
             &me_pk,
+            "wss://relay.example.com",
             &arb,
             "sanki",
             &play(),
@@ -658,6 +698,7 @@ mod tests {
         assert!(evaluate_direct_challenge(
             &off_cadence,
             &me_pk,
+            "wss://relay.example.com",
             &arb,
             "sanki",
             &any,
@@ -684,6 +725,7 @@ mod tests {
             .tags(vec![
                 p_role(&me_pk, "opponent"),
                 p_role(&arb, "arbiter"),
+                tag("timing_relay", &["wss://relay.example.com"]),
                 tag("game", &["sanki"]),
                 tag("time_control", &["0", "10", "1"]),
                 tag("accept_until", &["2000000300"]),
@@ -698,6 +740,7 @@ mod tests {
         assert!(evaluate_direct_challenge(
             &cross,
             &me_pk,
+            "wss://relay.example.com",
             &arb,
             "sanki",
             &play(),
@@ -714,6 +757,7 @@ mod tests {
         let plan = evaluate_direct_challenge(
             &cross,
             &me_pk,
+            "wss://relay.example.com",
             &arb,
             "sanki",
             &any,

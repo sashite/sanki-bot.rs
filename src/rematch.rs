@@ -174,6 +174,9 @@ pub fn founding_pair(
     if tags::pubkey_with_role(second, "timestamper") != timestamper {
         return Err("offers disagree on the timing mode");
     }
+    if tags::timing_relays(first) != tags::timing_relays(second) {
+        return Err("offers disagree on the timing_relay designation");
+    }
     Ok(FoundingPair {
         concluded,
         timestamper,
@@ -220,6 +223,7 @@ pub fn build_offer_tags(
     opponent: &PublicKey,
     arbiter: &PublicKey,
     timestamper: Option<&PublicKey>,
+    timing_relays: &[String],
     accept_until: u64,
 ) -> Vec<Tag> {
     let mut tags = vec![
@@ -230,6 +234,11 @@ pub fn build_offer_tags(
     ];
     if let Some(ts) = timestamper {
         tags.push(p_role(ts, "timestamper"));
+    }
+    // Self-timed designation, mirrored from the concluded session (kind 3430
+    // §Operating mode) — exactly one designation form is carried.
+    for url in timing_relays {
+        tags.push(single("timing_relay", url));
     }
     tags.push(single("accept_until", &accept_until.to_string()));
     tags
@@ -299,6 +308,7 @@ mod tests {
             opponent,
             arbiter,
             timestamper,
+            &["wss://relay.example.com".to_owned()],
             accept_until,
         );
         EventBuilder::new(Kind::Custom(REMATCH_OFFER_KIND), "")
@@ -370,6 +380,7 @@ mod tests {
             &me,
             &arbiter,
             None,
+            &["wss://relay.example.com".to_owned()],
             2_000_000_000,
         );
         let event = EventBuilder::new(Kind::Custom(DIRECT_CHALLENGE_KIND), "")
@@ -494,6 +505,7 @@ mod tests {
                 &me,
                 &arbiter,
                 None,
+                &["wss://relay.example.com".to_owned()],
                 1_000,
             ))
             .custom_created_at(Timestamp::from_secs(1_000))
@@ -540,6 +552,7 @@ mod tests {
             &opponent,
             &arbiter,
             None,
+            &["wss://relay.example.com".to_owned()],
             2_000_000_000,
         );
         let event = EventBuilder::new(Kind::Custom(REMATCH_OFFER_KIND), "")

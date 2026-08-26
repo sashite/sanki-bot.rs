@@ -416,8 +416,10 @@ async fn resolve_founding(
 ) -> Result<(Option<PublicKey>, TimeControl, Vec<Vec<String>>)> {
     if let Some(accepted_id) = tags::event_with_marker(session, "accepted_challenge") {
         let accepted = fetch_event(client, accepted_id).await?;
-        let direct_id = tags::first_event_ref(&accepted)
-            .ok_or_else(|| anyhow!("acceptance references no challenge"))?;
+        let direct_id =
+            tags::sole_event_with_marker(&accepted, "direct_challenge").ok_or_else(|| {
+                anyhow!("acceptance carries no single direct_challenge-marked reference")
+            })?;
         let direct = fetch_event(client, direct_id).await?;
         return Ok((
             tags::pubkey_with_role(&accepted, "timestamper"),
@@ -576,6 +578,7 @@ async fn handle_event(
                             &session_id,
                             &event.id,
                             &meta.opponent,
+                            &tags::timing_relays(&meta.session),
                             offered_rematches,
                         )
                         .await;
@@ -613,6 +616,7 @@ async fn terminate_session(
     concluded: &EventId,
     adjudication: &EventId,
     opponent: &PublicKey,
+    concluded_relays: &std::collections::BTreeSet<String>,
     offered: &mut BTreeMap<EventId, u64>,
 ) {
     ctx.ledger.session_changed(&me, opponent, false);
@@ -623,6 +627,7 @@ async fn terminate_session(
         concluded,
         adjudication,
         opponent,
+        concluded_relays,
         false,
         offered,
     )
@@ -651,6 +656,7 @@ async fn maybe_offer_rematch(
     concluded: &EventId,
     adjudication: &EventId,
     opponent: &PublicKey,
+    concluded_relays: &std::collections::BTreeSet<String>,
     always: bool,
     offered: &mut BTreeMap<EventId, u64>,
 ) {
@@ -686,6 +692,14 @@ async fn maybe_offer_rematch(
     let adjudication = *adjudication;
     let opponent = *opponent;
     let arbiter = ctx.arbiter;
+    // The offer mirrors the concluded session's self-timed designation (kind
+    // 3430 §Operating mode); a pre-designation session falls back to the
+    // configured relay, which is where it was in fact played.
+    let offer_relays: Vec<String> = if concluded_relays.is_empty() {
+        vec![tags::norm_relay(&ctx.fleet.relay_url).to_owned()]
+    } else {
+        concluded_relays.iter().cloned().collect()
+    };
     let result = publish_self_timed(
         client,
         &ctx.keys,
@@ -702,6 +716,7 @@ async fn maybe_offer_rematch(
                 &opponent,
                 &arbiter,
                 None,
+                &offer_relays,
                 accept_until,
             );
             (tags, String::new())
@@ -788,7 +803,9 @@ async fn consider_rematch_offer(
         return Err("concluded_by is not signed by the session's arbiter");
     }
     // Cite the very Adjudication the opponent cited: verified above, and the
-    // pair matches on `rematch_of` regardless.
+    // pair matches on `rematch_of` regardless. The mirror designates what the
+    // concluded session itself designates.
+    let concluded_relays = tags::timing_relays(&concluded);
     maybe_offer_rematch(
         client,
         ctx,
@@ -796,6 +813,7 @@ async fn consider_rematch_offer(
         &offer.concluded,
         &offer.concluded_by,
         &offer.offerer,
+        &concluded_relays,
         !ctx.ledger.is_member(&offer.offerer),
         offered,
     )
@@ -821,6 +839,7 @@ async fn court_pool_entry(
     let candidate: PoolCandidate = courtship::evaluate_open_challenge(
         entry,
         &me,
+        &ctx.fleet.relay_url,
         &ctx.matchmaker,
         &ctx.arbiter,
         &ctx.fleet.game,
@@ -857,6 +876,9 @@ async fn court_pool_entry(
     let matchmaker = ctx.matchmaker;
     let arbiter = ctx.arbiter;
     let game = ctx.fleet.game.clone();
+    // Self-timed designation: the configured relay, normalized (Canonical
+    // Timing NIP §Timing modes and mode selection).
+    let timing_relay = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
     publish_self_timed(
         client,
         &ctx.keys,
@@ -867,6 +889,7 @@ async fn court_pool_entry(
             let mut event_tags = vec![
                 p_role(&matchmaker, "matchmaker"),
                 p_role(&arbiter, "arbiter"),
+                Tag::custom("timing_relay", [timing_relay.clone()]),
                 Tag::custom("game", [game.clone()]),
                 Tag::custom("variant", ["self".to_owned(), variant.clone()]),
             ];
@@ -921,6 +944,7 @@ async fn consider_direct_challenge(
     let plan: AcceptPlan = courtship::evaluate_direct_challenge(
         challenge,
         &me,
+        &ctx.fleet.relay_url,
         &ctx.arbiter,
         &ctx.fleet.game,
         &ctx.config.play,
@@ -974,6 +998,9 @@ async fn consider_direct_challenge(
     let challenger = plan.challenger;
     let arbiter = ctx.arbiter;
     let me_hex = me.to_hex();
+    // The acceptance mirrors the challenge's self-timed designation VERBATIM
+    // (kind 3421 §Operating mode; vetted non-empty and naming our relay).
+    let mirrored_relays = tags::timing_relay_tags(challenge);
     let supply_mine = plan.supply_my_variant.clone();
     let supply_their = plan.supply_challenger_variant.clone();
     let supply_seat = plan.supply_seat;
@@ -985,7 +1012,14 @@ async fn consider_direct_challenge(
         ctx.fleet.pow_difficulty,
         move |_created_at| {
             let mut event_tags = vec![
-                Tag::custom("e", [challenge_id.to_hex()]),
+                Tag::custom(
+                    "e",
+                    [
+                        challenge_id.to_hex(),
+                        String::new(),
+                        "direct_challenge".to_string(),
+                    ],
+                ),
                 p_role(&challenger, "opponent"),
                 // The arbiter subscribes on `#p = self` and founds the game only
                 // from an Accepted Challenge that names it: without this tag the
@@ -993,6 +1027,7 @@ async fn consider_direct_challenge(
                 // never sees it and no Game Session (3422) is ever founded.
                 p_role(&arbiter, "arbiter"),
             ];
+            event_tags.extend(mirrored_relays.clone());
             // A player's variant is declared ONLY when the challenge left it open
             // (kind 3421 constraint 7): re-declaring a variant the challenge already
             // fixed puts the same tag in both events and invalidates the pair — the
@@ -1052,6 +1087,7 @@ async fn service_all(
                         &id,
                         &verdict_id,
                         &meta.opponent,
+                        &tags::timing_relays(&meta.session),
                         offered_rematches,
                     )
                     .await;

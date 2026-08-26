@@ -33,7 +33,7 @@ pub fn ply(event: &Event) -> Result<Ply> {
     ))
 }
 
-/// Map an Event Timestamp Attestation (kind `1041`) to the arbiter's
+/// Map an Event Timestamp Attestation (kind `3410`) to the arbiter's
 /// [`Attestation`]. Authority (is it the designated timestamper?) is the
 /// arbiter's concern, not this mapping's. (Unused while v1 is self-timed —
 /// kept for the attested-mode extension, ADR-0014 §13.)
@@ -80,7 +80,7 @@ pub fn request(event: &Event) -> Result<AdjudicationRequest> {
 /// - `time_control` — the agreed time control: from the Direct Challenge
 ///   (kind `3420`), or from the Pairing (kind `3419`);
 /// - `session_attestation` — in attested mode, the timestamper's Attestation
-///   (kind `1041`) of the Game Session, whose `created_at` is t₀. `None` when
+///   (kind `3410`) of the Game Session, whose `created_at` is t₀. `None` when
 ///   self-timed, in which case t₀ is the Game Session's own `created_at`.
 pub fn session_params(
     session: &Event,
@@ -321,7 +321,7 @@ mod tests {
     fn maps_an_attestation() {
         let timestamper = Keys::generate();
         let attested = dummy_id();
-        let event = sign(1041, "", vec![marked_e(&attested, "attests")], &timestamper);
+        let event = sign(3410, "", vec![marked_e(&attested, "attests")], &timestamper);
 
         let mapped = attestation(&event).unwrap();
         assert_eq!(mapped.attests.to_string(), attested.to_hex());
@@ -393,7 +393,7 @@ mod tests {
             &arbiter,
         );
         let session_attestation = sign(
-            1041,
+            3410,
             "",
             vec![marked_e(&session.id, "attests")],
             &timestamper,
@@ -489,7 +489,7 @@ mod tests {
 
         // An attestation of some OTHER event, not this session.
         let wrong_target = sign(
-            1041,
+            3410,
             "",
             vec![marked_e(&dummy_id(), "attests")],
             &timestamper,
@@ -503,7 +503,7 @@ mod tests {
         .is_err());
 
         // An attestation of this session, but signed by a non-timestamper.
-        let impostor = sign(1041, "", vec![marked_e(&session.id, "attests")], &alice);
+        let impostor = sign(3410, "", vec![marked_e(&session.id, "attests")], &alice);
         assert!(session_params(
             &session,
             Some(timestamper.public_key()),

@@ -7,6 +7,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **BREAKING (wire) — in-band timing designation, and kind `3410` for
+  attestations (2026-08-11 spec revisions).** A self-timed challenge now
+  carries one or more `["timing_relay", "<wss://…>"]` tags (XOR a
+  `timestamper` `p` tag — Canonical Timing NIP). The bot's own Open Challenges
+  designate its configured relay; it only accepts a Direct Challenge whose
+  designated set names that relay, and its acceptance MIRRORS the challenge's
+  set verbatim (kind `3421` constraint 4). Rematch offers mirror the concluded
+  session's designation. Attestations are kind `3410` (was `1041`, M-14).
+  Deploy together with the arbiter and the rest of the stack.
+
+- **BREAKING (wire) — acceptances now carry the `direct_challenge` marker** on
+  their founding `e` reference (kind `3421` §Reference tag). Deploy together
+  with the arbiter bot, which no longer ratifies an unmarked acceptance.
+
+### Changed
+
 - **BREAKING — the suite's kind numbers moved out of NIP-90's reserved range.**
   The Game Sessions this bot plays are now kind `3422`, its Plies `3423`, the
   Direct Challenges it answers `3420` with acceptances at `3421`, and the

@@ -87,20 +87,6 @@ pub fn events_with_marker(event: &Event, marker: &str) -> Option<Vec<EventId>> {
         .collect()
 }
 
-/// The event id of the first `e` tag, regardless of marker. Used for references
-/// that carry no marker, such as the Accepted Challenge's pointer to its Direct
-/// Challenge.
-pub fn first_event_ref(event: &Event) -> Option<EventId> {
-    event.tags.iter().find_map(|tag| {
-        let s = tag.as_slice();
-        if s.first().map(String::as_str) == Some("e") {
-            s.get(1).and_then(|v| EventId::parse(v).ok())
-        } else {
-            None
-        }
-    })
-}
-
 /// The value of the singleton `game` tag (`["game", "<id>"]`).
 pub fn game(event: &Event) -> Option<&str> {
     positional_value(event, "game", 1)
@@ -216,6 +202,43 @@ pub fn filter_row(event: &Event) -> Option<Vec<String>> {
             None
         }
     })
+}
+
+/// The values of every `timing_relay` tag (`["timing_relay", "<wss://…>"]`), as
+/// a **set**: the self-timed designation is mirrored and compared as a set
+/// (Canonical Timing NIP §Timing modes and mode selection). Empty in attested
+/// mode.
+pub fn timing_relays(event: &Event) -> std::collections::BTreeSet<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let s = tag.as_slice();
+            if s.first().map(String::as_str) == Some("timing_relay") {
+                s.get(1).cloned()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The raw `timing_relay` tags of `event`, in tag order — for mirroring the
+/// designation **verbatim** into a responding event (kind `3421` §Operating
+/// mode: the acceptance copies the challenge's set).
+pub fn timing_relay_tags(event: &Event) -> Vec<Tag> {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("timing_relay"))
+        .cloned()
+        .collect()
+}
+
+/// A relay URL normalized for designation comparison: the trailing slash is
+/// insignificant (`wss://r.example.com/` designates `wss://r.example.com`).
+pub fn norm_relay(url: &str) -> &str {
+    url.trim_end_matches('/')
 }
 
 #[cfg(test)]
@@ -368,15 +391,6 @@ mod tests {
             &signer,
         );
         assert_eq!(events_with_marker(&malformed, "rematch_offer"), None);
-    }
-
-    #[test]
-    fn reads_unmarked_first_event_ref() {
-        let signer = keys();
-        let direct = an_event_id();
-        // An Accepted Challenge points at its Direct Challenge with no marker.
-        let event = signed(vec![Tag::custom("e", [direct.to_hex()])], &signer);
-        assert_eq!(first_event_ref(&event), Some(direct));
     }
 
     #[test]
