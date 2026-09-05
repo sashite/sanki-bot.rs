@@ -14,7 +14,17 @@
 [fleet]
 relay_url  = "ws://localhost:8080"
 matchmaker = "<matchmaker hex pubkey>"
-arbiter    = "<arbiter hex pubkey>"
+# The Rule System event (kind 3417) the fleet plays under — its event id, the
+# value `publish-rules.py` (web-specs.md) prints last, the same id the app
+# (PUBLIC_RULES), the matchmaker and the rater are configured with. The event
+# and the module it names are loaded at start-up (from the relay and the
+# event's `url` hints) and cached below; a fleet that cannot load them does
+# not start.
+rules      = "<rule system event id, 64 hex characters>"
+# Where the event (`<id>.json`) and the module (`<digest>.wasm`) are cached.
+# A module dropped here by hand is used without fetching, after the same
+# digest check. Default: ./rules
+# rules_cache_dir = "/var/lib/sashite/rules"
 game       = "sanki"
 max_concurrent_bot_vs_bot = 3
 # The relay's NIP-13 minimum on player kinds (10 in production; 0 for a dev
@@ -52,6 +62,10 @@ nsec_env = "PLAYER_NSEC_KAORU"
   resign_threshold    = -700
   draw_offer          = "balanced"   # never | balanced | eager
   challenge_policy    = "everyone"
+  # Seconds the bot waits, once it predicts the opponent's flag, before
+  # publishing the Conclusion claiming the win on time (default 5): a human
+  # whose clock just fell is not flagged to the second.
+  # timeout_courtesy_secs = 5
 
   [bot.schedule]
   timezone = "Asia/Tokyo"

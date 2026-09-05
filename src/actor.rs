@@ -1,55 +1,52 @@
 //! One bot actor — a persona playing over the protocol interface
-//! (ADR-0014 §3, §6): standing events, courtship, session play, arbiter
-//! invocation, stars. Everything a bot does, a human client could do.
+//! (ADR-0014 §3, §6; ADR-0033/0034): standing events, courtship, founding,
+//! session play, conclusion, rematches, stars. Everything a bot does, a human
+//! client could do — and nothing a bot does on the rules axis is its own:
+//! the session's **module** (the rule system named by the fleet's Rule
+//! System event) answers every question of state, legality and verdict.
 //!
 //! The actor owns its relay client and subscriptions, and services its
 //! sessions **serially** (the per-bot concurrency caps make this natural —
 //! §7 of ADR-0015 assumes one `choose` at a time). Timed behavior (think
-//! delays, correspondence pacing, win-on-time wakes) is scheduled through a
-//! coarse periodic tick rather than per-event sleeps, so the notification
-//! loop never blocks.
+//! delays, correspondence pacing, win-on-time wakes, the timeout courtesy)
+//! is scheduled through a coarse periodic tick rather than per-event sleeps,
+//! so the notification loop never blocks.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use nostr_sdk::prelude::*;
 
-use sashite_sanki_arbiter::event as arb;
-use sashite_sanki_engine::domain::half_move::Move as EngineMove;
-use sashite_sanki_engine::domain::status::{Outcome3, Status};
-use sashite_sanki_engine::domain::time_control::TimeControl;
-use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Strength};
+use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Move, Position, Strength};
 
-use crate::chain::{predicted_verdict, session_view, SessionView};
+use crate::chain::{self, predicted_verdict, session_view, SessionView};
+use crate::conclusion::{self, Conclude};
 use crate::config::{BotConfig, DrawOffer, FleetSection};
 use crate::courtship::{self, AcceptPlan, PoolCandidate};
 use crate::fleet::Ledger;
-use crate::mapping;
+use crate::founding;
+use crate::module::{self, Check, Describe, Runtime};
 use crate::prng::SplitMix64;
-use crate::publish::{publish_self_timed, RelayClock};
+use crate::publish::{publish_self_timed, Pow, RelayClock};
 use crate::rematch;
+use crate::rules::LoadedRuleSystem;
+use crate::session::{self, Events, Seat, SessionTerms, Timing};
 use crate::tags;
 
 const OPEN_CHALLENGE_KIND: u16 = 3418;
-const DIRECT_CHALLENGE_KIND: u16 = 3420;
-const ACCEPTED_CHALLENGE_KIND: u16 = 3421;
-const GAME_SESSION_KIND: u16 = 3422;
-const PLY_KIND: u16 = 3423;
-const ADJUDICATION_REQUEST_KIND: u16 = 3424;
-const ADJUDICATION_KIND: u16 = 3425;
+const PAIRING_KIND: u16 = session::KIND_PAIRING;
+const DIRECT_CHALLENGE_KIND: u16 = session::KIND_DIRECT_CHALLENGE;
+const GAME_SESSION_KIND: u16 = session::KIND_GAME_SESSION;
+const PLY_KIND: u16 = session::KIND_PLY;
+const CONCLUSION_KIND: u16 = session::KIND_CONCLUSION;
 const CHALLENGE_POLICY_KIND: u16 = 30420;
 const MUTE_LIST_KIND: u16 = 10000;
 const CONTACTS_KIND: u16 = 3;
 
 /// Relay fetch budget.
 const FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(10);
-
-/// How far back a chain of rematches may be walked when resolving a session's
-/// inherited terms. A rematch of a rematch is legitimate; a relay serving a
-/// cycle of them is not, and only a bound tells the two apart.
-const MAX_REMATCH_HOPS: usize = 32;
 
 /// The actor's periodic heartbeat (schedules thinks, deadline wakes, courtship).
 const TICK_SECS: u64 = 5;
@@ -58,33 +55,41 @@ const TICK_SECS: u64 = 5;
 const SIGMA_LIVE_SECS: u64 = 2;
 const SIGMA_CORRESPONDENCE_SECS: u64 = 60;
 
-/// A pool entry's minimum residual life for us to court it, and the
-/// `accept_until` window of our own entries (§6.2).
+/// A pool entry's minimum residual life for us to court it, a Pairing's
+/// minimum residual founding window, the `accept_until` window of our own
+/// entries (§6.2).
 const COURT_MARGIN_SECS: u64 = 30;
 const OWN_ENTRY_WINDOW_SECS: u64 = 180;
 
-/// The `accept_until` window of a rematch offer (§9). The bot keeps ONE LIVE
-/// offer per game (proactive or in reply), so this is the opponent's window to
-/// answer and let the arbiter found the rematch. Sized for a human lingering on
-/// the game-over screen — five minutes proved too short (an expired proactive
-/// offer used to silence the reply path; that guard is now deadline-aware, and
-/// the window generous).
+/// The `accept_until` window of a rematch challenge (§9). The bot keeps ONE
+/// LIVE challenge per concluded game, so this is the opponent's window to
+/// accept — sized for a human lingering on the game-over screen.
 const REMATCH_WINDOW_SECS: u64 = 900;
 
 /// How far back the self-subscription replays when the bot starts. The
 /// subscription carries *live* traffic; the state a restart needs is rebuilt by
-/// the explicit recovery fetches, which are not bounded by this. Unbounded, the
-/// relay replays the bot's entire history the moment it connects — every Ply,
-/// verdict and offer it ever received — and the handlers work through a year of
-/// finished games as though they had just arrived. The window is not zero
-/// because `created_at` is the publisher's clock, not ours: the longest-lived
-/// thing that arrives here and still deserves acting on is a Rematch Offer
-/// inside its acceptance window, and three of those windows absorb both the skew
-/// and a slow start.
+/// the explicit recovery fetches. The window is not zero because `created_at`
+/// is the publisher's clock, not ours: the longest-lived thing that arrives
+/// here and still deserves acting on is a rematch challenge inside its
+/// acceptance window, and three of those windows absorb both the skew and a
+/// slow start.
 const SELF_REPLAY_LOOKBACK_SECS: u64 = 3 * REMATCH_WINDOW_SECS;
 
-/// Grace before locally abandoning a session whose arbiter stays silent.
-const SILENT_ARBITER_GRACE_SECS: u64 = 15 * 60;
+/// How far back the session recovery looks for Game Sessions naming the bot
+/// (§9): a correspondence game outlives a restart, a season-old one does not.
+/// Every recovered session costs one reconstruction on the first tick.
+const RECOVERY_LOOKBACK_SECS: u64 = 30 * 86_400;
+
+/// How far back the recovery looks for Pairings naming the bot: their
+/// founding window is a minute or two (kind 3419 §Lifecycle tags), so an
+/// older one has lapsed.
+const PAIRING_RECOVERY_LOOKBACK_SECS: u64 = 600;
+
+/// Grace before re-sending an already-published Ply or Conclusion whose echo
+/// has not come back (three coarse ticks): long enough for any realistic
+/// relay round trip, short enough never to threaten a clock even on a fast
+/// cadence.
+const REPUBLISH_GRACE_SECS: u64 = 15;
 
 /// Everything one bot actor needs, assembled by the supervisor.
 pub struct BotContext {
@@ -98,8 +103,13 @@ pub struct BotContext {
     pub fleet: FleetSection,
     /// The configured matchmaker.
     pub matchmaker: PublicKey,
-    /// The configured arbiter.
-    pub arbiter: PublicKey,
+    /// The rule system the fleet plays under: its event id, and its module —
+    /// shared by every persona of the process, one request at a time.
+    pub rules: EventId,
+    /// The loaded rule system (the module, instantiated).
+    pub module: Arc<Mutex<LoadedRuleSystem>>,
+    /// What the module's `describe` reports (the normative members).
+    pub describe: Describe,
     /// The shared fleet ledger.
     pub ledger: Arc<Ledger>,
     /// This bot's derived seed (from its pubkey).
@@ -108,14 +118,34 @@ pub struct BotContext {
     pub shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
+impl BotContext {
+    /// One synchronous exchange with the module.
+    fn with_module<T>(&self, f: impl FnOnce(&mut Runtime) -> T) -> Result<T> {
+        let mut guard = self
+            .module
+            .lock()
+            .map_err(|_| anyhow!("the module's lock is poisoned"))?;
+        Ok(f(&mut guard.runtime))
+    }
+}
+
 /// A tracked session.
 struct SessionMeta {
+    /// The canonical Game Session.
     session: Event,
-    params: sashite_sanki_arbiter::session::SessionParams,
+    /// The slot it occupies (kind 3422 §Idempotence and race resolution):
+    /// the founding's id, or the concluded session's for a rematch. One
+    /// tracked session per slot: a canonical one evicts a stale one.
+    slot: EventId,
+    /// Its terms.
+    terms: SessionTerms,
+    /// t₀.
+    start: u64,
+    /// The bot's seat.
+    my_seat: Seat,
+    /// The opponent.
     opponent: PublicKey,
     correspondence: bool,
-    /// When we first saw it (silent-arbiter bookkeeping happens upstream —
-    /// a tracked session always has its 3422).
     my_side_evals: VecDeque<i32>,
     /// Earliest instant we may act on the pending duty (think pacing).
     next_action_at: u64,
@@ -125,6 +155,15 @@ struct SessionMeta {
     /// The ply we last published, keyed by the half-move it filled — the
     /// same-slot idempotence guard (§6.5). See the guard in `service_session`.
     published: Option<PublishedPly>,
+    /// When the win on time was first predicted — the courtesy delay runs
+    /// from here (§6.6).
+    timeout_seen_at: Option<u64>,
+    /// The Conclusion we published and when — held until its echo comes
+    /// back, re-sent after the grace.
+    concluded: Option<(Event, u64)>,
+    /// Conclusions already logged as non-conforming (the client/kernel
+    /// divergence metric), so each is reported once.
+    warned: BTreeSet<EventId>,
 }
 
 /// The record behind `SessionMeta::published`: enough to RE-SEND the very
@@ -143,11 +182,6 @@ struct PublishedPly {
     at: u64,
 }
 
-/// Grace before re-sending an already-published ply whose echo has not come
-/// back (three coarse ticks): long enough for any realistic relay round trip,
-/// short enough never to threaten a clock even on a fast cadence.
-const REPUBLISH_GRACE_SECS: u64 = 15;
-
 /// Run the actor until shutdown. Errors bubble only for unrecoverable
 /// startup conditions; per-event errors are logged and absorbed.
 pub async fn run(mut ctx: BotContext) -> Result<()> {
@@ -155,9 +189,8 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let span = tracing::info_span!("bot", bot = %ctx.name);
     let _enter = span.enter();
 
-    // No signer on the client: nostr-sdk 0.45 removed `ClientBuilder::signer`
-    // along with `send_event_builder`. This bot already signed every event
-    // itself before sending it (see `publish`), so only the builder changes.
+    // No signer on the client: this bot signs every event itself before
+    // sending it (see `publish`).
     let client = Client::builder().build();
     client
         .add_relay(ctx.fleet.relay_url.as_str())
@@ -165,32 +198,35 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
         .with_context(|| format!("failed to add relay {}", ctx.fleet.relay_url))?;
     client.connect().await;
 
-    let relay_clock = RelayClock::new();
+    let relay_clock = Arc::new(RelayClock::new());
     let mut rng = SplitMix64::new(ctx.bot_seed);
     let mut sessions: BTreeMap<EventId, SessionMeta> = BTreeMap::new();
     let mut courted_entries: BTreeSet<EventId> = BTreeSet::new();
-    let mut accepted_challenges: BTreeSet<EventId> = BTreeSet::new();
-    // Games we have already offered a rematch for, keyed to OUR offer's
-    // `accept_until` — one LIVE offer per game, whether it went out proactively
-    // (on the verdict) or in reply to the opponent's; a lapsed offer may be
-    // renewed when the opponent offers after it expired.
+    let mut considered_challenges: BTreeSet<EventId> = BTreeSet::new();
+    let mut founded_pairings: BTreeSet<EventId> = BTreeSet::new();
+    // Games we have already challenged to a rematch, keyed to OUR challenge's
+    // `accept_until` — one LIVE challenge per game, whether it went out
+    // proactively (on the verdict) or in reply to the opponent's; a lapsed
+    // one may be renewed when the opponent proposes after it expired.
     let mut offered_rematches: BTreeMap<EventId, u64> = BTreeMap::new();
+    // Our own live pool entry's `accept_until`: one at a time, so N
+    // compatible strangers entering together do not become N sessions.
+    let own_entry_until: Arc<std::sync::atomic::AtomicU64> = Arc::new(0.into());
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
 
     // Fixed-size subscriptions (§3): everything that p-tags the bot, plus the
-    // pool feed on the matchmaker. Session-scoped 3424/3425 coverage comes
-    // from the per-service fetch (the tick), not a mutable subscription — the
-    // bounded-subscription variant is an optimization this loop can add later.
+    // pool feed on the matchmaker. Session-scoped Ply/Conclusion coverage
+    // comes from the per-service fetch (the tick), not a mutable subscription.
     let self_filter = Filter::new()
         .kinds(
             [
+                PAIRING_KIND,
                 DIRECT_CHALLENGE_KIND,
                 GAME_SESSION_KIND,
                 PLY_KIND,
-                ADJUDICATION_KIND,
-                rematch::REMATCH_OFFER_KIND,
+                CONCLUSION_KIND,
             ]
             .into_iter()
             .map(Kind::Custom),
@@ -204,6 +240,11 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let pool_filter = Filter::new()
         .kind(Kind::Custom(OPEN_CHALLENGE_KIND))
         .pubkey(ctx.matchmaker);
+    // The notification stream is opened BEFORE the subscriptions: it is a
+    // broadcast channel, and what the relay replays on REQ before the stream
+    // exists is lost to it — a Pairing that landed while the bot was
+    // starting, for one.
+    let mut notifications = client.notifications();
     client
         .subscribe(self_filter)
         .await
@@ -217,15 +258,44 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, me).await {
         tracing::warn!(error = %error, "session recovery incomplete");
     }
-    // …and rebuild what we have already offered, for the same reason: the
-    // one-offer-per-game gate lives in memory, so a restart would otherwise
-    // reopen every game the bot ever finished.
+    // …and rebuild what we have already challenged, for the same reason: the
+    // one-challenge-per-game gate lives in memory, so a restart would
+    // otherwise reopen every game the bot ever finished.
     if let Err(error) = recover_offered_rematches(&client, &mut offered_rematches, me).await {
-        tracing::warn!(error = %error, "rematch-offer recovery incomplete");
+        tracing::warn!(error = %error, "rematch recovery incomplete");
+    }
+    // …and found the Pairings that landed while the bot was down, while
+    // their founding window is open (a Pairing has no other trigger).
+    match fetch_many(
+        &client,
+        Filter::new()
+            .kind(Kind::Custom(PAIRING_KIND))
+            .pubkey(me)
+            .author(ctx.matchmaker)
+            .since(Timestamp::from(
+                Timestamp::now()
+                    .as_secs()
+                    .saturating_sub(PAIRING_RECOVERY_LOOKBACK_SECS),
+            )),
+    )
+    .await
+    {
+        Ok(pairings) => {
+            for pairing in pairings {
+                if founded_pairings.insert(pairing.id) {
+                    if let Err(reason) =
+                        consider_pairing(&client, &ctx, &relay_clock, &mut sessions, me, &pairing)
+                            .await
+                    {
+                        tracing::debug!(pairing = %pairing.id, reason, "recovered pairing not founded");
+                    }
+                }
+            }
+        }
+        Err(error) => tracing::warn!(error = %error, "pairing recovery incomplete"),
     }
     tracing::info!(sessions = sessions.len(), "bot up");
 
-    let mut notifications = client.notifications();
     let mut tick = tokio::time::interval(StdDuration::from_secs(TICK_SECS));
     loop {
         tokio::select! {
@@ -239,7 +309,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
             _ = tick.tick() => {
                 service_all(
                     &client, &ctx, &relay_clock, &mut sessions, &mut rng, me,
-                    &mut starred_today, &mut offered_rematches,
+                    &mut starred_today, &mut offered_rematches, None,
                 )
                 .await;
             }
@@ -247,20 +317,16 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 Some(ClientNotification::Event { event, .. }) => {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
-                        &mut accepted_challenges, &mut offered_rematches, &mut rng, me, *event,
+                        &mut considered_challenges, &mut founded_pairings,
+                        &mut offered_rematches, &own_entry_until, &mut starred_today,
+                        &mut rng, me, *event,
                     ).await;
                 }
                 Some(_) => {}
-                // The stream ends when the client shuts down.
-                //
-                // There is no `Lagged` arm to write any more, and its absence is not an
-                // oversight: 0.45 hands out a Stream over the same broadcast channel and
-                // its adapter DROPS the lag error rather than surfacing it. A bot that
-                // falls behind now misses events silently, where this loop used to warn.
-                // The tick above is the safety net that was already there — it re-services
-                // every session on a timer, so a missed Ply is noticed late rather than
-                // never — but the pool is private in 0.45 and the raw receiver is out of
-                // reach.
+                // The stream ends when the client shuts down. (0.45 drops the
+                // lag error rather than surfacing it; the tick re-services
+                // every session on a timer, so a missed event is noticed late
+                // rather than never.)
                 None => break,
             },
         }
@@ -288,7 +354,7 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
         &ctx.keys,
         relay_clock,
         Kind::Metadata,
-        0, // standing events are not player kinds; no PoW prescribed
+        Pow::None,
         |_created_at| (Vec::new(), metadata.clone()),
     )
     .await;
@@ -303,7 +369,7 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
         &ctx.keys,
         relay_clock,
         Kind::Custom(CHALLENGE_POLICY_KIND),
-        0,
+        Pow::None,
         move |_created_at| {
             (
                 vec![
@@ -320,8 +386,9 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
     }
 }
 
-/// Rebuild session tracking from the relay (§9): every Game Session tagging
-/// the bot without a canonical Adjudication.
+/// Rebuild session tracking from the relay (§9): every recent Game Session
+/// tagging the bot; the first tick drops the concluded ones (the module
+/// selects their canonical Conclusion) and resumes the rest.
 async fn recover_sessions(
     client: &Client,
     ctx: &BotContext,
@@ -332,22 +399,15 @@ async fn recover_sessions(
         client,
         Filter::new()
             .kind(Kind::Custom(GAME_SESSION_KIND))
-            .pubkey(me),
+            .pubkey(me)
+            .since(Timestamp::from(
+                Timestamp::now()
+                    .as_secs()
+                    .saturating_sub(RECOVERY_LOOKBACK_SECS),
+            )),
     )
     .await?;
     for session in game_sessions {
-        let verdicts = fetch_many(
-            client,
-            Filter::new()
-                .kind(Kind::Custom(ADJUDICATION_KIND))
-                .author(ctx.arbiter)
-                .event(session.id),
-        )
-        .await
-        .unwrap_or_default();
-        if !verdicts.is_empty() {
-            continue; // terminated; nothing to resume
-        }
         if let Err(error) = track_session(client, ctx, sessions, me, session).await {
             tracing::debug!(error = %error, "skipping unresumable session");
         }
@@ -355,121 +415,156 @@ async fn recover_sessions(
     Ok(())
 }
 
-/// Rebuild the set of games the bot has already offered a rematch for (§9,
-/// stateless restart). The gate that keeps the bot to **one** offer per game is
-/// a plain in-memory set; held only there it empties on every restart, and the
-/// bot re-offers for each finished game the moment it sees the verdict again —
-/// exactly the volley the gate exists to prevent. Our own Rematch Offers are the
-/// durable record of what we already offered, so they are what is read back.
-///
-/// A failure here is warned about, not fatal: the cost is a possible duplicate
-/// offer, which the arbiter's `(rematch, G)` idempotence absorbs — where the
-/// cost of refusing to start is that the bot plays nothing at all.
+/// Rebuild the set of games the bot has already challenged to a rematch (§9,
+/// stateless restart). Our own rematch challenges are the durable record of
+/// what we already proposed, so they are what is read back. A failure here is
+/// warned about, not fatal: the cost is a possible duplicate challenge, which
+/// the `(rematch, concluded session)` slot absorbs.
 async fn recover_offered_rematches(
     client: &Client,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     me: PublicKey,
 ) -> Result<()> {
-    let offers = fetch_many(
+    let challenges = fetch_many(
         client,
         Filter::new()
-            .kind(Kind::Custom(rematch::REMATCH_OFFER_KIND))
+            .kind(Kind::Custom(DIRECT_CHALLENGE_KIND))
             .author(me),
     )
     .await?;
-    for offer in &offers {
-        if let Some(concluded) = tags::sole_event_with_marker(offer, "rematch_of") {
-            let deadline: u64 = tags::accept_until(offer)
+    for challenge in &challenges {
+        if let [concluded] = tags::events_with_marker(challenge, "rematch_of").as_slice() {
+            let deadline: u64 = tags::accept_until(challenge)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| {
-                    offer
+                    challenge
                         .created_at
                         .as_secs()
                         .saturating_add(REMATCH_WINDOW_SECS)
                 });
-            let entry = offered_rematches.entry(concluded).or_insert(0);
+            let entry = offered_rematches.entry(*concluded).or_insert(0);
             *entry = (*entry).max(deadline);
         }
     }
     tracing::debug!(
         games = offered_rematches.len(),
-        "recovered the already-offered rematch set"
+        "recovered the already-challenged rematch set"
     );
     Ok(())
 }
 
-/// The terms a Game Session inherits from its founding: the timing mode (a
-/// `timestamper`, present iff attested), the time control, and the raw
-/// `time_control` rows the courtship layer compares byte-for-byte.
-///
-/// A session is founded one of three ways (kind `3422` §Founding reference): a
-/// directed challenge (`accepted_challenge` → the Direct Challenge behind it), a
-/// matchmade one (`pairing`), or a **rematch** — exactly two `rematch_offer`
-/// references, which restate no terms at all and so must be followed back to the
-/// concluded session and, recursively, to *its* founding. `hops` bounds that
-/// recursion: a relay can serve a cycle of sessions that each claim to rematch
-/// the next, and an unbounded walk would never return.
-async fn resolve_founding(
-    client: &Client,
-    session: &Event,
-    hops: usize,
-) -> Result<(Option<PublicKey>, TimeControl, Vec<Vec<String>>)> {
-    if let Some(accepted_id) = tags::event_with_marker(session, "accepted_challenge") {
-        let accepted = fetch_event(client, accepted_id).await?;
-        let direct_id =
-            tags::sole_event_with_marker(&accepted, "direct_challenge").ok_or_else(|| {
-                anyhow!("acceptance carries no single direct_challenge-marked reference")
-            })?;
-        let direct = fetch_event(client, direct_id).await?;
-        return Ok((
-            tags::pubkey_with_role(&accepted, "timestamper"),
-            mapping::time_control(&direct)?,
-            tags::time_control_rows(&direct),
-        ));
-    }
-    if let Some(pairing_id) = tags::event_with_marker(session, "pairing") {
-        let pairing = fetch_event(client, pairing_id).await?;
-        return Ok((
-            tags::pubkey_with_role(&pairing, "timestamper"),
-            mapping::time_control(&pairing)?,
-            tags::time_control_rows(&pairing),
-        ));
-    }
-
-    let Some(offer_ids) = tags::events_with_marker(session, "rematch_offer") else {
-        bail!("session references no founding");
+/// The founding event a Game Session references, fetched: a Pairing or a
+/// Direct Challenge, by the marker.
+async fn fetch_founding(client: &Client, session: &Event) -> Result<Event> {
+    let (kind, id) = match (
+        tags::events_with_marker(session, "pairing").as_slice(),
+        tags::events_with_marker(session, "direct_challenge").as_slice(),
+    ) {
+        ([id], []) => (PAIRING_KIND, *id),
+        ([], [id]) => (DIRECT_CHALLENGE_KIND, *id),
+        _ => bail!("the Game Session does not reference exactly one founding"),
     };
-    let [first_id, second_id] = <[EventId; 2]>::try_from(offer_ids)
-        .map_err(|_| anyhow!("rematch session does not reference exactly two offers"))?;
-    let hops = hops
-        .checked_sub(1)
-        .ok_or_else(|| anyhow!("rematch chain longer than {MAX_REMATCH_HOPS} hops"))?;
-    let first = fetch_event(client, first_id).await?;
-    let second = fetch_event(client, second_id).await?;
-    let pair = rematch::founding_pair([&first, &second], &session.pubkey)
-        .map_err(|reason| anyhow!("non-conforming rematch founding: {reason}"))?;
-    let concluded = fetch_event(client, pair.concluded).await?;
-    if concluded.kind != Kind::Custom(GAME_SESSION_KIND) {
-        bail!("rematch_of is not a Game Session");
+    let founding = fetch_event(client, id).await?;
+    if founding.kind != Kind::Custom(kind) {
+        bail!("the founding is not of the kind its marker announces");
     }
-    if concluded.pubkey != session.pubkey {
-        bail!("rematch replays another arbiter's session");
+    if founding.verify().is_err() {
+        bail!("the founding's signature is invalid");
     }
-    // The terms come from the concluded session's OWN chain, never from the
-    // offers (which restate none). The mode is then read back against what the
-    // pair claims — kind `3430` §Semantic constraints 6. Trusting the offers
-    // instead would let a pair claiming `None` found a session the arbiter can
-    // only rule as attested, which the bot would then play blind.
-    let (mode, time_control, rows) = Box::pin(resolve_founding(client, &concluded, hops)).await?;
-    if pair.timestamper != mode {
-        bail!("rematch offers do not mirror the concluded session's timing mode");
-    }
-    Ok((mode, time_control, rows))
+    Ok(founding)
 }
 
-/// Start tracking a Game Session: resolve its founding chain (time control,
-/// timing mode) and assemble the arbiter-grade `SessionParams` — the same
-/// walk the arbiter service performs before ruling (§6.4).
+/// The checks on a founding event that are the bot's to decide before it
+/// trusts a Game Session on it: a Pairing is the configured matchmaker's, a
+/// Direct Challenge honours its nonce (kind 3420 constraint 9). Nothing
+/// beyond what the terms check (`session::terms`) already mirrors.
+fn founding_ok(ctx: &BotContext, founding: &Event) -> Result<()> {
+    if founding.kind == Kind::Custom(PAIRING_KIND) {
+        if founding.pubkey != ctx.matchmaker {
+            bail!("the Pairing is not the configured matchmaker's");
+        }
+    } else if !session::pow_ok(founding) {
+        bail!("the Direct Challenge carries no honoured nonce");
+    }
+    Ok(())
+}
+
+/// The slot a founding's Game Sessions compete for: the concluded session for
+/// a rematch challenge, the founding itself otherwise.
+fn slot_of(founding: &Event) -> EventId {
+    match tags::events_with_marker(founding, "rematch_of").as_slice() {
+        [concluded] => *concluded,
+        _ => founding.id,
+    }
+}
+
+/// The founding's deadline for a Game Session's canonical timing (kind 3422
+/// constraint 9): the Direct Challenge's `accept_until`, the Pairing's
+/// `found_until`.
+fn founding_deadline(founding: &Event) -> Option<u64> {
+    let name = if founding.kind == Kind::Custom(PAIRING_KIND) {
+        "found_until"
+    } else {
+        "accept_until"
+    };
+    session::exactly_one(founding, name).and_then(session::decimal)
+}
+
+/// The Game Sessions competing for `founding`'s slot, each with its own
+/// founding (kind 3422 §Idempotence and race resolution): those referencing
+/// `founding` — and, for a rematch challenge, those referencing any rematch
+/// challenge of the same concluded session, which is the slot
+/// `(rematch, concluded session)`.
+async fn slot_candidates(client: &Client, founding: &Event) -> Result<Vec<(Event, Event)>> {
+    let mut foundings = vec![founding.clone()];
+    if let [concluded] = tags::events_with_marker(founding, "rematch_of").as_slice() {
+        let siblings = fetch_many(
+            client,
+            Filter::new()
+                .kind(Kind::Custom(DIRECT_CHALLENGE_KIND))
+                .event(*concluded),
+        )
+        .await?;
+        foundings.extend(siblings.into_iter().filter(|sibling| {
+            sibling.id != founding.id
+                && sibling.verify().is_ok()
+                && tags::events_with_marker(sibling, "rematch_of").as_slice() == [*concluded]
+        }));
+    }
+    let mut candidates = Vec::new();
+    for sibling in foundings {
+        let sessions = fetch_many(
+            client,
+            Filter::new()
+                .kind(Kind::Custom(GAME_SESSION_KIND))
+                .event(sibling.id),
+        )
+        .await?;
+        candidates.extend(
+            sessions
+                .into_iter()
+                .map(|session| (session, sibling.clone())),
+        );
+    }
+    Ok(candidates)
+}
+
+/// The canonical Game Session of a slot among `candidates` — each with its
+/// founding — in self-timed mode: the earliest `(created_at, id)` among those
+/// whose terms conform to their founding. With its terms and founding.
+fn canonical_of_slot(candidates: Vec<(Event, Event)>) -> Option<(Event, SessionTerms, Event)> {
+    candidates
+        .into_iter()
+        .filter_map(|(candidate, founding)| {
+            let terms = session::terms(&candidate, &founding).ok()?;
+            Some((candidate, terms, founding))
+        })
+        .min_by_key(|(candidate, _, _)| (candidate.created_at.as_secs(), candidate.id))
+}
+
+/// Start tracking a Game Session naming the bot: resolve its founding, check
+/// its terms against it and against the rule system (the prescribed initial
+/// position), establish the canonical Game Session of its slot, and t₀.
 async fn track_session(
     client: &Client,
     ctx: &BotContext,
@@ -480,43 +575,98 @@ async fn track_session(
     if sessions.contains_key(&session.id) {
         return Ok(());
     }
-    if session.pubkey != ctx.arbiter {
-        bail!("session from an arbiter we do not play under");
+    if session.verify().is_err() {
+        bail!("invalid signature");
     }
-    let players = tags::pubkeys_with_role(&session, "player");
-    if !players.contains(&me) {
+    let founding = fetch_founding(client, &session).await?;
+    // The canonical Game Session of the slot may be another than the one
+    // delivered (both players of a Pairing founding; a double publish; both
+    // players' rematch challenges accepted).
+    let mut candidates = slot_candidates(client, &founding).await?;
+    if !candidates
+        .iter()
+        .any(|(candidate, _)| candidate.id == session.id)
+    {
+        candidates.push((session, founding));
+    }
+    // Only Game Sessions naming the bot compete: a stranger's event on a
+    // sibling founding cannot displace ours (on the directed path the
+    // acceptor signs, on a Pairing the matchmaker names the players).
+    let candidates: Vec<(Event, Event)> = candidates
+        .into_iter()
+        .filter(|(candidate, founding)| {
+            founding_ok(ctx, founding).is_ok()
+                && tags::pubkeys_with_role(candidate, "player").contains(&me)
+        })
+        .collect();
+    let Some((canonical, terms, founding)) = canonical_of_slot(candidates) else {
+        bail!("no conforming Game Session on this founding");
+    };
+    if sessions.contains_key(&canonical.id) {
+        return Ok(());
+    }
+    if !terms.is_player(&me) {
         bail!("not our session");
     }
-    let opponent = *players
-        .iter()
-        .find(|player| **player != me)
-        .ok_or_else(|| anyhow!("no opponent in the session"))?;
-
-    // Founding-chain resolution (time control + timing mode) — directed,
-    // matchmade, or rematch (kind `3422` §Founding reference).
-    let (timestamper, time_control, rows) =
-        resolve_founding(client, &session, MAX_REMATCH_HOPS).await?;
-    if timestamper.is_some() {
-        bail!("attested session (v1 is self-timed) — abandoned");
+    if terms.rules != ctx.rules {
+        bail!("session under another rule system");
     }
-
-    let params = mapping::session_params(&session, None, time_control, None)?;
-    let correspondence = courtship::is_correspondence(&rows);
-    ctx.ledger
-        .session_changed(&session.pubkey, &opponent, false); // no-op guard
+    match &terms.timing {
+        Timing::SelfTimed(relay)
+            if tags::norm_relay(relay) == tags::norm_relay(&ctx.fleet.relay_url) => {}
+        Timing::SelfTimed(_) => bail!("session timed by another relay — unverifiable here"),
+        Timing::Attested(_) => bail!("attested session (v1 is self-timed) — abandoned"),
+    }
+    // The initial position the rule system prescribes (constraint 7).
+    if ctx.describe.positions.get(&terms.pairing()) != Some(&terms.position) {
+        bail!("the Game Session's position is not the one the rule system prescribes");
+    }
+    // The founding's deadline (constraint 9).
+    let created_at = canonical.created_at.as_secs();
+    if founding_deadline(&founding).is_some_and(|deadline| created_at > deadline) {
+        bail!("the Game Session was founded after the founding's deadline");
+    }
+    let start = terms.start_at.map_or(created_at, |at| at.max(created_at));
+    let my_seat = terms
+        .seat_of(&me)
+        .ok_or_else(|| anyhow!("no seat for us"))?;
+    let opponent = terms.player(my_seat.other());
+    let correspondence = courtship::is_correspondence(&tags::time_control_rows(&founding));
+    // One tracked session per slot: a canonical Game Session arriving after
+    // a sibling (both players of a Pairing founding, both rematch
+    // challenges accepted) evicts the stale one, whose events would never
+    // come — the bot would otherwise claim a win on time in a phantom.
+    let slot = slot_of(&founding);
+    let stale: Vec<EventId> = sessions
+        .iter()
+        .filter(|(_, meta)| meta.slot == slot)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in stale {
+        if let Some(meta) = sessions.remove(&id) {
+            ctx.ledger.session_changed(&me, &meta.opponent, false);
+            tracing::info!(session = %id, canonical = %canonical.id, "superseded by the canonical Game Session of its slot");
+        }
+    }
     ctx.ledger.session_changed(&me, &opponent, true);
-    tracing::info!(session = %session.id, %opponent, correspondence, "tracking session");
+    tracing::info!(session = %canonical.id, %opponent, seat = my_seat.name(), correspondence, "tracking session");
     sessions.insert(
-        session.id,
+        canonical.id,
         SessionMeta {
-            session,
-            params,
+            session: canonical,
+            slot,
+            terms,
+            start,
+            my_seat,
             opponent,
             correspondence,
             my_side_evals: VecDeque::new(),
             next_action_at: 0,
             planned_half_move: 0,
             published: None,
+            timeout_seen_at: None,
+            concluded: None,
+            warned: BTreeSet::new(),
         },
     );
     Ok(())
@@ -527,11 +677,14 @@ async fn track_session(
 async fn handle_event(
     client: &Client,
     ctx: &BotContext,
-    relay_clock: &RelayClock,
+    relay_clock: &Arc<RelayClock>,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     courted_entries: &mut BTreeSet<EventId>,
-    accepted_challenges: &mut BTreeSet<EventId>,
+    considered_challenges: &mut BTreeSet<EventId>,
+    founded_pairings: &mut BTreeSet<EventId>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
+    own_entry_until: &Arc<std::sync::atomic::AtomicU64>,
+    starred_today: &mut u64,
     rng: &mut SplitMix64,
     me: PublicKey,
     event: Event,
@@ -539,18 +692,44 @@ async fn handle_event(
     match event.kind {
         Kind::Custom(OPEN_CHALLENGE_KIND) => {
             if courted_entries.insert(event.id) {
-                if let Err(reason) =
-                    court_pool_entry(client, ctx, relay_clock, rng, me, &event).await
+                if let Err(reason) = court_pool_entry(
+                    client,
+                    ctx,
+                    relay_clock,
+                    sessions,
+                    own_entry_until,
+                    rng,
+                    me,
+                    &event,
+                )
+                .await
                 {
                     tracing::debug!(entry = %event.id, reason, "pool entry not courted");
                 }
             }
         }
-        Kind::Custom(DIRECT_CHALLENGE_KIND) => {
-            if accepted_challenges.insert(event.id) {
+        Kind::Custom(PAIRING_KIND) => {
+            if founded_pairings.insert(event.id) {
                 if let Err(reason) =
-                    consider_direct_challenge(client, ctx, relay_clock, sessions, rng, me, &event)
-                        .await
+                    consider_pairing(client, ctx, relay_clock, sessions, me, &event).await
+                {
+                    tracing::debug!(pairing = %event.id, reason, "pairing not founded");
+                }
+            }
+        }
+        Kind::Custom(DIRECT_CHALLENGE_KIND) => {
+            if considered_challenges.insert(event.id) {
+                if let Err(reason) = consider_direct_challenge(
+                    client,
+                    ctx,
+                    relay_clock,
+                    sessions,
+                    offered_rematches,
+                    rng,
+                    me,
+                    &event,
+                )
+                .await
                 {
                     tracing::debug!(challenge = %event.id, reason, "challenge not accepted");
                 }
@@ -561,278 +740,157 @@ async fn handle_event(
                 tracing::debug!(error = %error, "session not tracked");
             }
         }
-        Kind::Custom(PLY_KIND) | Kind::Custom(ADJUDICATION_REQUEST_KIND) => {
-            // Discovery triggers only (§6.4): the tick re-derives everything
+        Kind::Custom(PLY_KIND) => {
+            // A discovery trigger only (§6.4): the tick re-derives everything
             // from a session-scoped fetch. Nothing to do inline.
         }
-        Kind::Custom(ADJUDICATION_KIND) => {
+        Kind::Custom(CONCLUSION_KIND) => {
+            // A Conclusion of a tracked session: service it now rather than
+            // at the next tick — the module decides whether it conforms.
             if let Some(session_id) = tags::event_with_marker(&event, "game_session") {
-                if event.pubkey == ctx.arbiter {
-                    if let Some(meta) = sessions.remove(&session_id) {
-                        tracing::info!(session = %session_id, status = %event.content, "session terminated");
-                        terminate_session(
-                            client,
-                            ctx,
-                            relay_clock,
-                            me,
-                            &session_id,
-                            &event.id,
-                            &meta.opponent,
-                            &tags::timing_relays(&meta.session),
-                            offered_rematches,
-                        )
-                        .await;
-                    }
+                if sessions.contains_key(&session_id) {
+                    service_all(
+                        client,
+                        ctx,
+                        relay_clock,
+                        sessions,
+                        rng,
+                        me,
+                        starred_today,
+                        offered_rematches,
+                        Some(session_id),
+                    )
+                    .await;
                 }
-            }
-        }
-        Kind::Custom(rematch::REMATCH_OFFER_KIND) => {
-            // A rematch offer addressed to us (§9, reciprocate).
-            if let Err(reason) =
-                consider_rematch_offer(client, ctx, relay_clock, me, &event, offered_rematches)
-                    .await
-            {
-                tracing::debug!(offer = %event.id, reason, "rematch offer not answered");
             }
         }
         _ => {}
     }
 }
 
-/// Terminate a tracked session on its verdict: release the fleet budget slot,
-/// then (if the persona is willing) proactively offer a rematch. BOTH paths
-/// that observe the terminal 3425 — the notification arm and the tick's session
-/// service — funnel through here, so the offer fires whichever wins the race to
-/// `sessions.remove`; that guard keeps it to one offer per game. Both carry the
-/// Adjudication that ended the session (`adjudication`): the offer must cite one
-/// as its `concluded_by` proof, and the verdict we just observed is exactly it —
-/// no re-fetch needed.
+/// Terminate a tracked session on its canonical Conclusion: release the
+/// fleet budget slot, then (if the persona is willing) propose a rematch.
 #[allow(clippy::too_many_arguments)]
 async fn terminate_session(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
     me: PublicKey,
-    concluded: &EventId,
-    adjudication: &EventId,
-    opponent: &PublicKey,
-    concluded_relays: &std::collections::BTreeSet<String>,
+    meta: &SessionMeta,
+    conclusion: &EventId,
+    concluded_at: u64,
     offered: &mut BTreeMap<EventId, u64>,
 ) {
-    ctx.ledger.session_changed(&me, opponent, false);
+    // A game that ended long ago — re-observed after a restart — is not
+    // proposed a rematch of: the offer is for a player still at the board.
+    if relay_clock.now_secs().saturating_sub(concluded_at) > REMATCH_WINDOW_SECS {
+        ctx.ledger.session_changed(&me, &meta.opponent, false);
+        return;
+    }
+    ctx.ledger.session_changed(&me, &meta.opponent, false);
     maybe_offer_rematch(
         client,
         ctx,
         relay_clock,
-        concluded,
-        adjudication,
-        opponent,
-        concluded_relays,
+        &meta.terms,
+        conclusion,
         false,
         offered,
     )
     .await;
 }
 
-/// Offer `opponent` a rematch of `concluded`, unless our own offer for this
-/// game is still LIVE, the persona is unwilling (a per-game decision the
-/// `always` flag overrides — reciprocating a human's explicit offer is
-/// unconditional), or — against a sibling bot — the bot-vs-bot budget is
-/// spent. Shared by both triggers (the proactive offer on the verdict and the
-/// reply to an incoming offer), which is why the one-live-offer-per-game guard
-/// lives here. Best-effort: a failure is logged,
-/// never propagated. The offer is self-timed (the bot never plays attested
-/// games) and mined by the publish path like any founding.
-///
-/// `adjudication` is the 3425 the offer cites as its `concluded_by` proof that
-/// `concluded` is over: the observed verdict on the proactive path, the (already
-/// verified) one the opponent cited on the reply path. Both adjudicate the same
-/// session, which is all the pair rule asks.
-#[allow(clippy::too_many_arguments)]
+/// Challenge the opponent to a rematch of `concluded`, unless our own
+/// challenge for this game is still LIVE, the persona is unwilling (a
+/// per-game decision the `always` flag overrides — reciprocating a human's
+/// explicit proposal is unconditional), or — against a sibling bot — the
+/// bot-vs-bot budget is spent. Shared by both triggers (the proactive
+/// challenge on the verdict and the reply to an incoming one), which is why
+/// the one-live-challenge-per-game guard lives here. Best-effort: a failure
+/// is logged, never propagated.
 async fn maybe_offer_rematch(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
-    concluded: &EventId,
-    adjudication: &EventId,
-    opponent: &PublicKey,
-    concluded_relays: &std::collections::BTreeSet<String>,
+    concluded: &SessionTerms,
+    conclusion: &EventId,
     always: bool,
     offered: &mut BTreeMap<EventId, u64>,
 ) {
-    // One LIVE offer per game — whether it goes out proactively or in reply, so
-    // two willing bots never volley mirrors forever. The guard carries our
-    // offer's own `accept_until`: once that window lapses the pair can no longer
-    // be founded from our side, so an opponent offering AFTER the lapse earns a
-    // fresh mirror instead of silence (the previously assumed limitation).
+    let me = ctx.keys.public_key();
+    let Some(opponent) = concluded.opponent_of(&me) else {
+        return;
+    };
     let now = Timestamp::now().as_secs();
     if offered
-        .get(concluded)
+        .get(&concluded.id)
         .is_some_and(|deadline| *deadline > now)
     {
         return;
     }
-    // The per-game die gates only what the bot VOLUNTEERS. Reciprocating an
-    // explicit offer from outside the fleet is unconditional (`always`): a
-    // human who clicks Rematch is answered, never diced away.
     if !always
         && !rematch::wants_rematch(
             ctx.bot_seed,
-            concluded,
+            &concluded.id,
             rematch::DEFAULT_REMATCH_PROBABILITY,
         )
     {
         return;
     }
-    if ctx.ledger.is_member(opponent) && !ctx.ledger.may_court_sibling() {
-        tracing::debug!(against = %opponent, "rematch not offered: bot-vs-bot budget spent");
+    if ctx.ledger.is_member(&opponent) && !ctx.ledger.may_court_sibling() {
+        tracing::debug!(against = %opponent, "rematch not proposed: bot-vs-bot budget spent");
         return;
     }
-    let concluded = *concluded;
-    let adjudication = *adjudication;
-    let opponent = *opponent;
-    let arbiter = ctx.arbiter;
-    // The offer mirrors the concluded session's self-timed designation (kind
-    // 3430 §Operating mode); a pre-designation session falls back to the
-    // configured relay, which is where it was in fact played.
-    let offer_relays: Vec<String> = if concluded_relays.is_empty() {
-        vec![tags::norm_relay(&ctx.fleet.relay_url).to_owned()]
-    } else {
-        concluded_relays.iter().cloned().collect()
-    };
+    let terms = concluded.clone();
+    let conclusion = *conclusion;
+    let hint = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
     let result = publish_self_timed(
         client,
         &ctx.keys,
         relay_clock,
-        Kind::Custom(rematch::REMATCH_OFFER_KIND),
-        ctx.fleet.pow_difficulty,
+        Kind::Custom(DIRECT_CHALLENGE_KIND),
+        Pow::Mined(ctx.fleet.pow_difficulty),
         move |created_at| {
             let accept_until = created_at.as_secs().saturating_add(REMATCH_WINDOW_SECS);
-            // No timestamper: the bot only plays self-timed games (attested
-            // challenges are declined in courtship), so the rematch mirrors that.
-            let tags = rematch::build_offer_tags(
-                &concluded,
-                &adjudication,
-                &opponent,
-                &arbiter,
-                None,
-                &offer_relays,
-                accept_until,
-            );
+            let tags =
+                rematch::rematch_challenge_tags(&terms, &conclusion, &me, accept_until, &hint)
+                    .unwrap_or_default();
             (tags, String::new())
         },
     )
     .await;
     match result {
-        Ok(offer) => {
-            let deadline: u64 = tags::accept_until(&offer)
+        Ok(challenge) => {
+            let deadline: u64 = tags::accept_until(&challenge)
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| now.saturating_add(REMATCH_WINDOW_SECS));
-            offered.insert(concluded, deadline);
+            offered.insert(concluded.id, deadline);
             tracing::info!(
-                rematch_of = %concluded,
+                rematch_of = %concluded.id,
                 against = %opponent,
-                offer = %offer.id,
-                "offered a rematch"
+                challenge = %challenge.id,
+                "proposed a rematch"
             );
         }
-        Err(error) => tracing::warn!(error = %error, "rematch offer publish failed"),
+        Err(error) => tracing::warn!(error = %error, "rematch challenge publish failed"),
     }
-}
-
-/// Answer an incoming Rematch Offer (kind 3430) addressed to us (§9,
-/// reciprocate): verify it is a well-formed offer, from our arbiter, for a Game
-/// Session that BOTH of us actually played and that its `concluded_by`
-/// Adjudication really ended, then mirror it through the shared path (which
-/// applies the one-live-offer-per-game and budget gates; the persona die is
-/// bypassed for an offerer from outside the fleet — a human who clicks Rematch
-/// is answered). Catches what the proactive offer misses — a restart that
-/// skipped the verdict, the opponent offering first, or our own offer having
-/// expired before the human answered.
-async fn consider_rematch_offer(
-    client: &Client,
-    ctx: &BotContext,
-    relay_clock: &RelayClock,
-    me: PublicKey,
-    event: &Event,
-    offered: &mut BTreeMap<EventId, u64>,
-) -> std::result::Result<(), &'static str> {
-    let offer = rematch::parse_incoming_offer(event).ok_or("malformed rematch offer")?;
-    if offer.addressed_to != me {
-        return Err("addressed to someone else");
-    }
-    if offer.arbiter != ctx.arbiter {
-        return Err("foreign arbiter");
-    }
-    if offer.timestamper.is_some() {
-        return Err("attested rematch — we only play self-timed");
-    }
-    if offer.accept_until <= Timestamp::now().as_secs() {
-        return Err("already expired");
-    }
-    // The concluded session was purged on its verdict; re-fetch it and confirm
-    // it is our arbiter's Game Session that BOTH of us played — never mine a
-    // mirror for a game we did not play (spam defense).
-    let concluded = fetch_event(client, offer.concluded)
-        .await
-        .map_err(|_| "concluded session unavailable")?;
-    if concluded.kind != Kind::Custom(GAME_SESSION_KIND) || concluded.pubkey != ctx.arbiter {
-        return Err("rematch_of is not our arbiter's game session");
-    }
-    if tags::seat_for(&concluded, &me).is_none()
-        || tags::seat_for(&concluded, &offer.offerer).is_none()
-    {
-        return Err("not both players of the concluded session");
-    }
-    // The offer's proof that the game is over: its `concluded_by` must really be
-    // an Adjudication OF that session, signed by the arbiter who signed it (kind
-    // 3425 §Semantic constraints). Without this the reference is a free-form
-    // pointer, and a stranger could dress any event up as a verdict. Re-checked
-    // here even though our own arbiter is honest: what we mirror is what we saw,
-    // not what we assume.
-    let adjudication = fetch_event(client, offer.concluded_by)
-        .await
-        .map_err(|_| "concluded_by adjudication unavailable")?;
-    if adjudication.kind != Kind::Custom(ADJUDICATION_KIND) {
-        return Err("concluded_by is not an adjudication");
-    }
-    if tags::event_with_marker(&adjudication, "game_session") != Some(concluded.id) {
-        return Err("concluded_by adjudicates another session");
-    }
-    if adjudication.pubkey != concluded.pubkey {
-        return Err("concluded_by is not signed by the session's arbiter");
-    }
-    // Cite the very Adjudication the opponent cited: verified above, and the
-    // pair matches on `rematch_of` regardless. The mirror designates what the
-    // concluded session itself designates.
-    let concluded_relays = tags::timing_relays(&concluded);
-    maybe_offer_rematch(
-        client,
-        ctx,
-        relay_clock,
-        &offer.concluded,
-        &offer.concluded_by,
-        &offer.offerer,
-        &concluded_relays,
-        !ctx.ledger.is_member(&offer.offerer),
-        offered,
-    )
-    .await;
-    Ok(())
 }
 
 /// React to a live pool entry (§6.2): compatibility, fleet budget, async
 /// checks (mute lists, `following` filter), a persona reaction delay, then
 /// our own mirror entry.
+#[allow(clippy::too_many_arguments)]
 async fn court_pool_entry(
     client: &Client,
     ctx: &BotContext,
-    relay_clock: &RelayClock,
+    relay_clock: &Arc<RelayClock>,
+    sessions: &BTreeMap<EventId, SessionMeta>,
+    own_entry_until: &Arc<std::sync::atomic::AtomicU64>,
     rng: &mut SplitMix64,
     me: PublicKey,
     entry: &Event,
 ) -> std::result::Result<(), &'static str> {
-    let now = Timestamp::now().as_secs();
+    let now = relay_clock.now_secs();
     if !crate::persona::is_present(&ctx.config.schedule, ctx.bot_seed, chrono::Utc::now()) {
         return Err("absent");
     }
@@ -841,12 +899,25 @@ async fn court_pool_entry(
         &me,
         &ctx.fleet.relay_url,
         &ctx.matchmaker,
-        &ctx.arbiter,
+        &ctx.rules,
         &ctx.fleet.game,
         &ctx.config.play,
         now,
         COURT_MARGIN_SECS,
     )?;
+    // The concurrency caps, and one own entry at a time: a Pairing founds a
+    // session the bot must then serve.
+    let (live, correspondence) = load_of(sessions);
+    if courtship::is_correspondence(&candidate.spec) {
+        if correspondence >= ctx.config.play.max_correspondence {
+            return Err("correspondence cap reached");
+        }
+    } else if live >= ctx.config.play.max_live {
+        return Err("live cap reached");
+    }
+    if own_entry_until.load(std::sync::atomic::Ordering::Relaxed) > now {
+        return Err("our own entry is still live");
+    }
     if ctx.ledger.is_member(&candidate.challenger) && !ctx.ledger.may_court_sibling() {
         return Err("bot-vs-bot budget spent");
     }
@@ -859,7 +930,9 @@ async fn court_pool_entry(
         return Err("their following filter excludes us (fail-closed)");
     }
 
-    // Persona reaction delay (bounded by the entry's life).
+    // Persona reaction delay (bounded by the entry's life) — then the entry,
+    // in a task of its own: the actor's loop must keep serving its games
+    // meanwhile (a live game on a fast cadence cannot wait 30 s).
     let delay = crate::persona::think_seconds(
         &ctx.config.tempo.think,
         rng,
@@ -867,93 +940,90 @@ async fn court_pool_entry(
             .accept_until
             .saturating_sub(now)
             .saturating_sub(COURT_MARGIN_SECS),
+    )
+    .min(30);
+    own_entry_until.store(
+        now.saturating_add(delay)
+            .saturating_add(OWN_ENTRY_WINDOW_SECS),
+        std::sync::atomic::Ordering::Relaxed,
     );
-    tokio::time::sleep(StdDuration::from_secs(delay.min(30))).await;
-
+    let client = client.clone();
+    let keys = ctx.keys.clone();
+    let relay_clock = Arc::clone(relay_clock);
+    let ledger = Arc::clone(&ctx.ledger);
+    let own_entry_until = Arc::clone(own_entry_until);
+    let pow = Pow::Mined(ctx.fleet.pow_difficulty);
     let variant = candidate.variant.clone();
     let mirror = candidate.mirror;
     let spec = candidate.spec.clone();
     let matchmaker = ctx.matchmaker;
-    let arbiter = ctx.arbiter;
+    let rules = ctx.rules;
     let game = ctx.fleet.game.clone();
+    let against = entry.pubkey;
     // Self-timed designation: the configured relay, normalized (Canonical
-    // Timing NIP §Timing modes and mode selection).
+    // Timing NIP §Timing modes and mode selection) — also the relay hint of
+    // the rules reference.
     let timing_relay = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
-    publish_self_timed(
-        client,
-        &ctx.keys,
-        relay_clock,
-        Kind::Custom(OPEN_CHALLENGE_KIND),
-        ctx.fleet.pow_difficulty,
-        move |created_at| {
-            let mut event_tags = vec![
-                p_role(&matchmaker, "matchmaker"),
-                p_role(&arbiter, "arbiter"),
-                Tag::custom("timing_relay", [timing_relay.clone()]),
-                Tag::custom("game", [game.clone()]),
-                Tag::custom("variant", ["self".to_owned(), variant.clone()]),
-            ];
-            // The free MIRROR form imposes the shared variant back; courting an
-            // ASYMMETRIC (premium) entry, our entry must leave the opponent
-            // unconstrained — their `self` differs from our variant, so imposing
-            // it back would make the pair variant-conflicting, and constraining
-            // the opponent at all is the premium form (see
-            // `courtship::PoolCandidate::mirror`).
-            if mirror {
+    tokio::spawn(async move {
+        tokio::time::sleep(StdDuration::from_secs(delay)).await;
+        let result = publish_self_timed(
+            &client,
+            &keys,
+            &relay_clock,
+            Kind::Custom(OPEN_CHALLENGE_KIND),
+            pow,
+            move |created_at| {
+                let mut event_tags = vec![
+                    p_role(&matchmaker, "matchmaker"),
+                    Tag::custom(
+                        "e",
+                        [rules.to_hex(), timing_relay.clone(), "rules".to_owned()],
+                    ),
+                    Tag::custom("timing_relay", [timing_relay.clone()]),
+                    Tag::custom("game", [game.clone()]),
+                    Tag::custom("variant", ["self".to_owned(), variant.clone()]),
+                ];
+                // The free MIRROR form imposes the shared variant back; courting
+                // an ASYMMETRIC (premium) entry, our entry must leave the
+                // opponent unconstrained (see `courtship::PoolCandidate::mirror`).
+                if mirror {
+                    event_tags.push(Tag::custom(
+                        "variant",
+                        ["opponent".to_owned(), variant.clone()],
+                    ));
+                }
                 event_tags.push(Tag::custom(
-                    "variant",
-                    ["opponent".to_owned(), variant.clone()],
+                    "accept_until",
+                    [created_at
+                        .as_secs()
+                        .saturating_add(OWN_ENTRY_WINDOW_SECS)
+                        .to_string()],
                 ));
+                for row in &spec {
+                    event_tags.push(Tag::custom("time_control", row.clone()));
+                }
+                (event_tags, String::new())
+            },
+        )
+        .await;
+        match result {
+            Ok(_) => {
+                ledger.pool_presence(me, true);
+                tracing::info!(%against, "entered the pool (reactive)");
             }
-            event_tags.push(Tag::custom(
-                "accept_until",
-                [created_at
-                    .as_secs()
-                    .saturating_add(OWN_ENTRY_WINDOW_SECS)
-                    .to_string()],
-            ));
-            for row in &spec {
-                event_tags.push(Tag::custom("time_control", row.clone()));
+            Err(error) => {
+                own_entry_until.store(0, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(error = %error, "pool entry publish failed");
             }
-            (event_tags, String::new())
-        },
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(error = %error, "pool entry publish failed");
-        "publish failed"
-    })?;
-    ctx.ledger.pool_presence(me, true);
-    tracing::info!(against = %entry.pubkey, "entered the pool (reactive)");
+        }
+    });
     Ok(())
 }
 
-/// Consider a Direct Challenge addressed to us (§6.3) and publish the
-/// acceptance when the persona says yes.
-#[allow(clippy::too_many_arguments)]
-async fn consider_direct_challenge(
-    client: &Client,
-    ctx: &BotContext,
-    relay_clock: &RelayClock,
-    sessions: &BTreeMap<EventId, SessionMeta>,
-    rng: &mut SplitMix64,
-    me: PublicKey,
-    challenge: &Event,
-) -> std::result::Result<(), &'static str> {
-    let now = Timestamp::now().as_secs();
-    let plan: AcceptPlan = courtship::evaluate_direct_challenge(
-        challenge,
-        &me,
-        &ctx.fleet.relay_url,
-        &ctx.arbiter,
-        &ctx.fleet.game,
-        &ctx.config.play,
-        now,
-        COURT_MARGIN_SECS,
-        rng,
-    )?;
-    // Concurrency caps.
-    let (live, correspondence) = sessions
+/// The concurrency caps: how many live and correspondence sessions are
+/// tracked.
+fn load_of(sessions: &BTreeMap<EventId, SessionMeta>) -> (u32, u32) {
+    sessions
         .values()
         .fold((0_u32, 0_u32), |(live, corr), meta| {
             if meta.correspondence {
@@ -961,7 +1031,135 @@ async fn consider_direct_challenge(
             } else {
                 (live.saturating_add(1), corr)
             }
-        });
+        })
+}
+
+/// Found the session a Pairing naming us declares (kind 3422 §Signing party,
+/// matchmaking path): as soon as it is observed, unless a canonical Game
+/// Session for it already exists.
+async fn consider_pairing(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    sessions: &mut BTreeMap<EventId, SessionMeta>,
+    me: PublicKey,
+    pairing: &Event,
+) -> std::result::Result<(), &'static str> {
+    if pairing.pubkey != ctx.matchmaker {
+        return Err("not our matchmaker's Pairing");
+    }
+    if pairing.verify().is_err() {
+        return Err("invalid signature");
+    }
+    let now = Timestamp::now().as_secs();
+    let plan = founding::found_on_pairing(
+        pairing,
+        me,
+        &ctx.fleet.relay_url,
+        &ctx.rules,
+        &ctx.fleet.game,
+        &ctx.describe,
+        now,
+        COURT_MARGIN_SECS.min(10),
+    )?;
+    ctx.ledger.pool_presence(me, false);
+    // Do not publish if a canonical Game Session for the Pairing is already
+    // observed (the other player founded first): track it instead.
+    let existing = fetch_many(
+        client,
+        Filter::new()
+            .kind(Kind::Custom(GAME_SESSION_KIND))
+            .event(pairing.id),
+    )
+    .await
+    .unwrap_or_default();
+    if let Some((canonical, _)) = founding::canonical_session(existing.iter(), pairing) {
+        let canonical = canonical.clone();
+        if let Err(error) = track_session(client, ctx, sessions, me, canonical).await {
+            tracing::debug!(error = %error, "the existing Game Session is not trackable");
+        }
+        return Err("already founded by the other player");
+    }
+    let session = publish_game_session(client, ctx, relay_clock, &plan)
+        .await
+        .map_err(|error| {
+            tracing::warn!(error = %error, "Game Session publish failed");
+            "publish failed"
+        })?;
+    tracing::info!(pairing = %pairing.id, session = %session.id, "founded the session on the Pairing");
+    if let Err(error) = track_session(client, ctx, sessions, me, session).await {
+        tracing::debug!(error = %error, "our Game Session is not tracked yet");
+    }
+    Ok(())
+}
+
+/// Publish a Game Session per `plan` — no proof of work is prescribed on
+/// kind 3422.
+async fn publish_game_session(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &RelayClock,
+    plan: &founding::GameSessionPlan,
+) -> Result<Event> {
+    let hint = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
+    let plan = plan.clone();
+    publish_self_timed(
+        client,
+        &ctx.keys,
+        relay_clock,
+        Kind::Custom(GAME_SESSION_KIND),
+        Pow::None,
+        move |_created_at| (plan.tags(&hint), plan.position.clone()),
+    )
+    .await
+}
+
+/// Consider a Direct Challenge addressed to us (§6.3) — fresh or rematch —
+/// and accept it by founding the Game Session when the persona says yes.
+#[allow(clippy::too_many_arguments)]
+async fn consider_direct_challenge(
+    client: &Client,
+    ctx: &BotContext,
+    relay_clock: &Arc<RelayClock>,
+    sessions: &mut BTreeMap<EventId, SessionMeta>,
+    offered_rematches: &mut BTreeMap<EventId, u64>,
+    rng: &mut SplitMix64,
+    me: PublicKey,
+    challenge: &Event,
+) -> std::result::Result<(), &'static str> {
+    if challenge.verify().is_err() {
+        return Err("invalid signature");
+    }
+    let now = relay_clock.now_secs();
+    let plan: AcceptPlan = courtship::evaluate_direct_challenge(
+        challenge,
+        &me,
+        &ctx.fleet.relay_url,
+        &ctx.rules,
+        &ctx.fleet.game,
+        &ctx.config.play,
+        now,
+        COURT_MARGIN_SECS,
+        rng,
+    )?;
+    // A rematch challenge: its constraints against the concluded session,
+    // and the persona's per-game willingness (a human's explicit proposal is
+    // answered unconditionally).
+    if let Some(refs) = plan.rematch {
+        verify_rematch(client, ctx, challenge, refs).await?;
+        let human = !ctx.ledger.is_member(&plan.challenger);
+        if !human
+            && !rematch::wants_rematch(
+                ctx.bot_seed,
+                &refs.concluded,
+                rematch::DEFAULT_REMATCH_PROBABILITY,
+            )
+        {
+            return Err("rematch declined (persona)");
+        }
+    }
+    // Concurrency caps.
+    let (live, correspondence) = load_of(sessions);
     if plan.correspondence {
         if correspondence >= ctx.config.play.max_correspondence {
             return Err("correspondence cap reached");
@@ -984,80 +1182,159 @@ async fn consider_direct_challenge(
     if ctx.ledger.is_member(&plan.challenger) && !ctx.ledger.may_court_sibling() {
         return Err("bot-vs-bot budget spent");
     }
+    // A challenge replayed after a restart may already be accepted (kind
+    // 3422 §Idempotence: one Game Session per slot): track what exists
+    // instead of founding twice.
+    let existing = fetch_many(
+        client,
+        Filter::new()
+            .kind(Kind::Custom(GAME_SESSION_KIND))
+            .event(challenge.id),
+    )
+    .await
+    .unwrap_or_default();
+    if let Some((accepted, _)) = founding::canonical_session(existing.iter(), challenge) {
+        let accepted = accepted.clone();
+        if let Err(error) = track_session(client, ctx, sessions, me, accepted).await {
+            tracing::debug!(error = %error, "the existing acceptance is not trackable");
+        }
+        return Err("already accepted");
+    }
 
+    // The acceptance IS the Game Session (kind 3422 §Signing party) — after
+    // the persona's reflection, in a task of its own so the actor's loop
+    // keeps serving its games meanwhile. The Game Session reaches the loop
+    // through the subscription (it names the bot) and is tracked then.
+    let session_plan = founding::accept_direct_challenge(challenge, &plan, me, &ctx.describe)?;
+    if let Some(refs) = plan.rematch {
+        // Accepting theirs supersedes proposing ours.
+        offered_rematches.insert(refs.concluded, u64::MAX);
+    }
     let delay = crate::persona::think_seconds(
         &ctx.config.tempo.think,
         rng,
         plan.accept_until
             .saturating_sub(now)
             .saturating_sub(COURT_MARGIN_SECS),
-    );
-    tokio::time::sleep(StdDuration::from_secs(delay.min(60))).await;
-
+    )
+    .min(60);
+    let client = client.clone();
+    let keys = ctx.keys.clone();
+    let relay_clock = Arc::clone(relay_clock);
+    let hint = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
     let challenge_id = challenge.id;
     let challenger = plan.challenger;
-    let arbiter = ctx.arbiter;
-    let me_hex = me.to_hex();
-    // The acceptance mirrors the challenge's self-timed designation VERBATIM
-    // (kind 3421 §Operating mode; vetted non-empty and naming our relay).
-    let mirrored_relays = tags::timing_relay_tags(challenge);
-    let supply_mine = plan.supply_my_variant.clone();
-    let supply_their = plan.supply_challenger_variant.clone();
-    let supply_seat = plan.supply_seat;
-    publish_self_timed(
-        client,
-        &ctx.keys,
-        relay_clock,
-        Kind::Custom(ACCEPTED_CHALLENGE_KIND),
-        ctx.fleet.pow_difficulty,
-        move |_created_at| {
-            let mut event_tags = vec![
-                Tag::custom(
-                    "e",
-                    [
-                        challenge_id.to_hex(),
-                        String::new(),
-                        "direct_challenge".to_string(),
-                    ],
-                ),
-                p_role(&challenger, "opponent"),
-                // The arbiter subscribes on `#p = self` and founds the game only
-                // from an Accepted Challenge that names it: without this tag the
-                // acceptance is published and OK'd by the relay, but the arbiter
-                // never sees it and no Game Session (3422) is ever founded.
-                p_role(&arbiter, "arbiter"),
-            ];
-            event_tags.extend(mirrored_relays.clone());
-            // A player's variant is declared ONLY when the challenge left it open
-            // (kind 3421 constraint 7): re-declaring a variant the challenge already
-            // fixed puts the same tag in both events and invalidates the pair — the
-            // arbiter then never founds the game.
-            if let Some(mine) = &supply_mine {
-                event_tags.push(Tag::custom("variant", [me_hex.clone(), mine.clone()]));
-            }
-            if let Some(theirs) = &supply_their {
-                event_tags.push(Tag::custom(
-                    "variant",
-                    [challenger.to_hex(), theirs.clone()],
-                ));
-            }
-            if let Some(seat) = supply_seat {
-                event_tags.push(Tag::custom("seat", [seat.to_owned()]));
-            }
-            (event_tags, String::new())
-        },
-    )
-    .await
-    .map_err(|error| {
-        tracing::warn!(error = %error, "acceptance publish failed");
-        "publish failed"
-    })?;
-    tracing::info!(challenge = %challenge_id, %challenger, "accepted a direct challenge");
+    let rematch = plan.rematch.is_some();
+    tokio::spawn(async move {
+        tokio::time::sleep(StdDuration::from_secs(delay)).await;
+        let result = publish_self_timed(
+            &client,
+            &keys,
+            &relay_clock,
+            Kind::Custom(GAME_SESSION_KIND),
+            Pow::None,
+            move |_created_at| (session_plan.tags(&hint), session_plan.position.clone()),
+        )
+        .await;
+        match result {
+            Ok(session) => tracing::info!(
+                challenge = %challenge_id,
+                %challenger,
+                session = %session.id,
+                rematch,
+                "accepted a direct challenge by founding the session"
+            ),
+            Err(error) => tracing::warn!(error = %error, "acceptance publish failed"),
+        }
+    });
     Ok(())
 }
 
-/// Service every tracked session (the tick body): compute the live view via
-/// the arbiter crate, then act — play our ply, invoke the arbiter, star.
+/// Verify a rematch challenge against the concluded session it names (kind
+/// 3420 §Rematch challenge): the session is one we played, its Conclusion
+/// really is one the rule system yields (`check`, through the module — never
+/// believed), and every constrained term mirrors it.
+async fn verify_rematch(
+    client: &Client,
+    ctx: &BotContext,
+    challenge: &Event,
+    refs: courtship::RematchRefs,
+) -> std::result::Result<(), &'static str> {
+    let concluded = fetch_event(client, refs.concluded)
+        .await
+        .map_err(|_| "concluded session unavailable")?;
+    if concluded.kind != Kind::Custom(GAME_SESSION_KIND) || concluded.verify().is_err() {
+        return Err("rematch_of is not a Game Session");
+    }
+    let founding = fetch_founding(client, &concluded)
+        .await
+        .map_err(|_| "the concluded session's founding is unavailable")?;
+    let terms =
+        session::terms(&concluded, &founding).map_err(|_| "non-conforming concluded session")?;
+    if !terms.is_player(&ctx.keys.public_key()) {
+        return Err("we did not play the concluded session");
+    }
+    let conclusion = fetch_event(client, refs.concluded_by)
+        .await
+        .map_err(|_| "concluded_by unavailable")?;
+    if conclusion.verify().is_err() {
+        return Err("concluded_by has an invalid signature");
+    }
+    founding::rematch_terms_ok(challenge, &terms, &conclusion)?;
+    // One rematch per concluded session: a Game Session already founded on
+    // any rematch challenge of it makes this one moot.
+    let siblings = fetch_many(
+        client,
+        Filter::new()
+            .kind(Kind::Custom(DIRECT_CHALLENGE_KIND))
+            .event(concluded.id),
+    )
+    .await
+    .map_err(|_| "the concluded session's rematch challenges are unavailable")?;
+    for sibling in siblings.iter().filter(|sibling| {
+        tags::events_with_marker(sibling, "rematch_of").as_slice() == [concluded.id]
+    }) {
+        let founded = fetch_many(
+            client,
+            Filter::new()
+                .kind(Kind::Custom(GAME_SESSION_KIND))
+                .event(sibling.id),
+        )
+        .await
+        .unwrap_or_default();
+        if founding::canonical_session(founded.iter(), sibling).is_some() {
+            return Err("a rematch of this session is already founded");
+        }
+    }
+    // The proof of conclusion, checked by the module: the Conclusion must
+    // conform at its cutoff.
+    let created_at = concluded.created_at.as_secs();
+    let start = terms.start_at.map_or(created_at, |at| at.max(created_at));
+    let raw = fetch_many(
+        client,
+        Filter::new()
+            .kind(Kind::Custom(PLY_KIND))
+            .event(concluded.id),
+    )
+    .await
+    .map_err(|_| "the concluded session's plies are unavailable")?;
+    let events = Events::from_relay(raw.iter(), &terms, ctx.describe.max_step);
+    let claim = session::conclusion(&conclusion, &terms).ok_or("malformed concluded_by")?;
+    let request = chain::session_request(&terms, start, &events);
+    let verdict = ctx
+        .with_module(|oracle| module::check(oracle, &request, &claim))
+        .map_err(|_| "module unavailable")?
+        .map_err(|_| "the module gave no answer")?;
+    match verdict {
+        Check::Conforming(_) => Ok(()),
+        Check::Wrong { .. } => Err("concluded_by does not conform to the rule system"),
+        Check::NoVerdict(_) => Err("concluded_by is out of reach"),
+    }
+}
+
+/// Service every tracked session (the tick body), or only `only`: compute
+/// the live view through the module, then act — conclude, play our ply,
+/// star.
 #[allow(clippy::too_many_arguments)]
 async fn service_all(
     client: &Client,
@@ -1068,26 +1345,29 @@ async fn service_all(
     me: PublicKey,
     starred_today: &mut u64,
     offered_rematches: &mut BTreeMap<EventId, u64>,
+    only: Option<EventId>,
 ) {
-    let ids: Vec<EventId> = sessions.keys().copied().collect();
+    let ids: Vec<EventId> = match only {
+        Some(id) => vec![id],
+        None => sessions.keys().copied().collect(),
+    };
     for id in ids {
         let Some(meta) = sessions.get_mut(&id) else {
             continue;
         };
-        match service_session(client, ctx, relay_clock, meta, rng, me, starred_today).await {
-            // The verdict that ended it — carried through, since the rematch
-            // offer must cite it as its `concluded_by` proof.
-            Ok(Some(verdict_id)) => {
+        match service_session(client, ctx, relay_clock, meta, rng, starred_today).await {
+            // The canonical Conclusion that ended it — carried through, since
+            // the rematch challenge cites it as its `concluded_by` proof.
+            Ok(Some((conclusion_id, concluded_at))) => {
                 if let Some(meta) = sessions.remove(&id) {
                     terminate_session(
                         client,
                         ctx,
                         relay_clock,
                         me,
-                        &id,
-                        &verdict_id,
-                        &meta.opponent,
-                        &tags::timing_relays(&meta.session),
+                        &meta,
+                        &conclusion_id,
+                        concluded_at,
                         offered_rematches,
                     )
                     .await;
@@ -1101,9 +1381,10 @@ async fn service_all(
     }
 }
 
-/// Service one session. Returns `Ok(Some(verdict))` — the id of the Adjudication
-/// that ended it — when the session is finished and may be dropped, `Ok(None)`
-/// while it is still running.
+/// Service one session. Returns `Ok(Some((conclusion, cutoff)))` — the id
+/// and the cutoff of the canonical Conclusion that ended it — when the
+/// session is finished and may be dropped, `Ok(None)` while it is still
+/// running.
 #[allow(clippy::too_many_arguments)]
 async fn service_session(
     client: &Client,
@@ -1111,79 +1392,152 @@ async fn service_session(
     relay_clock: &RelayClock,
     meta: &mut SessionMeta,
     rng: &mut SplitMix64,
-    me: PublicKey,
     starred_today: &mut u64,
-) -> Result<Option<EventId>> {
+) -> Result<Option<(EventId, u64)>> {
     let session_id = meta.session.id;
-    let now = Timestamp::now().as_secs();
+    // The relay's clock, as estimated: the cutoff of every question asked
+    // of the module, and what deadlines are measured against.
+    let now = relay_clock.now_secs();
 
-    // The canonical verdict, if any: the session is over.
-    let verdicts = fetch_many(
+    // The session's Plies and Conclusions (session-scoped `#e` fetch — §6.4),
+    // filtered as the ABI prescribes.
+    let raw = fetch_many(
         client,
         Filter::new()
-            .kind(Kind::Custom(ADJUDICATION_KIND))
-            .author(ctx.arbiter)
+            .kinds([Kind::Custom(PLY_KIND), Kind::Custom(CONCLUSION_KIND)])
             .event(session_id),
     )
     .await?;
-    if let Some(verdict) = verdicts.first() {
-        maybe_star(client, ctx, relay_clock, meta, rng, verdict, starred_today).await;
-        tracing::info!(session = %session_id, status = %verdict.content, "verdict observed");
-        return Ok(Some(verdict.id));
+    let events = Events::from_relay(raw.iter(), &meta.terms, ctx.describe.max_step);
+    let request = chain::session_request(&meta.terms, meta.start, &events);
+
+    // The canonical Conclusion, if any: the session is over. Every other
+    // Conclusion is checked once and a wrong claim logged — the client/kernel
+    // divergence metric an operator watches.
+    let conclusions: Vec<serde_json::Value> =
+        events.conclusions.iter().map(|(_, c)| c.clone()).collect();
+    let canonical =
+        ctx.with_module(|oracle| module::select_conclusion(oracle, &request, &conclusions))??;
+    for (id, claim) in &events.conclusions {
+        if meta.warned.contains(id) || canonical.as_ref().is_some_and(|c| c.id == id.to_hex()) {
+            continue;
+        }
+        let verdict = ctx.with_module(|oracle| module::check(oracle, &request, claim))??;
+        if let Check::Wrong { claimed, expected } = verdict {
+            meta.warned.insert(*id);
+            tracing::warn!(
+                session = %session_id,
+                conclusion = %id,
+                %claimed,
+                expected = ?expected,
+                "non-conforming Conclusion (client/kernel divergence)"
+            );
+        }
+    }
+    if let Some(canonical) = canonical {
+        let conclusion_id = EventId::from_hex(&canonical.id)?;
+        if now.saturating_sub(canonical.cutoff) <= REMATCH_WINDOW_SECS {
+            maybe_star(
+                client,
+                ctx,
+                relay_clock,
+                meta,
+                rng,
+                &canonical.verdict.status,
+                starred_today,
+            )
+            .await;
+        }
+        tracing::info!(
+            session = %session_id,
+            status = %canonical.verdict.status,
+            first = canonical.verdict.result.first,
+            second = canonical.verdict.result.second,
+            "session concluded"
+        );
+        return Ok(Some((conclusion_id, canonical.cutoff)));
     }
 
-    // The session's plies and requests (session-scoped `#e` fetch — §6.4).
-    let ply_events = fetch_many(
-        client,
-        Filter::new().kind(Kind::Custom(PLY_KIND)).event(session_id),
-    )
-    .await?;
-    let request_events = fetch_many(
-        client,
-        Filter::new()
-            .kind(Kind::Custom(ADJUDICATION_REQUEST_KIND))
-            .event(session_id),
-    )
-    .await?;
-    let mut plies: Vec<arb::Ply> = Vec::new();
-    for event in &ply_events {
-        match mapping::ply(event) {
-            Ok(ply) => plies.push(ply),
-            Err(error) => tracing::debug!(id = %event.id, error = %error, "unmappable ply"),
+    let view =
+        ctx.with_module(|oracle| session_view(oracle, &meta.terms, meta.start, &events, now))??;
+
+    // A Conclusion we published: once its echo is back and it is not the
+    // canonical one, it did not conform (the opponent moved between the
+    // prediction and the cutoff, say) — the session goes on, and a fresh
+    // prediction may conclude it again. While the echo has not come back,
+    // re-send it after the grace, never publish another.
+    if let Some((ours, at)) = &meta.concluded {
+        if events.conclusions.iter().any(|(id, _)| *id == ours.id) {
+            tracing::warn!(session = %session_id, conclusion = %ours.id, "our Conclusion did not conform; the session goes on");
+            meta.concluded = None;
+        } else if now.saturating_sub(*at) >= REPUBLISH_GRACE_SECS {
+            // Its stamp is stale for a strict timing relay by now: let the
+            // decision below publish a fresh one — a second conforming
+            // Conclusion by the same signer is harmless (the earliest rules).
+            tracing::info!(session = %session_id, "the Conclusion's echo never came back; concluding afresh");
+            meta.concluded = None;
+        } else {
+            return Ok(None);
         }
     }
 
-    let my_key = mapping_key(me)?;
-    let view = session_view(&meta.params, &plies, &[], my_key, now)?;
-
-    // Terminal chain, or a predicted post-chain verdict worth invoking?
-    if let Some(invocation) = invocation_decision(ctx, meta, &plies, my_key, me, &view, now) {
-        // The opponent may already have invoked; then the arbiter will rule.
-        let already_requested = request_events
-            .iter()
-            .any(|event| tags::pubkey_with_role(event, "arbiter").as_ref() == Some(&ctx.arbiter));
-        if !already_requested {
-            publish_request(client, ctx, relay_clock, session_id).await?;
-            tracing::info!(session = %session_id, ?invocation, "invoked the arbiter");
+    // A wanted verdict? The prediction is the module's, at this instant, with
+    // our seat as the invoker.
+    let predicted = ctx.with_module(|oracle| {
+        predicted_verdict(oracle, &meta.terms, meta.start, &events, meta.my_seat, now)
+    })??;
+    if let Some(verdict) = predicted {
+        let decision = conclusion::decision(
+            &verdict,
+            meta.my_seat,
+            &view,
+            wants_draw(ctx, meta),
+            wants_to_resign(ctx, meta),
+        );
+        if let Some(why) = decision {
+            let due = match why {
+                Conclude::WinOnTime => {
+                    // The courtesy delay: a human whose clock just fell is not
+                    // flagged to the second (§6.6).
+                    let seen = *meta.timeout_seen_at.get_or_insert(now);
+                    now.saturating_sub(seen) >= ctx.config.play.timeout_courtesy_secs
+                }
+                Conclude::Terminal | Conclude::AcceptDraw | Conclude::Resign => true,
+            };
+            if due {
+                let (tags, content) = conclusion::conclusion_tags(
+                    &meta.terms,
+                    &verdict,
+                    tags::norm_relay(&ctx.fleet.relay_url),
+                );
+                let event = publish_self_timed(
+                    client,
+                    &ctx.keys,
+                    relay_clock,
+                    Kind::Custom(CONCLUSION_KIND),
+                    Pow::Mined(ctx.fleet.pow_difficulty),
+                    move |_created_at| (tags.clone(), content.clone()),
+                )
+                .await?;
+                meta.concluded = Some((event, now));
+                tracing::info!(session = %session_id, ?why, status = %verdict.status, "concluded");
+            }
+            return Ok(None);
         }
-        return Ok(None); // dropped when the 3425 lands
     }
+    meta.timeout_seen_at = None;
 
-    if view.terminal || view.on_move != my_key {
+    if view.terminal || view.on_move != meta.my_seat {
         return Ok(None);
     }
 
     // Same-slot idempotence guard (§6.5). Our ply for this very half-move may
-    // already be out while the session fetch has not caught up with it (the
-    // relay indexes and echoes asynchronously; a second trigger can land within
-    // the same second). Without the guard that re-entry SEARCHED AGAIN — a fresh
-    // seed, so usually a DIFFERENT move — and published a second content for the
-    // same slot, leaving every consumer's selection to race the two (observed:
-    // c2c4+b2b4, c2c4+e2e4, c7c5+d7d5). One slot, one search: hold until the
-    // chain advances past it, and after a grace period re-send the SAME content
-    // — identical contents collapse to one candidate in the selection rule, so
-    // the re-send is harmless where a fresh search is not, and a genuinely lost
-    // publish cannot deadlock the seat.
+    // already be out while the session fetch has not caught up with it. One
+    // slot, one search: hold until the chain advances past it, and after a
+    // grace period re-send the SAME content — identical contents collapse to
+    // one candidate in the selection rule, so the re-send is harmless where a
+    // fresh search is not, and a genuinely lost publish cannot deadlock the
+    // seat.
     if let Some(published) = &mut meta.published {
         if published.half_move == view.next_half_move {
             if now.saturating_sub(published.at) >= REPUBLISH_GRACE_SECS {
@@ -1249,25 +1603,19 @@ async fn service_session(
     }
     if now < meta.next_action_at {
         let wait = meta.next_action_at.saturating_sub(now);
-        // Defer to the coarse tick when the wake is still more than a tick away
-        // (cheap, non-blocking), and always for correspondence (its 60 s σ dwarfs
-        // the tick). But a LIVE game whose planned move falls WITHIN one tick must
-        // not defer: the next coarse tick would fire up to `TICK_SECS` AFTER
-        // `next_action_at`, overshooting the flag on a fast cadence (a 10 s/move
-        // game has no room for a 5 s tick slip). Sleep the sub-tick residual and
-        // play in-call so we hit the planned instant precisely — `play_ply` itself
-        // clamps the search to `latest_start - now`, so publication still lands
-        // before the flag. Bounded by `TICK_SECS`, so the loop never blocks for
-        // more than one tick.
+        // Defer to the coarse tick when the wake is still more than a tick
+        // away, and always for correspondence. A LIVE game whose planned move
+        // falls WITHIN one tick must not defer: sleep the sub-tick residual
+        // and play in-call so we hit the planned instant precisely.
         if meta.correspondence || wait >= TICK_SECS {
             return Ok(None); // a later tick will come back
         }
         tokio::time::sleep(StdDuration::from_secs(wait)).await;
     }
 
-    // Recompute `now` after any pacing sleep so `play_ply` sizes its search budget
-    // against the time that actually remains, not the pre-sleep estimate.
-    let play_now = Timestamp::now().as_secs();
+    // Recompute `now` after any pacing sleep so `play_ply` sizes its search
+    // budget against the time that actually remains.
+    let play_now = relay_clock.now_secs();
     play_ply(
         client,
         ctx,
@@ -1275,78 +1623,11 @@ async fn service_session(
         meta,
         &view,
         rng,
-        me,
         play_now,
         latest_start,
     )
     .await?;
     Ok(None)
-}
-
-/// What a 3424 published now would achieve, if it is worth publishing
-/// (§6.6): the bot invokes ONLY when it wants the predicted verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Invocation {
-    Ratify,
-    WinOnTime,
-    AcceptDraw,
-    Resign,
-}
-
-fn invocation_decision(
-    ctx: &BotContext,
-    meta: &SessionMeta,
-    plies: &[arb::Ply],
-    my_key: arb::PublicKey,
-    me: PublicKey,
-    view: &SessionView,
-    now: u64,
-) -> Option<Invocation> {
-    let verdict = predicted_verdict(&meta.params, plies, &[], my_key, now)?;
-    let my_side = if meta
-        .params
-        .player(sashite_sanki_engine::domain::side::Side::First)
-        == my_key
-    {
-        sashite_sanki_engine::domain::side::Side::First
-    } else {
-        sashite_sanki_engine::domain::side::Side::Second
-    };
-    let i_win = matches!(
-        (verdict.result(), my_side),
-        (
-            Outcome3::FirstWins,
-            sashite_sanki_engine::domain::side::Side::First
-        ) | (
-            Outcome3::SecondWins,
-            sashite_sanki_engine::domain::side::Side::Second
-        )
-    );
-    let _ = me;
-    match verdict.status() {
-        // A rule-system ending reached by the chain: either player may
-        // safely invoke — ratify whatever the outcome (it is already fact).
-        // `MoveCap` (engine 0.6): the absolute 300-full-move global cap — a
-        // rule-system draw like `MoveLimit`, ratifiable the same way.
-        Status::Checkmate
-        | Status::Stalemate
-        | Status::NoMove
-        | Status::Insufficient
-        | Status::Repetition
-        | Status::MoveLimit
-        | Status::MoveCap => Some(Invocation::Ratify),
-        // Timeout: invoke only as the winner (publishing early risks
-        // resigning; the loser never hurries their own flag).
-        Status::Timeout => i_win.then_some(Invocation::WinOnTime),
-        // Agreement: the opponent's standing draw offer — invoking IS the
-        // acceptance. Gated by temperament and the standing assessment.
-        Status::Agreement => {
-            (view.last_ply_offers_draw && wants_draw(ctx, meta)).then_some(Invocation::AcceptDraw)
-        }
-        // Residual resignation (against the invoker): only when the persona
-        // has decided to resign (sustained hopeless assessments).
-        Status::Resignation => wants_to_resign(ctx, meta).then_some(Invocation::Resign),
-    }
 }
 
 /// Draw temperament (§6.6): accept when the standing assessment does not
@@ -1385,23 +1666,23 @@ async fn publish_ply(
     content: String,
     offer_draw: bool,
 ) -> Result<()> {
+    let hint = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
     publish_self_timed(
         client,
         &ctx.keys,
         relay_clock,
         Kind::Custom(PLY_KIND),
-        ctx.fleet.pow_difficulty,
+        Pow::Mined(ctx.fleet.pow_difficulty),
         move |_created_at| {
             let mut event_tags = vec![
                 Tag::custom(
                     "e",
-                    [
-                        session_id.to_hex(),
-                        String::new(),
-                        "game_session".to_owned(),
-                    ],
+                    [session_id.to_hex(), hint.clone(), "game_session".to_owned()],
                 ),
-                p_role(&opponent, "opponent"),
+                Tag::custom(
+                    "p",
+                    [opponent.to_hex(), hint.clone(), "opponent".to_owned()],
+                ),
                 Tag::custom("step", [step.to_string()]),
             ];
             if offer_draw {
@@ -1414,7 +1695,9 @@ async fn publish_ply(
     Ok(())
 }
 
-/// Choose and publish our ply (§6.5).
+/// Choose and publish our ply (§6.5): the search over the tip the module
+/// reached, then the module's `legal_moves` as the last word on what is
+/// played.
 #[allow(clippy::too_many_arguments)]
 async fn play_ply(
     client: &Client,
@@ -1423,10 +1706,15 @@ async fn play_ply(
     meta: &mut SessionMeta,
     view: &SessionView,
     rng: &mut SplitMix64,
-    me: PublicKey,
     now: u64,
     latest_start: u64,
 ) -> Result<()> {
+    // The module's legal moves in the tip: the rule, whatever the search
+    // thinks (ADR-0034 §Normativity).
+    let legal = ctx.with_module(|oracle| module::legal_moves(oracle, &view.tip))??;
+    if legal.is_empty() {
+        bail!("no legal move on our turn (the view should be terminal)");
+    }
     // Search budget: the persona's allowance, clamped by the clock.
     let clock_allowance_ms = latest_start.saturating_sub(now).saturating_mul(1_000);
     let budget_ms = ctx
@@ -1441,7 +1729,12 @@ async fn play_ply(
         weights: sashite_sanki_player::EvalWeights::default(),
         seed: rng.next_u64(),
     };
-    let tip = view.tip.clone();
+    let tip = Position::parse(&view.tip).map_err(|e| {
+        anyhow!(
+            "the search engine cannot parse the module's tip {}: {e:?}",
+            view.tip
+        )
+    })?;
     let occurrences = view.occurrences.clone();
     let halfmove_clock = view.halfmove_clock;
     let choice = tokio::task::spawn_blocking(move || {
@@ -1461,10 +1754,36 @@ async fn play_ply(
         choose(&ctx, &strength, &limits)
     })
     .await
-    .context("search task failed")?
-    .ok_or_else(|| anyhow!("no legal move on our turn (stale view?)"))?;
+    .context("search task failed")?;
 
-    meta.my_side_evals.push_back(choice.eval_cp);
+    // The search's choice, if the module admits it; else — a divergence
+    // between the search engine and the rule system, logged — a move the
+    // module admits, drawn among its.
+    let (content, eval_cp) = match choice {
+        Some(choice) if legal.contains(&move_content(&choice.mv)) => {
+            tracing::debug!(
+                eval = choice.eval_cp,
+                depth = choice.depth,
+                nodes = choice.nodes,
+                "searched"
+            );
+            (move_content(&choice.mv), choice.eval_cp)
+        }
+        other => {
+            tracing::warn!(
+                session = %meta.session.id,
+                chosen = other.as_ref().map(|c| move_content(&c.mv)),
+                "the search's move is not one the rule system admits; playing a legal one"
+            );
+            let index = rng.next_index(legal.len());
+            (
+                legal.get(index).cloned().unwrap_or_default(),
+                meta.my_side_evals.back().copied().unwrap_or(0),
+            )
+        }
+    };
+
+    meta.my_side_evals.push_back(eval_cp);
     if meta.my_side_evals.len() > 8 {
         meta.my_side_evals.pop_front();
     }
@@ -1472,11 +1791,10 @@ async fn play_ply(
     // Draw offer temperament on our own ply (§6.6).
     let offer_draw = match ctx.config.play.draw_offer {
         DrawOffer::Never => false,
-        DrawOffer::Balanced => choice.eval_cp.abs() <= 60 && view.chain_len >= 24,
-        DrawOffer::Eager => choice.eval_cp.abs() <= 150 && view.chain_len >= 10,
+        DrawOffer::Balanced => eval_cp.abs() <= 60 && view.chain_len >= 24,
+        DrawOffer::Eager => eval_cp.abs() <= 150 && view.chain_len >= 10,
     };
 
-    let content = move_content(&choice.mv);
     let session_id = meta.session.id;
     let opponent = meta.opponent;
     let step = view.step;
@@ -1500,51 +1818,13 @@ async fn play_ply(
         offer_draw,
         at: now,
     });
-    let _ = me;
     tracing::info!(
         session = %session_id,
         half_move = view.next_half_move,
-        eval = choice.eval_cp,
-        depth = choice.depth,
-        nodes = choice.nodes,
+        eval = eval_cp,
         offer_draw,
         "played"
     );
-    Ok(())
-}
-
-/// Publish the Adjudication Request (kind 3424).
-async fn publish_request(
-    client: &Client,
-    ctx: &BotContext,
-    relay_clock: &RelayClock,
-    session_id: EventId,
-) -> Result<()> {
-    let arbiter = ctx.arbiter;
-    publish_self_timed(
-        client,
-        &ctx.keys,
-        relay_clock,
-        Kind::Custom(ADJUDICATION_REQUEST_KIND),
-        ctx.fleet.pow_difficulty,
-        move |_created_at| {
-            (
-                vec![
-                    Tag::custom(
-                        "e",
-                        [
-                            session_id.to_hex(),
-                            String::new(),
-                            "game_session".to_owned(),
-                        ],
-                    ),
-                    p_role(&arbiter, "arbiter"),
-                ],
-                String::new(),
-            )
-        },
-    )
-    .await?;
     Ok(())
 }
 
@@ -1557,7 +1837,7 @@ async fn maybe_star(
     relay_clock: &RelayClock,
     meta: &SessionMeta,
     rng: &mut SplitMix64,
-    verdict: &Event,
+    status: &str,
     starred_today: &mut u64,
 ) {
     if *starred_today >= 1 {
@@ -1567,7 +1847,7 @@ async fn maybe_star(
         return;
     }
     let chain_len = meta.my_side_evals.len(); // proxy: own turns witnessed
-    let fast_mate = verdict.content == "checkmate" && chain_len <= 12;
+    let fast_mate = status == "checkmate" && chain_len <= 12;
     let long_struggle = chain_len >= 50;
     if !(fast_mate || long_struggle) || rng.next_index(4) != 0 {
         return;
@@ -1578,7 +1858,7 @@ async fn maybe_star(
         &ctx.keys,
         relay_clock,
         Kind::Reaction,
-        0,
+        Pow::None,
         move |_created_at| {
             (
                 vec![
@@ -1646,25 +1926,22 @@ async fn follows(client: &Client, follower: &PublicKey, followed: &PublicKey) ->
     })
 }
 
-/// The kind-3423 `content` of an engine move.
-fn move_content(mv: &EngineMove) -> String {
+/// The kind-3423 `content` of a search-engine move — the same form the
+/// module's `legal_moves` lists (Move Encoding — Sanki §Content format).
+fn move_content(mv: &Move) -> String {
     match mv {
-        EngineMove::Board { from, to, actor } => {
+        Move::Board { from, to, actor } => {
             let actor = actor
                 .as_ref()
                 .map_or("null".to_owned(), |name| format!("\"{}\"", name.as_str()));
             format!("[\"{from}\",\"{to}\",{actor}]")
         }
-        EngineMove::Drop { piece, to } => format!("[null,\"{to}\",\"{}\"]", piece.as_str()),
+        Move::Drop { piece, to } => format!("[null,\"{to}\",\"{}\"]", piece.as_str()),
     }
 }
 
 fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
     Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_owned()])
-}
-
-fn mapping_key(pubkey: PublicKey) -> Result<arb::PublicKey> {
-    arb::PublicKey::parse(&pubkey.to_hex()).ok_or_else(|| anyhow!("malformed pubkey"))
 }
 
 /// Minimal JSON string escaping for the kind-0 metadata fields.
@@ -1699,13 +1976,9 @@ async fn fetch_event(client: &Client, id: EventId) -> Result<Event> {
     fetch_many(client, Filter::new().id(id))
         .await?
         .into_iter()
-        .next()
+        .find(|event| event.id == id)
         .ok_or_else(|| anyhow!("event {id} not found on the relay"))
 }
-
-/// Unused-for-now grace constant kept where the silent-arbiter logic will
-/// live once courting tracks declared-but-unratified sessions.
-const _: u64 = SILENT_ARBITER_GRACE_SECS;
 
 #[cfg(test)]
 mod tests {
@@ -1715,11 +1988,11 @@ mod tests {
 
     #[test]
     fn move_content_matches_the_kind_3423_format() {
-        let board = EngineMove::parse(r#"["a1","a4",null]"#).unwrap();
+        let board = Move::parse(r#"["a1","a4",null]"#).unwrap();
         assert_eq!(move_content(&board), r#"["a1","a4",null]"#);
-        let promo = EngineMove::parse(r#"["b7","b8","queen"]"#).unwrap();
+        let promo = Move::parse(r#"["b7","b8","queen"]"#).unwrap();
         assert_eq!(move_content(&promo), r#"["b7","b8","queen"]"#);
-        let drop = EngineMove::parse(r#"[null,"e5","fu"]"#).unwrap();
+        let drop = Move::parse(r#"[null,"e5","fu"]"#).unwrap();
         assert_eq!(move_content(&drop), r#"[null,"e5","fu"]"#);
     }
 
@@ -1727,5 +2000,33 @@ mod tests {
     fn json_string_escapes() {
         assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
         assert_eq!(json_string("a\nb"), r#""a\nb""#);
+    }
+
+    #[test]
+    fn the_search_engine_and_the_module_agree_on_move_contents() {
+        // The module's `legal_moves` lists the contents a Ply carries; the
+        // search engine's moves, encoded by `move_content`, must be among
+        // them — the guard `play_ply` applies, exercised on the start.
+        use crate::module::native::Native;
+        let describe = module::describe(&mut Native).unwrap();
+        for (pairing, feen) in &describe.positions {
+            let legal = module::legal_moves(&mut Native, feen).unwrap();
+            let position = Position::parse(feen).unwrap_or_else(|e| panic!("{pairing}: {e:?}"));
+            let strength = Strength {
+                max_depth: 1,
+                ..Strength::default()
+            };
+            let ctx = PlayerContext {
+                position: &position,
+                occurrences: &sashite_sanki_player::Occurrences::new(),
+                halfmove_clock: 0,
+            };
+            let choice = choose(&ctx, &strength, &Limits::default()).unwrap();
+            assert!(
+                legal.contains(&move_content(&choice.mv)),
+                "{pairing}: {} not among the module's legal moves",
+                move_content(&choice.mv)
+            );
+        }
     }
 }

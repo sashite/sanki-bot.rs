@@ -2,18 +2,21 @@
 //!
 //! One process, N identities: a supervisor loads the TOML fleet
 //! configuration (path from `FLEET_CONFIG_PATH`, kept outside every
-//! repository; keys by environment indirection), builds the shared ledger
-//! (bot-vs-bot budget, pool occupancy), and runs one bot actor per persona —
-//! each with its own keypair, relay client and subscriptions. The bots hold
-//! no privileged key and exercise exactly the public protocol: entering the
-//! matchmaking pool (kind 3418), answering Direct Challenges (3420/3421),
-//! exchanging Plies (3423) under the Time Accounting discipline, and
-//! invoking the arbiter (3424) only when the predicted verdict is wanted.
+//! repository; keys by environment indirection), loads the **rule system**
+//! the fleet plays under (the Rule System event named by `fleet.rules`, and
+//! the module it names — verified, cached, instantiated under `wasmi`),
+//! builds the shared ledger (bot-vs-bot budget, pool occupancy), and runs
+//! one bot actor per persona — each with its own keypair, relay client and
+//! subscriptions. The bots hold no privileged key and exercise exactly the
+//! public protocol: entering the matchmaking pool (kind 3418), founding the
+//! session a Pairing declares and accepting Direct Challenges by founding
+//! the Game Session (3422), exchanging Plies (3423) under the Time
+//! Accounting discipline, concluding (3425) only with the verdict the rule
+//! system yields, and proposing rematches (3420).
 //!
-//! Game and protocol semantics are REUSED, never reimplemented:
-//! `sashite-sanki-engine` (legality, application), `sashite-sanki-arbiter`
-//! (canonical chain, clocks, verdict prediction — the bot believes exactly
-//! what the arbiter will rule), `sashite-sanki-player` (move choice).
+//! Rule semantics are never reimplemented (ADR-0034): the session's module
+//! is the one oracle of state, legality and verdict; `sashite-sanki-player`
+//! chooses the moves, within what the module admits.
 //!
 //! Configuration (environment):
 //! - `FLEET_CONFIG_PATH` (required): path to the fleet TOML (see
@@ -25,19 +28,24 @@
 mod actor;
 mod chain;
 mod clockmath;
+mod conclusion;
 mod config;
 mod courtship;
 mod fleet;
-mod mapping;
+mod founding;
+mod module;
 mod persona;
 mod prng;
 mod publish;
 mod rematch;
+mod rules;
+mod session;
 mod tags;
 
 use std::collections::BTreeSet;
 use std::env;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
@@ -59,8 +67,8 @@ async fn main() -> Result<()> {
 
     let matchmaker = PublicKey::parse(&fleet_config.fleet.matchmaker)
         .context("fleet.matchmaker is not a valid pubkey")?;
-    let arbiter = PublicKey::parse(&fleet_config.fleet.arbiter)
-        .context("fleet.arbiter is not a valid pubkey")?;
+    let rules = EventId::from_hex(&fleet_config.fleet.rules)
+        .context("fleet.rules is not a Rule System event id")?;
 
     // Resolve every key first (fail fast on a missing variable), and build
     // the fleet member set for the ledger.
@@ -79,11 +87,38 @@ async fn main() -> Result<()> {
         fleet_config.fleet.max_concurrent_bot_vs_bot,
     ));
 
+    // The rule system, before anything is published: a client MUST hold and
+    // have instantiated the module before entering a pool, challenging,
+    // founding or accepting (kind 3417 §Retrieval and verification). One
+    // instance serves every persona of the process.
+    let loaded = load_rule_system(
+        &fleet_config.fleet.relay_url,
+        Path::new(&fleet_config.fleet.rules_cache_dir),
+        rules,
+    )
+    .await?;
+    if loaded.describe.game != fleet_config.fleet.game {
+        anyhow::bail!(
+            "the rule system is for game {:?}, the fleet plays {:?}",
+            loaded.describe.game,
+            fleet_config.fleet.game
+        );
+    }
+    let describe = loaded.describe.clone();
+    tracing::info!(
+        %rules,
+        digest = loaded.event.digest(),
+        publisher = %loaded.event.publisher(),
+        pairings = describe.positions.len(),
+        max_step = describe.max_step,
+        "rule system loaded"
+    );
+    let module = Arc::new(Mutex::new(loaded));
+
     tracing::info!(
         bots = roster.len(),
         relay = %fleet_config.fleet.relay_url,
         %matchmaker,
-        %arbiter,
         "starting the Sashité player fleet"
     );
 
@@ -101,7 +136,9 @@ async fn main() -> Result<()> {
             config: bot,
             fleet: fleet_config.fleet.clone(),
             matchmaker,
-            arbiter,
+            rules,
+            module: Arc::clone(&module),
+            describe: describe.clone(),
             ledger: Arc::clone(&ledger),
             bot_seed,
             shutdown: shutdown_rx.clone(),
@@ -121,6 +158,35 @@ async fn main() -> Result<()> {
     }
     tracing::info!("fleet down; bye");
     Ok(())
+}
+
+/// Loads the Rule System event `rules` and its module through a throwaway
+/// relay connection (the event from the relay if not cached, the module
+/// from the event's `url` hints if not cached).
+async fn load_rule_system(
+    relay_url: &str,
+    cache: &Path,
+    rules: EventId,
+) -> Result<rules::LoadedRuleSystem> {
+    let client = Client::builder().build();
+    client
+        .add_relay(relay_url)
+        .await
+        .with_context(|| format!("failed to add relay {relay_url}"))?;
+    client.connect().await;
+    let http = reqwest::Client::builder()
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()
+        .context("building the HTTP client")?;
+    let loaded = rules::load(&client, &http, cache, rules)
+        .await
+        .with_context(|| format!("could not load the rule system {rules}"))?;
+    client.disconnect().await;
+    Ok(loaded)
 }
 
 /// A stable per-bot seed from its pubkey bytes.

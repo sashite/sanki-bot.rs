@@ -1,11 +1,11 @@
 [package]
 name = "sashite-sanki-player-nostr-bot"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/sashite/sanki-player-nostr-bot.rs"
-description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014). One supervisor, N personas — pool courtship (kind 3418), direct-challenge acceptance (3420/3421), full session play (3423) with clock discipline, predictive arbiter invocation (3424) — over the pure crates: sashite-sanki-engine (rules), sashite-sanki-arbiter (chain and clocks), sashite-sanki-player (move choice)."
+description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014, ADR-0034). One supervisor, N personas — pool courtship (kind 3418), founding and acceptance by Game Session (3422), full session play (3423) with clock discipline, Conclusions (3425) the rule system yields, rematch challenges (3420) — over the session's rule system: the module named by a Rule System event (3417), run under wasmi, is the only rules oracle; sashite-sanki-player chooses the moves."
 # Internal service, not a library for crates.io.
 publish = false
 
@@ -25,16 +25,27 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 # Timezone-aware presence windows (personas live in their own timezones).
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
 
-# The pure crates: rules, protocol semantics, move decision. The bot maps relay
-# events into their types and never reimplements game or protocol semantics
-# (ADR-0014 §Chain and clock logic).
-sashite-sanki-engine = "0.9"
-sashite-sanki-arbiter = "0.12"
+# The rule system (ADR-0034): the kind-3417 Rule System parser and the kind-3418
+# Open Challenge parser (`nostchmaker`); the WebAssembly interpreter the session's
+# module runs under (pure Rust, deterministic, no JIT — the runtime the module's
+# own conformance run uses); the module's digest check; fetching the module's
+# bytes from the event's `url` hints (rustls, like the relay connection).
+nostchmaker = "0.9"
+wasmi = { version = "2", features = ["deterministic"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+# Move choice (ADR-0015): the anytime search over the native engine. It is the
+# bot's brain, never its rules: the tip position it searches from, the legality
+# of the move it picks, the state of the session and every verdict come from the
+# session's module (ADR-0034), and the search's choice is checked against the
+# module's `legal_moves` before it is played.
 sashite-sanki-player = "0.5"
 
 [dev-dependencies]
@@ -43,7 +54,11 @@ sashite-sanki-player = "0.5"
 # already in the dependency tree (via nostr-sdk), so nothing new compiles.
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
-serde_json = "1"
+# The reference module's library face: the same answers as the module, natively,
+# so the module-driven paths are tested without building or shipping a `.wasm`.
+sashite-sanki-kernel-wasm = "0.1"
+# Hand-written modules of the wrong shape, for the runtime's refusal tests.
+wat = "1"
 
 [lints.rust]
 unsafe_code = "forbid"

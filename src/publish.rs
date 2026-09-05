@@ -44,16 +44,23 @@ impl RelayClock {
         }
     }
 
-    /// The `created_at` to stamp right now.
+    /// The relay's clock as estimated now, in unix seconds — the instant
+    /// every timing comparison with the relay's events is made at (a cutoff,
+    /// a deadline), so that a host clock behind the relay never makes the
+    /// bot believe it has more time than it has.
     #[must_use]
-    pub fn stamp(&self) -> Timestamp {
+    pub fn now_secs(&self) -> u64 {
         let now = Timestamp::now().as_secs();
         let skew = self.skew_secs.load(Ordering::Relaxed);
-        let stamped = i64::try_from(now)
-            .unwrap_or(i64::MAX)
-            .saturating_add(skew)
-            .saturating_add(i64::try_from(FORWARD_BUFFER_SECS).unwrap_or(1));
-        Timestamp::from_secs(u64::try_from(stamped.max(0)).unwrap_or(0))
+        let estimated = i64::try_from(now).unwrap_or(i64::MAX).saturating_add(skew);
+        u64::try_from(estimated.max(0)).unwrap_or(0)
+    }
+
+    /// The `created_at` to stamp right now: the relay's clock plus the
+    /// forward buffer.
+    #[must_use]
+    pub fn stamp(&self) -> Timestamp {
+        Timestamp::from_secs(self.now_secs().saturating_add(FORWARD_BUFFER_SECS))
     }
 
     /// Raise the estimate after a stale rejection.
@@ -91,6 +98,18 @@ pub fn is_future_reason(reason: &str) -> bool {
     lower.contains("future") || lower.contains("ahead") || lower.contains("too far forward")
 }
 
+/// Whether, and how hard, an event is mined (NIP-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pow {
+    /// The kind prescribes no `nonce` tag (a profile, a Game Session, a
+    /// reaction): none is added.
+    None,
+    /// The kind prescribes a `nonce` tag (every player-published founding,
+    /// Ply and Conclusion): mined to this difficulty — `0` adds the
+    /// trivially-satisfied `["nonce", "0", "0"]`.
+    Mined(u8),
+}
+
 /// Build, mine, sign and publish an event whose tags may depend on the
 /// stamped `created_at` (e.g. an `accept_until` window). Retries stale
 /// rejections with a bumped stamp; returns the accepted event.
@@ -99,7 +118,7 @@ pub async fn publish_self_timed<F>(
     keys: &Keys,
     relay_clock: &RelayClock,
     kind: Kind,
-    pow_difficulty: u8,
+    pow: Pow,
     build: F,
 ) -> Result<Event>
 where
@@ -110,25 +129,29 @@ where
         let (mut tags, content) = build(created_at);
         let mut builder = EventBuilder::new(kind, content).custom_created_at(created_at);
         let mut difficulty: Option<NonZeroU8> = None;
-        if pow_difficulty > 0 {
-            // Mining adds the NIP-13 `nonce` tag as a side effect. Since nostr
-            // 0.45 it happens on the UNSIGNED event rather than on the builder
-            // (`EventBuilder::pow` is gone), so the target is carried down to
-            // the signing step below.
-            difficulty = NonZeroU8::new(pow_difficulty);
-            builder = builder.tags(tags);
-        } else {
-            // The `nonce` tag is STRUCTURALLY required on a clock-timed suite event —
-            // a Ply (kind 3423, §Proof-of-work tag / constraint 6) and an Adjudication
-            // Request — independently of the relay's difficulty policy: a conforming
-            // client (e.g. the Sanki app's `parsePly`) rejects a Ply that carries none,
-            // so its half-move never joins the canonical chain and the board wedges.
-            // At difficulty 0 (a dev relay enforcing no PoW) `.pow()` is skipped, so the
-            // tag would be absent; add the trivially-satisfied 0-target nonce explicitly,
-            // mirroring the app's own miner, which emits `["nonce", "0", "0"]` at
-            // difficulty 0.
-            tags.push(Tag::custom("nonce", ["0", "0"]));
-            builder = builder.tags(tags);
+        match pow {
+            Pow::Mined(target) if target > 0 => {
+                // Mining adds the NIP-13 `nonce` tag as a side effect. Since
+                // nostr 0.45 it happens on the UNSIGNED event rather than on
+                // the builder (`EventBuilder::pow` is gone), so the target is
+                // carried down to the signing step below.
+                difficulty = NonZeroU8::new(target);
+                builder = builder.tags(tags);
+            }
+            Pow::Mined(_) => {
+                // The `nonce` tag is STRUCTURALLY required on a player-published
+                // suite event — a Ply (kind 3423, constraint 6), a Conclusion, a
+                // founding — independently of the relay's difficulty policy: a
+                // conforming consumer rejects one that carries none, so a Ply
+                // without it never joins the canonical chain and the board
+                // wedges. At difficulty 0 (a dev relay enforcing no PoW) mining
+                // is skipped, so the tag would be absent; add the trivially-
+                // satisfied 0-target nonce explicitly, mirroring the app's own
+                // miner, which emits `["nonce", "0", "0"]` at difficulty 0.
+                tags.push(Tag::custom("nonce", ["0", "0"]));
+                builder = builder.tags(tags);
+            }
+            Pow::None => builder = builder.tags(tags),
         }
         let unsigned = builder.finalize_unsigned(keys.public_key());
         let unsigned = match difficulty {

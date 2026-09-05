@@ -4,7 +4,8 @@
 //! markers in the fourth element of `e`/`p` tags, and `game`/`variant`/`seat`
 //! payloads in dedicated tags. These helpers extract those values without
 //! interpreting them. They are pure functions over a borrowed [`Event`], so they
-//! are independently testable and shared by the session and adjudication builders.
+//! are independently testable and shared by the courtship, session and
+//! conclusion layers.
 
 use nostr_sdk::prelude::*;
 
@@ -39,37 +40,10 @@ pub fn event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
     marked_value(event, "e", marker).and_then(|v| EventId::parse(v).ok())
 }
 
-/// The event id of the `e` tag carrying the given marker, when the event carries
-/// **exactly one** such tag and its id parses — the shape a specification's
-/// "exactly one" requirement demands (e.g. a Rematch Offer's `concluded_by`,
-/// kind `3430` §Semantic constraints). `None` when the marker is absent,
-/// repeated, or carried by a tag whose id is missing or unparseable; a repeated
-/// marker is a malformation [`event_with_marker`] (first match wins) would let
-/// through.
-pub fn sole_event_with_marker(event: &Event, marker: &str) -> Option<EventId> {
-    let mut marked = event.tags.iter().filter_map(|tag| {
-        let s = tag.as_slice();
-        if s.first().map(String::as_str) == Some("e")
-            && s.get(3).map(String::as_str) == Some(marker)
-        {
-            Some(s.get(1).map_or("", String::as_str))
-        } else {
-            None
-        }
-    });
-    let only = marked.next()?;
-    if marked.next().is_some() {
-        return None; // repeated marker: not "exactly one"
-    }
-    EventId::parse(only).ok()
-}
-
-/// Every event id of `e` tags carrying the given marker, in tag order — e.g. the
-/// **two** `rematch_offer`-marked tags of a rematch-founded Game Session (kind
-/// `3422` §Founding reference). `None` if any marked tag's id is missing or
-/// unparseable, so a caller checking "exactly N" against the returned length
-/// never sees a malformed reference silently drop out of the count.
-pub fn events_with_marker(event: &Event, marker: &str) -> Option<Vec<EventId>> {
+/// The event ids of every `e` tag carrying the given marker, in tag order —
+/// so that a doubled reference is visible to the caller ("exactly one" is
+/// `[id]`). An id that does not parse is skipped.
+pub fn events_with_marker(event: &Event, marker: &str) -> Vec<EventId> {
     event
         .tags
         .iter()
@@ -78,25 +52,43 @@ pub fn events_with_marker(event: &Event, marker: &str) -> Option<Vec<EventId>> {
             if s.first().map(String::as_str) == Some("e")
                 && s.get(3).map(String::as_str) == Some(marker)
             {
+                s.get(1).and_then(|v| EventId::parse(v).ok())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The second element of every tag named `name`, in tag order (empty when the
+/// tag has no second element).
+pub fn values<'a>(event: &'a Event, name: &str) -> Vec<&'a str> {
+    event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let s = tag.as_slice();
+            if s.first().map(String::as_str) == Some(name) {
                 Some(s.get(1).map_or("", String::as_str))
             } else {
                 None
             }
         })
-        .map(|v| EventId::parse(v).ok())
         .collect()
+}
+
+/// How many tags are named `name`.
+pub fn count_named(event: &Event, name: &str) -> usize {
+    event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(name))
+        .count()
 }
 
 /// The value of the singleton `game` tag (`["game", "<id>"]`).
 pub fn game(event: &Event) -> Option<&str> {
     positional_value(event, "game", 1)
-}
-
-/// The seat-name of the singleton `seat` tag (`["seat", "<seat>"]`) carried by a
-/// founding event. Distinct from the Game Session's per-player `seat` tags (the
-/// three-element, pubkey-keyed form).
-pub fn seat(event: &Event) -> Option<&str> {
-    positional_value(event, "seat", 1)
 }
 
 /// The value of the singleton `accept_until` tag (`["accept_until", "<unix-seconds>"]`)
@@ -113,6 +105,12 @@ pub fn variant_for<'a>(event: &'a Event, pubkey: &PublicKey) -> Option<&'a str> 
 /// The seat assigned to `pubkey` by a Game Session (`["seat", "<pubkey>", "<seat>"]`).
 pub fn seat_for<'a>(event: &'a Event, pubkey: &PublicKey) -> Option<&'a str> {
     keyed_value(event, "seat", pubkey)
+}
+
+/// The result assigned to `pubkey` by a Conclusion (`["result", "<pubkey>",
+/// "<integer>"]`). The raw string; the caller parses it.
+pub fn result_for<'a>(event: &'a Event, pubkey: &PublicKey) -> Option<&'a str> {
+    keyed_value(event, "result", pubkey)
 }
 
 /// Second element of the first tag named `name` whose fourth element is `marker`.
@@ -204,37 +202,6 @@ pub fn filter_row(event: &Event) -> Option<Vec<String>> {
     })
 }
 
-/// The values of every `timing_relay` tag (`["timing_relay", "<wss://…>"]`), as
-/// a **set**: the self-timed designation is mirrored and compared as a set
-/// (Canonical Timing NIP §Timing modes and mode selection). Empty in attested
-/// mode.
-pub fn timing_relays(event: &Event) -> std::collections::BTreeSet<String> {
-    event
-        .tags
-        .iter()
-        .filter_map(|tag| {
-            let s = tag.as_slice();
-            if s.first().map(String::as_str) == Some("timing_relay") {
-                s.get(1).cloned()
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// The raw `timing_relay` tags of `event`, in tag order — for mirroring the
-/// designation **verbatim** into a responding event (kind `3421` §Operating
-/// mode: the acceptance copies the challenge's set).
-pub fn timing_relay_tags(event: &Event) -> Vec<Tag> {
-    event
-        .tags
-        .iter()
-        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("timing_relay"))
-        .cloned()
-        .collect()
-}
-
 /// A relay URL normalized for designation comparison: the trailing slash is
 /// insignificant (`wss://r.example.com/` designates `wss://r.example.com`).
 pub fn norm_relay(url: &str) -> &str {
@@ -286,19 +253,19 @@ mod tests {
     #[test]
     fn reads_roles_and_markers() {
         let signer = keys();
-        let arbiter = keys().public_key();
+        let matchmaker = keys().public_key();
         let opponent = keys().public_key();
         let gs = an_event_id();
         let event = signed(
             vec![
-                p(&arbiter, "arbiter"),
+                p(&matchmaker, "matchmaker"),
                 p(&opponent, "opponent"),
                 e_marked(&gs, "game_session"),
             ],
             &signer,
         );
 
-        assert_eq!(pubkey_with_role(&event, "arbiter"), Some(arbiter));
+        assert_eq!(pubkey_with_role(&event, "matchmaker"), Some(matchmaker));
         assert_eq!(pubkey_with_role(&event, "opponent"), Some(opponent));
         assert_eq!(pubkey_with_role(&event, "timestamper"), None);
         assert_eq!(event_with_marker(&event, "game_session"), Some(gs));
@@ -306,91 +273,38 @@ mod tests {
     }
 
     #[test]
-    fn sole_marker_requires_exactly_one_parseable_reference() {
-        let signer = keys();
-        let adjudication = an_event_id();
-        let other = an_event_id();
-
-        // Exactly one: read.
-        let one = signed(vec![e_marked(&adjudication, "concluded_by")], &signer);
-        assert_eq!(
-            sole_event_with_marker(&one, "concluded_by"),
-            Some(adjudication)
-        );
-        // Absent: none.
-        assert_eq!(sole_event_with_marker(&one, "rematch_of"), None);
-
-        // Repeated: none — where `event_with_marker` would take the first.
-        let two = signed(
-            vec![
-                e_marked(&adjudication, "concluded_by"),
-                e_marked(&other, "concluded_by"),
-            ],
-            &signer,
-        );
-        assert_eq!(sole_event_with_marker(&two, "concluded_by"), None);
-        assert_eq!(
-            event_with_marker(&two, "concluded_by"),
-            Some(adjudication),
-            "the lax reader still takes the first — the strict one is the guard"
-        );
-
-        // Present once but unparseable: none.
-        let bad = signed(
-            vec![Tag::custom(
-                "e",
-                [
-                    "not-an-event-id".to_string(),
-                    String::new(),
-                    "concluded_by".to_string(),
-                ],
-            )],
-            &signer,
-        );
-        assert_eq!(sole_event_with_marker(&bad, "concluded_by"), None);
-    }
-
-    #[test]
     fn collects_every_marked_reference_in_tag_order() {
         let signer = keys();
         let (a, b) = (an_event_id(), an_event_id());
-        // A rematch-founded Game Session carries exactly two `rematch_offer`s.
         let session = signed(
             vec![
-                e_marked(&a, "rematch_offer"),
-                e_marked(&b, "rematch_offer"),
+                e_marked(&a, "rules"),
+                e_marked(&b, "rules"),
                 e_marked(&an_event_id(), "pairing"),
             ],
             &signer,
         );
-        assert_eq!(
-            events_with_marker(&session, "rematch_offer"),
-            Some(vec![a, b])
-        );
-        // Absent marker: an empty vector, not `None` — "exactly two" fails on
-        // the length, and the caller says so in its own words.
-        assert_eq!(
-            events_with_marker(&session, "accepted_challenge"),
-            Some(vec![])
-        );
-
-        // One unparseable id poisons the whole read: a silent drop would turn a
-        // malformed three-reference session into a well-formed-looking pair.
+        // A doubled reference is visible: "exactly one" is `[id]`.
+        assert_eq!(events_with_marker(&session, "rules"), vec![a, b]);
+        assert_eq!(events_with_marker(&session, "direct_challenge"), vec![]);
+        assert_eq!(count_named(&session, "e"), 3);
+        assert_eq!(values(&session, "e").len(), 3);
+        // An unparseable id is skipped.
         let malformed = signed(
             vec![
-                e_marked(&a, "rematch_offer"),
+                e_marked(&a, "rules"),
                 Tag::custom(
                     "e",
                     [
                         "not-an-event-id".to_string(),
                         String::new(),
-                        "rematch_offer".to_string(),
+                        "rules".to_string(),
                     ],
                 ),
             ],
             &signer,
         );
-        assert_eq!(events_with_marker(&malformed, "rematch_offer"), None);
+        assert_eq!(events_with_marker(&malformed, "rules"), vec![a]);
     }
 
     #[test]
@@ -401,20 +315,22 @@ mod tests {
         let event = signed(
             vec![
                 single("game", "sanki"),
-                single("seat", "first"),
                 p(&alice, "player"),
                 p(&bob, "player"),
                 kv("seat", &alice, "first"),
                 kv("seat", &bob, "second"),
                 kv("variant", &alice, "chess"),
                 kv("variant", &bob, "ogi"),
+                kv("result", &alice, "100"),
+                kv("result", &bob, "0"),
             ],
             &signer,
         );
 
         assert_eq!(pubkeys_with_role(&event, "player"), vec![alice, bob]);
+        assert_eq!(result_for(&event, &alice), Some("100"));
+        assert_eq!(result_for(&event, &bob), Some("0"));
         assert_eq!(game(&event), Some("sanki"));
-        assert_eq!(seat(&event), Some("first"));
         assert_eq!(seat_for(&event, &alice), Some("first"));
         assert_eq!(seat_for(&event, &bob), Some("second"));
         assert_eq!(variant_for(&event, &alice), Some("chess"));

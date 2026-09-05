@@ -1,15 +1,19 @@
 //! Courtship decisions — pool entries (kind 3418) and Direct Challenges
-//! (kinds 3420/3421), per ADR-0014 §6.2–§6.3.
+//! (kind 3420, fresh or rematch), per ADR-0014 §6.2–§6.3 under ADR-0033/0034:
+//! no arbiter, and one **rule system** — the Rule System event (kind 3417)
+//! the fleet plays under — that every founding must name.
 //!
 //! Everything here is **pure** over borrowed events and persona data. The
 //! async layer performs the fetches a decision may require (contact lists,
-//! mute lists) and enforces the fleet ledger; refusals are by silence, so a
-//! `Skip` simply produces a debug log upstream.
+//! mute lists, the concluded session of a rematch) and enforces the fleet
+//! ledger; refusals are by silence, so a `Skip` simply produces a debug log
+//! upstream.
 
 use nostr_sdk::prelude::*;
 
 use crate::config::PlayConfig;
 use crate::prng::SplitMix64;
+use crate::session::{self, Seat, Timing};
 use crate::tags;
 
 /// A pool entry (kind 3418) judged compatible from the bot's side, up to the
@@ -40,6 +44,35 @@ pub struct PoolCandidate {
 /// Why an entry (or challenge) is not courted. Logged, never answered.
 pub type Skip = &'static str;
 
+/// Whether `event` designates exactly our relay as its (only) timing relay,
+/// and no timestamper: the self-timed designation our own foundings carry
+/// (Canonical Timing NIP §Timing modes and mode selection). Trailing slashes
+/// are insignificant.
+fn designates_our_relay(event: &Event, relay_url: &str) -> Result<(), Skip> {
+    match session::timing_of(event) {
+        Some(Timing::SelfTimed(relay)) => {
+            if tags::norm_relay(&relay) == tags::norm_relay(relay_url) {
+                Ok(())
+            } else {
+                Err("timing_relay designation is not our relay")
+            }
+        }
+        Some(Timing::Attested(_)) => Err("attested mode (v1 is self-timed)"),
+        None => Err("no single timing designation"),
+    }
+}
+
+/// Whether `event` names exactly our rule system by its `rules` reference —
+/// the one the fleet holds and runs; anything else cannot be played
+/// (kind `3417` §Referencing a rule system).
+fn names_our_rules(event: &Event, rules: &EventId) -> Result<(), Skip> {
+    match session::rules_ref(event) {
+        Some(named) if named == *rules => Ok(()),
+        Some(_) => Err("another rule system"),
+        None => Err("no single rules reference"),
+    }
+}
+
 /// Evaluate an Open Challenge from the bot's side (§6.2, reactive path).
 /// `now` in unix seconds; `margin_secs` is the minimum life the entry must
 /// still have for our own entry to land and pair.
@@ -49,7 +82,7 @@ pub fn evaluate_open_challenge(
     me: &PublicKey,
     relay_url: &str,
     matchmaker: &PublicKey,
-    arbiter: &PublicKey,
+    rules: &EventId,
     game: &str,
     play: &PlayConfig,
     now: u64,
@@ -64,28 +97,12 @@ pub fn evaluate_open_challenge(
     if tags::pubkey_with_role(event, "matchmaker").as_ref() != Some(matchmaker) {
         return Err("other matchmaker");
     }
-    // Pairing requires both entries to designate the same arbiter and the
-    // same timing mode: ours names the configured arbiter and no
-    // timestamper, so anything else can never pair with us (§6.2).
-    if tags::pubkey_with_role(event, "arbiter").as_ref() != Some(arbiter) {
-        return Err("other arbiter");
-    }
-    if tags::pubkey_with_role(event, "timestamper").is_some() {
-        return Err("attested mode (v1 is self-timed)");
-    }
-    // Pairing also requires the two entries' `timing_relay` sets to be
-    // identical (kind 3419 §Consent constraints, constraint 5): ours designates
-    // exactly the configured relay, so an entry designating anything else can
-    // never pair with us. Trailing slashes are insignificant.
-    let entry_relays: std::collections::BTreeSet<String> = tags::timing_relays(event)
-        .iter()
-        .map(|url| tags::norm_relay(url).to_owned())
-        .collect();
-    let ours: std::collections::BTreeSet<String> =
-        std::iter::once(tags::norm_relay(relay_url).to_owned()).collect();
-    if entry_relays != ours {
-        return Err("timing_relay designation is not our relay");
-    }
+    // Pairing requires both entries to reference the same rule system and to
+    // carry the same timing designation (kind 3419 §Consent constraints):
+    // ours names the fleet's rule system and our relay, so anything else can
+    // never pair with us (§6.2).
+    names_our_rules(event, rules)?;
+    designates_our_relay(event, relay_url)?;
     let accept_until: u64 = tags::accept_until(event)
         .and_then(|value| value.parse().ok())
         .ok_or("missing accept_until")?;
@@ -149,71 +166,70 @@ pub fn evaluate_open_challenge(
     })
 }
 
-/// A Direct Challenge (kind 3420) the persona would accept, with what the
-/// acceptance must supply (§6.3).
+/// The two references of a rematch challenge (kind 3420 §Rematch tags).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RematchRefs {
+    /// The concluded Game Session (`rematch_of`).
+    pub concluded: EventId,
+    /// A Conclusion of that session (`concluded_by`).
+    pub concluded_by: EventId,
+}
+
+/// A Direct Challenge (kind 3420) the persona would accept, with everything
+/// the Game Session that accepts it must state (§6.3; kind `3422` §Signing
+/// party — the acceptance IS the Game Session).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptPlan {
     /// The challenger.
     pub challenger: PublicKey,
     /// The bot's own variant: the challenge's imposition, or a persona draw.
     pub my_variant: String,
-    /// The bot's variant to DECLARE on the acceptance — `Some` only when the
-    /// challenge left it open. Kind 3421 constraint 7: the acceptance MUST NOT
-    /// re-declare a variant the challenge already fixed, or the pair is invalid
-    /// and the arbiter never founds the game.
-    pub supply_my_variant: Option<String>,
-    /// The challenger's variant to supply on the acceptance (mirror rule),
-    /// when the challenge delegated it.
-    pub supply_challenger_variant: Option<String>,
-    /// The seat to supply (uniform draw), when the challenge left it open.
-    pub supply_seat: Option<&'static str>,
+    /// The challenger's variant: the challenge's own, or — when the
+    /// challenger delegated it by omission — supplied by the mirror rule.
+    pub their_variant: String,
+    /// The bot's seat: the other value than the challenger's declared seat,
+    /// or a uniform draw when the challenge left it open.
+    pub my_seat: Seat,
     /// The challenge's `accept_until`.
     pub accept_until: u64,
     /// Whether the cadence is correspondence-paced (acceptance at any hour —
     /// resolved question 5; live challenges only while present).
     pub correspondence: bool,
+    /// The rematch references when the challenge is a rematch challenge —
+    /// the async layer verifies them against the concluded session before
+    /// accepting (kind 3420 §Rematch challenge).
+    pub rematch: Option<RematchRefs>,
 }
 
 /// Evaluate a Direct Challenge addressed to the bot (§6.3). `rng` covers the
-/// persona draws (variant when free, seat when open).
+/// persona draws (variant when free, seat when open). A **rematch challenge**
+/// (both rematch tags present) is evaluated for its form and timing only: its
+/// variants and cadence are those of a session the bot already played, so the
+/// persona gates do not apply — its constraints against the concluded session
+/// are the async layer's to verify.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_direct_challenge(
     event: &Event,
     me: &PublicKey,
     relay_url: &str,
-    arbiter: &PublicKey,
+    rules: &EventId,
     game: &str,
     play: &PlayConfig,
     now: u64,
     margin_secs: u64,
     rng: &mut SplitMix64,
 ) -> Result<AcceptPlan, Skip> {
-    if tags::pubkey_with_role(event, "opponent").as_ref() != Some(me) {
+    if tags::pubkeys_with_role(event, "opponent") != [*me] {
         return Err("not addressed to us");
     }
     if tags::game(event) != Some(game) {
         return Err("other game");
     }
-    if tags::pubkey_with_role(event, "arbiter").as_ref() != Some(arbiter) {
-        return Err("arbiter we do not play under");
-    }
-    if tags::pubkey_with_role(event, "timestamper").is_some() {
-        return Err("attested mode (v1 is self-timed)");
-    }
-    // Self-timed requires a timing designation, and it must name our relay —
-    // otherwise our plies would land where no verifier is told to look
-    // (Canonical Timing NIP §Timing modes and mode selection). The acceptance
-    // mirrors the set verbatim, so a superset that includes our relay is fine.
-    let designated = tags::timing_relays(event);
-    if designated.is_empty() {
-        return Err("no timing designation (neither timestamper nor timing_relay)");
-    }
-    if !designated
-        .iter()
-        .any(|url| tags::norm_relay(url) == tags::norm_relay(relay_url))
-    {
-        return Err("timing designation does not name our relay");
-    }
+    names_our_rules(event, rules)?;
+    // Self-timed, and it must name our relay — otherwise our plies would land
+    // where no verifier is told to look (Canonical Timing NIP §Timing modes
+    // and mode selection). The Game Session mirrors the designation verbatim.
+    designates_our_relay(event, relay_url)?;
     let challenger = event.pubkey;
     if challenger == *me {
         return Err("self-challenge");
@@ -224,9 +240,31 @@ pub fn evaluate_direct_challenge(
     if accept_until <= now.saturating_add(margin_secs) {
         return Err("expiring too soon");
     }
+    if !session::pow_ok(event) {
+        return Err("no honoured nonce");
+    }
+
+    // A rematch challenge carries both rematch tags, a fresh one neither
+    // (kind 3420 §Rematch tags); its `e` tags are those and `rules`.
+    let rematch = match (
+        tags::events_with_marker(event, "rematch_of").as_slice(),
+        tags::events_with_marker(event, "concluded_by").as_slice(),
+    ) {
+        ([], []) => None,
+        ([concluded], [concluded_by]) => Some(RematchRefs {
+            concluded: *concluded,
+            concluded_by: *concluded_by,
+        }),
+        _ => return Err("malformed rematch references"),
+    };
+    let e_tags = if rematch.is_some() { 3 } else { 1 };
+    if tags::count_named(event, "e") != e_tags {
+        return Err("unexpected e tags");
+    }
 
     let rows = tags::time_control_rows(event);
-    if !play.accept_any_time_control
+    if rematch.is_none()
+        && !play.accept_any_time_control
         && !play
             .time_controls
             .iter()
@@ -237,15 +275,17 @@ pub fn evaluate_direct_challenge(
 
     // Variant terms (§6.3): every ASYMMETRIC imposition of our variant is
     // refused as persona policy (needs no premium lookup); a MIRROR
-    // imposition is judged on the variant itself.
+    // imposition is judged on the variant itself. A rematch fixes both as
+    // they were: what we played, we play again.
     let their_variant = tags::variant_for(event, &challenger).map(str::to_owned);
     let imposed_mine = tags::variant_for(event, me).map(str::to_owned);
     let my_variant = match (&their_variant, &imposed_mine) {
+        (Some(_), Some(mine)) if rematch.is_some() => mine.clone(),
         (Some(theirs), Some(mine)) if theirs != mine => {
-            // Explicit cross-variant: the challenger plays `theirs` and assigns us
-            // the DIFFERENT `mine`. Refused as persona policy UNLESS the persona
-            // opts in (`accept_imposed_variant`), and even then only for a variant
-            // it actually plays.
+            // Explicit cross-variant: the challenger plays `theirs` and assigns
+            // us the DIFFERENT `mine`. Refused as persona policy UNLESS the
+            // persona opts in (`accept_imposed_variant`), and even then only
+            // for a variant it actually plays.
             if !play.accept_imposed_variant {
                 return Err("asymmetric variant imposition (persona policy)");
             }
@@ -261,44 +301,49 @@ pub fn evaluate_direct_challenge(
             }
             mine.clone()
         }
-        (_, None) => crate::persona::draw_weighted_key(&play.variants, rng)
-            .ok_or("no persona variant")?
-            .to_owned(),
+        (_, None) => {
+            if rematch.is_some() {
+                return Err("a rematch challenge must fix both variants");
+            }
+            crate::persona::draw_weighted_key(&play.variants, rng)
+                .ok_or("no persona variant")?
+                .to_owned()
+        }
     };
+    if !session::is_identifier(&my_variant)
+        || their_variant
+            .as_deref()
+            .is_some_and(|v| !session::is_identifier(v))
+    {
+        return Err("malformed variant identifier");
+    }
+    // The challenger's variant, by the mirror rule when delegated: we play
+    // the same variant on both sides of the board.
+    let their_variant = their_variant.unwrap_or_else(|| my_variant.clone());
 
-    // The acceptance supplies exactly what the challenge left open, and MUST NOT
-    // re-declare a term the challenge already fixed (kind 3421 constraint 7 — the
-    // same-player variant tag present in BOTH events invalidates the pair): the
-    // bot's own variant only when it was not imposed, the challenger's by the
-    // mirror rule when delegated, the seat by a uniform draw when open.
-    let supply_my_variant = if imposed_mine.is_none() {
-        Some(my_variant.clone())
-    } else {
-        None
-    };
-    let supply_challenger_variant = if their_variant.is_none() {
-        Some(my_variant.clone())
-    } else {
-        None
-    };
-    let supply_seat = if tags::seat(event).is_none() {
-        Some(if rng.next_index(2) == 0 {
-            "first"
-        } else {
-            "second"
-        })
-    } else {
-        None
+    // The seat: the other value than the challenger's declared one; a uniform
+    // draw when open (a rematch always declares it).
+    let my_seat = match tags::values(event, "seat").as_slice() {
+        [] if rematch.is_some() => return Err("a rematch challenge must declare the seat"),
+        [] => {
+            if rng.next_index(2) == 0 {
+                Seat::First
+            } else {
+                Seat::Second
+            }
+        }
+        [declared] => Seat::parse(declared).ok_or("malformed seat")?.other(),
+        _ => return Err("several seat tags"),
     };
 
     Ok(AcceptPlan {
         challenger,
         my_variant,
-        supply_my_variant,
-        supply_challenger_variant,
-        supply_seat,
+        their_variant,
+        my_seat,
         accept_until,
         correspondence: is_correspondence(&rows),
+        rematch,
     })
 }
 
@@ -320,6 +365,8 @@ mod tests {
     use super::*;
     use crate::config::{PlayConfig, StrengthConfig, WeightedTimeControl};
     use std::collections::BTreeMap;
+
+    const RELAY: &str = "wss://relay.example.com";
 
     fn play() -> PlayConfig {
         PlayConfig {
@@ -345,6 +392,7 @@ mod tests {
             resign_threshold: -700,
             draw_offer: crate::config::DrawOffer::Balanced,
             challenge_policy: "everyone".to_owned(),
+            timeout_courtesy_secs: 5,
         }
     }
 
@@ -359,19 +407,28 @@ mod tests {
         Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_string()])
     }
 
+    fn e_marked(id: &EventId, marker: &str) -> Tag {
+        Tag::custom("e", [id.to_hex(), String::new(), marker.to_string()])
+    }
+
+    fn rules() -> EventId {
+        EventId::from_hex(&"7".repeat(64)).unwrap()
+    }
+
     fn open_challenge(
         signer: &Keys,
         matchmaker: &PublicKey,
-        arbiter: &PublicKey,
+        rules: &EventId,
         extra: Vec<Tag>,
     ) -> Event {
         let mut tags = vec![
             p_role(matchmaker, "matchmaker"),
-            p_role(arbiter, "arbiter"),
-            tag("timing_relay", &["wss://relay.example.com"]),
+            e_marked(rules, "rules"),
+            tag("timing_relay", &[RELAY]),
             tag("game", &["sanki"]),
             tag("time_control", &["0", "10", "1"]),
             tag("accept_until", &["2000000300"]),
+            tag("nonce", &["0", "0"]),
         ];
         tags.extend(extra);
         EventBuilder::new(Kind::Custom(3418), "")
@@ -382,16 +439,15 @@ mod tests {
 
     #[test]
     fn courts_a_compatible_mirror_entry() {
-        let (me, human, mm, arb) = (
+        let (me, human, mm) = (
             Keys::generate(),
             Keys::generate(),
-            Keys::generate().public_key(),
             Keys::generate().public_key(),
         );
         let entry = open_challenge(
             &human,
             &mm,
-            &arb,
+            &rules(),
             vec![
                 tag("variant", &["self", "ogi"]),
                 tag("variant", &["opponent", "ogi"]),
@@ -400,9 +456,9 @@ mod tests {
         let candidate = evaluate_open_challenge(
             &entry,
             &me.public_key(),
-            "wss://relay.example.com",
+            RELAY,
             &mm,
-            &arb,
+            &rules(),
             "sanki",
             &play(),
             2_000_000_000,
@@ -420,16 +476,15 @@ mod tests {
         // The human plays ogi and imposes chess on us (the premium form). With
         // `accept_imposed_variant`, the persona courts it: our variant is the
         // imposed one, and our own entry must NOT impose back (`mirror: false`).
-        let (me, human, mm, arb) = (
+        let (me, human, mm) = (
             Keys::generate(),
             Keys::generate(),
-            Keys::generate().public_key(),
             Keys::generate().public_key(),
         );
         let entry = open_challenge(
             &human,
             &mm,
-            &arb,
+            &rules(),
             vec![
                 tag("variant", &["self", "ogi"]),
                 tag("variant", &["opponent", "chess"]),
@@ -442,9 +497,9 @@ mod tests {
         let candidate = evaluate_open_challenge(
             &entry,
             &me.public_key(),
-            "wss://relay.example.com",
+            RELAY,
             &mm,
-            &arb,
+            &rules(),
             "sanki",
             &opted_in,
             2_000_000_000,
@@ -457,7 +512,7 @@ mod tests {
         let imposes_xiongqi = open_challenge(
             &human,
             &mm,
-            &arb,
+            &rules(),
             vec![
                 tag("variant", &["self", "ogi"]),
                 tag("variant", &["opponent", "xiongqi"]),
@@ -466,9 +521,9 @@ mod tests {
         assert!(evaluate_open_challenge(
             &imposes_xiongqi,
             &me.public_key(),
-            "wss://relay.example.com",
+            RELAY,
             &mm,
-            &arb,
+            &rules(),
             "sanki",
             &opted_in,
             2_000_000_000,
@@ -479,21 +534,20 @@ mod tests {
 
     #[test]
     fn skips_incompatible_entries() {
-        let (me, human, mm, arb) = (
+        let (me, human, mm) = (
             Keys::generate(),
             Keys::generate(),
-            Keys::generate().public_key(),
             Keys::generate().public_key(),
         );
         let me_pk = me.public_key();
-        let base = |extra| open_challenge(&human, &mm, &arb, extra);
+        let base = |extra| open_challenge(&human, &mm, &rules(), extra);
         let eval = |event: &Event| {
             evaluate_open_challenge(
                 event,
                 &me_pk,
-                "wss://relay.example.com",
+                RELAY,
                 &mm,
-                &arb,
+                &rules(),
                 "sanki",
                 &play(),
                 2_000_000_000,
@@ -527,13 +581,21 @@ mod tests {
             p_role(&Keys::generate().public_key(), "timestamper"),
         ]);
         assert!(eval(&attested).is_err());
+        // Another rule system can never pair with ours.
+        let other_rules = open_challenge(
+            &human,
+            &mm,
+            &EventId::from_hex(&"8".repeat(64)).unwrap(),
+            vec![tag("variant", &["self", "ogi"])],
+        );
+        assert_eq!(eval(&other_rules), Err("another rule system"));
         // Expiring too soon.
         assert!(evaluate_open_challenge(
             &base(vec![tag("variant", &["self", "ogi"])]),
             &me_pk,
-            "wss://relay.example.com",
+            RELAY,
             &mm,
-            &arb,
+            &rules(),
             "sanki",
             &play(),
             2_000_000_290,
@@ -542,19 +604,15 @@ mod tests {
         .is_err());
     }
 
-    fn direct_challenge(
-        signer: &Keys,
-        me: &PublicKey,
-        arbiter: &PublicKey,
-        extra: Vec<Tag>,
-    ) -> Event {
+    fn direct_challenge(signer: &Keys, me: &PublicKey, rules: &EventId, extra: Vec<Tag>) -> Event {
         let mut tags = vec![
             p_role(me, "opponent"),
-            p_role(arbiter, "arbiter"),
-            tag("timing_relay", &["wss://relay.example.com"]),
+            e_marked(rules, "rules"),
+            tag("timing_relay", &[RELAY]),
             tag("game", &["sanki"]),
             tag("time_control", &["300", "3"]),
             tag("accept_until", &["2000000300"]),
+            tag("nonce", &["0", "0"]),
         ];
         tags.extend(extra);
         EventBuilder::new(Kind::Custom(3420), "")
@@ -565,18 +623,14 @@ mod tests {
 
     #[test]
     fn accepts_a_free_challenge_supplying_the_open_pieces() {
-        let (me, human, arb) = (
-            Keys::generate(),
-            Keys::generate(),
-            Keys::generate().public_key(),
-        );
-        let challenge = direct_challenge(&human, &me.public_key(), &arb, vec![]);
+        let (me, human) = (Keys::generate(), Keys::generate());
+        let challenge = direct_challenge(&human, &me.public_key(), &rules(), vec![]);
         let mut rng = SplitMix64::new(1);
         let plan = evaluate_direct_challenge(
             &challenge,
             &me.public_key(),
-            "wss://relay.example.com",
-            &arb,
+            RELAY,
+            &rules(),
             "sanki",
             &play(),
             2_000_000_000,
@@ -584,28 +638,18 @@ mod tests {
             &mut rng,
         )
         .unwrap();
-        // Everything was left open: the acceptance supplies variant (mirror)
-        // and seat.
-        assert_eq!(
-            plan.supply_challenger_variant.as_deref(),
-            Some(plan.my_variant.as_str())
-        );
-        // The bot's own variant was open too, so it is declared on the acceptance.
-        assert_eq!(
-            plan.supply_my_variant.as_deref(),
-            Some(plan.my_variant.as_str())
-        );
-        assert!(plan.supply_seat.is_some());
+        // Everything was left open: the acceptance supplies both variants
+        // (the mirror rule) and the seat.
+        assert_eq!(plan.their_variant, plan.my_variant);
+        assert!(plan.my_variant == "ogi" || plan.my_variant == "chess");
         assert!(!plan.correspondence);
+        assert_eq!(plan.rematch, None);
+        assert_eq!(plan.challenger, human.public_key());
     }
 
     #[test]
-    fn refuses_asymmetric_impositions_and_foreign_arbiters() {
-        let (me, human, arb) = (
-            Keys::generate(),
-            Keys::generate(),
-            Keys::generate().public_key(),
-        );
+    fn refuses_asymmetric_impositions_and_foreign_rules() {
+        let (me, human) = (Keys::generate(), Keys::generate());
         let me_pk = me.public_key();
         let human_pk = human.public_key();
         let mut rng = SplitMix64::new(1);
@@ -613,8 +657,8 @@ mod tests {
             evaluate_direct_challenge(
                 event,
                 &me_pk,
-                "wss://relay.example.com",
-                &arb,
+                RELAY,
+                &rules(),
                 "sanki",
                 &play(),
                 2_000_000_000,
@@ -627,7 +671,7 @@ mod tests {
         let asymmetric = direct_challenge(
             &human,
             &me_pk,
-            &arb,
+            &rules(),
             vec![
                 Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
                 Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
@@ -635,44 +679,61 @@ mod tests {
         );
         assert!(eval(&asymmetric).is_err());
 
-        // Mirror imposition: judged on the variant (ogi is in the persona).
+        // Mirror imposition: judged on the variant (ogi is in the persona);
+        // the challenger declares `first`, so we hold `second`.
         let mirror = direct_challenge(
             &human,
             &me_pk,
-            &arb,
+            &rules(),
             vec![
                 Tag::custom("variant", [human_pk.to_hex(), "ogi".into()]),
                 Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
+                tag("seat", &["first"]),
             ],
         );
         let plan = eval(&mirror).unwrap();
         assert_eq!(plan.my_variant, "ogi");
-        assert_eq!(plan.supply_challenger_variant, None);
-        // Both variants fixed by the challenge — the acceptance declares neither.
-        assert_eq!(plan.supply_my_variant, None);
+        assert_eq!(plan.their_variant, "ogi");
+        assert_eq!(plan.my_seat, Seat::Second);
 
-        // A challenge under another arbiter is ignored.
-        let foreign = direct_challenge(&human, &me_pk, &Keys::generate().public_key(), vec![]);
-        assert!(eval(&foreign).is_err());
+        // A challenge under another rule system is ignored.
+        let foreign = direct_challenge(
+            &human,
+            &me_pk,
+            &EventId::from_hex(&"8".repeat(64)).unwrap(),
+            vec![],
+        );
+        assert_eq!(eval(&foreign), Err("another rule system"));
+        // A challenge designating another relay too.
+        let elsewhere = EventBuilder::new(Kind::Custom(3420), "")
+            .tags(vec![
+                p_role(&me_pk, "opponent"),
+                e_marked(&rules(), "rules"),
+                tag("timing_relay", &["wss://other.example.com"]),
+                tag("game", &["sanki"]),
+                tag("time_control", &["300", "3"]),
+                tag("accept_until", &["2000000300"]),
+                tag("nonce", &["0", "0"]),
+            ])
+            .finalize(&human)
+            .unwrap();
+        assert!(eval(&elsewhere).is_err());
     }
 
     #[test]
     fn accept_any_time_control_bypasses_the_cadence_gate() {
-        let (me, human, arb) = (
-            Keys::generate(),
-            Keys::generate(),
-            Keys::generate().public_key(),
-        );
+        let (me, human) = (Keys::generate(), Keys::generate());
         let me_pk = me.public_key();
         // A cadence absent from the persona (which has 10 s/move and 5 + 3).
         let off_cadence = EventBuilder::new(Kind::Custom(3420), "")
             .tags(vec![
                 p_role(&me_pk, "opponent"),
-                p_role(&arb, "arbiter"),
-                tag("timing_relay", &["wss://relay.example.com"]),
+                e_marked(&rules(), "rules"),
+                tag("timing_relay", &[RELAY]),
                 tag("game", &["sanki"]),
                 tag("time_control", &["600", "5"]),
                 tag("accept_until", &["2000000300"]),
+                tag("nonce", &["0", "0"]),
             ])
             .finalize(&human)
             .expect("sign");
@@ -682,8 +743,8 @@ mod tests {
         assert!(evaluate_direct_challenge(
             &off_cadence,
             &me_pk,
-            "wss://relay.example.com",
-            &arb,
+            RELAY,
+            &rules(),
             "sanki",
             &play(),
             2_000_000_000,
@@ -698,8 +759,8 @@ mod tests {
         assert!(evaluate_direct_challenge(
             &off_cadence,
             &me_pk,
-            "wss://relay.example.com",
-            &arb,
+            RELAY,
+            &rules(),
             "sanki",
             &any,
             2_000_000_000,
@@ -711,37 +772,29 @@ mod tests {
 
     #[test]
     fn accept_imposed_variant_allows_explicit_cross_variant() {
-        let (me, human, arb) = (
-            Keys::generate(),
-            Keys::generate(),
-            Keys::generate().public_key(),
-        );
+        let (me, human) = (Keys::generate(), Keys::generate());
         let me_pk = me.public_key();
         let human_pk = human.public_key();
         // The challenger plays chess and imposes ogi on us — an explicit
         // cross-variant game. The cadence is a persona one, so only the variant
         // terms are under test.
-        let cross = EventBuilder::new(Kind::Custom(3420), "")
-            .tags(vec![
-                p_role(&me_pk, "opponent"),
-                p_role(&arb, "arbiter"),
-                tag("timing_relay", &["wss://relay.example.com"]),
-                tag("game", &["sanki"]),
-                tag("time_control", &["0", "10", "1"]),
-                tag("accept_until", &["2000000300"]),
+        let cross = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![
                 Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
                 Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
-            ])
-            .finalize(&human)
-            .expect("sign");
+            ],
+        );
         let mut rng = SplitMix64::new(1);
 
         // Default persona: the asymmetric imposition is refused.
         assert!(evaluate_direct_challenge(
             &cross,
             &me_pk,
-            "wss://relay.example.com",
-            &arb,
+            RELAY,
+            &rules(),
             "sanki",
             &play(),
             2_000_000_000,
@@ -750,15 +803,14 @@ mod tests {
         )
         .is_err());
 
-        // With accept_imposed_variant set, the bot takes the imposed ogi and
-        // supplies nothing (the challenger already fixed both variants).
+        // With accept_imposed_variant set, the bot takes the imposed ogi.
         let mut any = play();
         any.accept_imposed_variant = true;
         let plan = evaluate_direct_challenge(
             &cross,
             &me_pk,
-            "wss://relay.example.com",
-            &arb,
+            RELAY,
+            &rules(),
             "sanki",
             &any,
             2_000_000_000,
@@ -767,9 +819,102 @@ mod tests {
         )
         .expect("accept the imposed variant");
         assert_eq!(plan.my_variant, "ogi");
-        assert_eq!(plan.supply_challenger_variant, None);
-        // The imposed variant is NOT re-declared on the acceptance (3421 c7).
-        assert_eq!(plan.supply_my_variant, None);
+        assert_eq!(plan.their_variant, "chess");
+    }
+
+    #[test]
+    fn a_rematch_challenge_bypasses_the_persona_gates_but_must_fix_everything() {
+        let (me, human) = (Keys::generate(), Keys::generate());
+        let me_pk = me.public_key();
+        let human_pk = human.public_key();
+        let concluded = EventId::from_hex(&"a".repeat(64)).unwrap();
+        let conclusion = EventId::from_hex(&"b".repeat(64)).unwrap();
+        let mut rng = SplitMix64::new(1);
+        // Cross-variant and off-cadence: a fresh challenge like this would be
+        // refused by the default persona; as a rematch of a session we played,
+        // it is accepted (the async layer verifies the concluded session).
+        let rematch = EventBuilder::new(Kind::Custom(3420), "")
+            .tags(vec![
+                p_role(&me_pk, "opponent"),
+                e_marked(&rules(), "rules"),
+                e_marked(&concluded, "rematch_of"),
+                e_marked(&conclusion, "concluded_by"),
+                tag("timing_relay", &[RELAY]),
+                tag("game", &["sanki"]),
+                tag("time_control", &["600", "5"]),
+                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "xiongqi".into()]),
+                tag("seat", &["second"]),
+                tag("accept_until", &["2000000300"]),
+                tag("nonce", &["0", "0"]),
+            ])
+            .finalize(&human)
+            .unwrap();
+        let plan = evaluate_direct_challenge(
+            &rematch,
+            &me_pk,
+            RELAY,
+            &rules(),
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .unwrap();
+        assert_eq!(plan.my_variant, "xiongqi");
+        assert_eq!(plan.their_variant, "chess");
+        assert_eq!(plan.my_seat, Seat::First);
+        assert_eq!(
+            plan.rematch,
+            Some(RematchRefs {
+                concluded,
+                concluded_by: conclusion
+            })
+        );
+        // A rematch leaving the seat open, or a variant open, is malformed.
+        let seatless = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![
+                e_marked(&concluded, "rematch_of"),
+                e_marked(&conclusion, "concluded_by"),
+                Tag::custom("variant", [human_pk.to_hex(), "ogi".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
+            ],
+        );
+        assert!(evaluate_direct_challenge(
+            &seatless,
+            &me_pk,
+            RELAY,
+            &rules(),
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .is_err());
+        // One rematch tag without the other is malformed.
+        let half = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![e_marked(&concluded, "rematch_of")],
+        );
+        assert!(evaluate_direct_challenge(
+            &half,
+            &me_pk,
+            RELAY,
+            &rules(),
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .is_err());
     }
 
     #[test]

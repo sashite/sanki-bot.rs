@@ -1,6 +1,6 @@
 //! Minimal in-process NIP-01 relay for the e2e bench — the bot connects to it
 //! like to any relay, while the test holds the OTHER side of the wire: it can
-//! inject already-signed events straight into the store (acting as arbiter and
+//! inject already-signed events straight into the store (acting as matchmaker and
 //! opponent without a second client), observe EVERY frame the bot publishes
 //! (`received` — even the swallowed ones), and inject the one fault this bench
 //! exists for: `swallow_plies_from` acknowledges a bot Ply with `OK true` but
@@ -87,7 +87,7 @@ impl MiniRelay {
     }
 
     /// Inject an already-signed event as though a client had published it
-    /// (stored + broadcast) — how the test acts as arbiter and opponent.
+    /// (stored + broadcast) — how the test acts as matchmaker and opponent.
     pub async fn inject(&self, event: Value) {
         store_and_broadcast(&self.state, event).await;
     }

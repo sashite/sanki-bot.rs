@@ -28,6 +28,12 @@ RUN apt-get update \
 # Run as an unprivileged, no-home system user.
 RUN useradd --system --user-group --no-create-home players
 
+# The rule system's event and module are cached where the fleet file's
+# `rules_cache_dir` points (ADR-0034): mount a volume there so a restart never
+# depends on the relay or the blob host.
+RUN mkdir -p /var/lib/sashite/rules && chown players:players /var/lib/sashite/rules
+VOLUME ["/var/lib/sashite/rules"]
+
 COPY --from=builder /build/target/release/players /usr/local/bin/players
 
 USER players

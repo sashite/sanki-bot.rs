@@ -3,7 +3,82 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.6.0] — 2026-09-05
+
+The fleet plays the **arbiterless** protocol under an **executable rule
+system** ([ADR-0033](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0033-arbiterless-sessions.md),
+[ADR-0034](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0034-reference-build.md)).
+Deploy together with the revised relay policy, matchmaker and rater, and
+the first Rule System event published.
+
+### Changed
+
+- **BREAKING (wire) — no arbiter.** The Accepted Challenge (`3421`), the
+  Adjudication Request (`3424`) and the Rematch Offer (`3430`) are retired.
+  A bot **accepts** a Direct Challenge by publishing the Game Session
+  (`3422`) itself — the acceptance is the founding — and **founds** the
+  session a Pairing (`3419`) naming it declares as soon as it observes it
+  (either player may; the canonical one wins the slot). It **concludes** by
+  publishing a Conclusion (`3425`) claiming exactly the verdict the rule
+  system yields at that instant with itself as the invoker — a terminal
+  chain, the win on time (after a courtesy delay), the opponent's standing
+  draw offer, its own resignation — and treats a session as over when the
+  module selects a canonical Conclusion; a non-conforming one is logged and
+  ignored. A **rematch** is a Direct Challenge citing the concluded session
+  and its Conclusion (`rematch_of` / `concluded_by`), seats swapped, terms
+  inherited; an incoming one is verified against the concluded session —
+  its `concluded_by` through the module — before being accepted.
+- **BREAKING (config) — `fleet.rules` replaces `fleet.arbiter`:** the id of
+  the Rule System event (kind `3417`) the fleet plays under, loaded at
+  start-up with the module it names (`fleet.rules_cache_dir`, default
+  `./rules`). A pool entry, a Pairing, a challenge under another rule system
+  is ignored. New per-bot `timeout_courtesy_secs` (default `5`).
+- **The module is the rules oracle.** `sashite-sanki-engine` and
+  `sashite-sanki-arbiter` leave the dependency tree: the session view (chain,
+  clocks, turn, terminal state), the history bookkeeping the search needs
+  (replayed through `apply`), the legal moves, the prescribed initial
+  position and every verdict come from the module under `wasmi`, through the
+  Kernel ABI. `sashite-sanki-player` still chooses the moves; its choice is
+  checked against the module's `legal_moves` before it is played. The clock
+  budget arithmetic is pinned against the module's `clock` primitive.
+- **Timing designation:** exactly one `timing_relay`, ours (the revised
+  founding kinds carry exactly one); an entry or challenge designating any
+  other relay, or a timestamper, is not played.
+- **Proof of work** is added only on the kinds that prescribe a `nonce` tag
+  (foundings, Plies, Conclusions) — a Game Session, a profile, a reaction
+  carry none.
+- The notification stream is opened before the subscriptions, so nothing the
+  relay replays on REQ is lost; pending Pairings are recovered at start-up
+  along with sessions and rematch challenges (30 days back). A game that
+  concluded longer ago than the rematch window is neither proposed a rematch
+  of nor starred when re-observed.
+- **Courtship no longer blocks the actor's loop:** the persona's reaction
+  delay and the publish it ends with (a pool entry, an acceptance) run in a
+  task of their own, so a live game on a fast cadence is served meanwhile.
+  The concurrency caps now gate pool courtship too, and the bot keeps one
+  live pool entry at a time.
+- Every timing comparison — the module's cutoff, the deadline, a window —
+  uses the relay's clock as estimated by the publish path, never the raw
+  host clock.
+- One tracked session per slot: a canonical Game Session arriving after a
+  sibling (both players of a Pairing founding; both rematch challenges
+  accepted) evicts the stale one. A founding is trusted only once verified
+  (signature, the matchmaker's Pairing, the challenge's nonce, the acceptor
+  as signer); a replayed challenge already accepted is not accepted twice; a
+  rematch challenge of a session whose rematch is already founded is moot.
+
+### Added
+
+- The e2e benches need the module's bytes (`SANKI_MODULE`) and cover the
+  founding on a Pairing, the per-slot idempotence discipline, and the
+  win-on-time Conclusion — the whole loop from the Rule System event on the
+  relay to the rematch proposal.
+
+### Previously unreleased (since 0.5.0, folded into this release)
+
+The entries below were written before the arbiter left; where they speak of
+acceptances (`3421`), Rematch Offers (`3430`) and the arbiter, this release
+supersedes them.
 
 ### Changed
 

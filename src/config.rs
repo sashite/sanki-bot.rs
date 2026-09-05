@@ -30,8 +30,16 @@ pub struct FleetSection {
     pub relay_url: String,
     /// The configured matchmaker (hex or npub).
     pub matchmaker: String,
-    /// The configured arbiter — a bot only plays under this arbiter.
-    pub arbiter: String,
+    /// The Rule System event (kind 3417) the fleet plays under — its event
+    /// id, 64 hex characters (ADR-0034). A bot enters the pool, challenges,
+    /// founds and accepts under this rule system only, and loads its module
+    /// at start-up.
+    pub rules: String,
+    /// Where the Rule System event and its module are cached (`<id>.json`,
+    /// `<digest>.wasm`); a module dropped here by hand is used without
+    /// fetching. Defaults to `./rules`.
+    #[serde(default = "default_rules_cache_dir")]
+    pub rules_cache_dir: String,
     /// The game family (`sanki`).
     #[serde(default = "default_game")]
     pub game: String,
@@ -46,6 +54,9 @@ pub struct FleetSection {
 
 fn default_game() -> String {
     "sanki".to_owned()
+}
+fn default_rules_cache_dir() -> String {
+    "./rules".to_owned()
 }
 const fn default_bot_vs_bot() -> u32 {
     3
@@ -126,6 +137,12 @@ pub struct PlayConfig {
     /// kind-30420 mode published for `sanki`.
     #[serde(default = "default_policy")]
     pub challenge_policy: String,
+    /// The courtesy delay, in seconds, before claiming a win on time: the
+    /// bot waits this long after it first predicts the opponent's flag
+    /// before publishing the Conclusion (§6.6) — a human whose clock just
+    /// fell is not flagged to the second. Default `5`.
+    #[serde(default = "default_timeout_courtesy")]
+    pub timeout_courtesy_secs: u64,
 }
 
 const fn default_max_live() -> u32 {
@@ -139,6 +156,9 @@ const fn default_resign_threshold() -> i32 {
 }
 fn default_policy() -> String {
     "everyone".to_owned()
+}
+const fn default_timeout_courtesy() -> u64 {
+    5
 }
 
 /// A weighted time-control preference.
@@ -243,6 +263,9 @@ fn validate(config: &FleetConfig) -> Result<()> {
     if config.bots.is_empty() {
         bail!("the fleet has no [[bot]] table");
     }
+    if nostr_sdk::prelude::EventId::from_hex(&config.fleet.rules).is_err() {
+        bail!("fleet.rules is not a Rule System event id (64 hex characters)");
+    }
     let mut names = std::collections::BTreeSet::new();
     for bot in &config.bots {
         if !names.insert(bot.name.as_str()) {
@@ -309,7 +332,7 @@ mod tests {
 [fleet]
 relay_url  = "wss://relay.sanki.app/"
 matchmaker = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-arbiter    = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+rules      = "7777777777777777777777777777777777777777777777777777777777777777"
 game       = "sanki"
 max_concurrent_bot_vs_bot = 3
 pow_difficulty = 10
@@ -353,7 +376,9 @@ nsec_env = "PLAYER_NSEC_KAORU"
         let contents = EXAMPLE.replace(r#"distribution = "lognormal", "#, "");
         let config = parse(&contents).unwrap();
         assert_eq!(config.fleet.game, "sanki");
+        assert_eq!(config.fleet.rules_cache_dir, "./rules");
         assert_eq!(config.bots.len(), 1);
+        assert_eq!(config.bots[0].play.timeout_courtesy_secs, 5);
         let bot = &config.bots[0];
         assert_eq!(bot.name, "kaoru");
         assert_eq!(bot.play.time_controls[0].spec, vec![vec!["0", "10", "1"]]);
@@ -369,5 +394,6 @@ nsec_env = "PLAYER_NSEC_KAORU"
         assert!(parse(&contents.replace("Asia/Tokyo", "Mars/Olympus")).is_err());
         assert!(parse(&contents.replace("mon-sun", "lundi")).is_err());
         assert!(parse(&contents.replace("20:30", "25:99")).is_err());
+        assert!(parse(&contents.replace(&"7".repeat(64), "not-an-id")).is_err());
     }
 }

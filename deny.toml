@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# cargo-deny configuration for sashite-sanki-arbiter-nostr-bot.
+# cargo-deny configuration for sashite-sanki-player-nostr-bot.
 # Config schema version 2 (cargo-deny >= 0.18). Run: `cargo deny check`.
 
 [advisories]

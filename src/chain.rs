@@ -1,62 +1,48 @@
-//! The bot's live view of a session — computed with the ARBITER's own crate,
-//! never a reimplementation (ADR-0014 §Chain and clock logic): what the
-//! arbiter would rule right now is what the bot believes.
+//! The bot's live view of a session — computed by the session's **module**,
+//! never by a reimplementation (ADR-0034; ADR-0014 §Chain and clock logic):
+//! what the rule system yields right now is what the bot believes.
 //!
-//! In self-timed mode a Request's canonical timing is its own `created_at`,
-//! so a **synthetic probe request timed "now"** turns `natural_state` into a
-//! live-chain oracle: the selected chain, the reached position, both clocks,
-//! and whose turn it is. The same probe through `verdict::adjudicate` is the
-//! §6.6 prediction: the verdict an invocation published now would yield.
+//! In self-timed mode every event's canonical timing is its own `created_at`,
+//! so the module's `natural_state` **at the present instant** is a live oracle
+//! of the session: the selected chain, the reached position, both clocks, and
+//! whose turn it is. `verdict_at` at the same instant, with the bot's own seat
+//! as the invoker, is the prediction of the claim a Conclusion published now
+//! MUST carry to conform (kind `3425` §Client guidelines, item 7).
+//!
+//! The search's history bookkeeping — the occurrence counts along the chain
+//! and the half-move clock — is replayed through the module's `apply`, one
+//! Ply at a time from the initial position: the positions it visits are the
+//! rule system's, and the `irreversible` bit it reports is the rule the
+//! move-limit counter runs on.
 
 use anyhow::{anyhow, Result};
-use sashite_sanki_arbiter::event::{self, AdjudicationRequest, Attestation, Ply};
-use sashite_sanki_arbiter::natural_state::{natural_state, Conclusion};
-use sashite_sanki_arbiter::session::SessionParams;
-use sashite_sanki_arbiter::verdict::{adjudicate, Adjudication};
-use sashite_sanki_engine::domain::half_move::Move;
-use sashite_sanki_engine::domain::side::Side;
-use sashite_sanki_engine::domain::time::Timestamp;
-use sashite_sanki_engine::engine;
-use sashite_sanki_player::Occurrences;
+use sashite_sanki_player::{Occurrences, Position};
+use serde_json::{json, Value};
 
 use crate::clockmath::max_affordable;
-
-/// The probe request id — never published; only its timing matters.
-fn probe_request(
-    params: &SessionParams,
-    me: event::PublicKey,
-    now: u64,
-) -> Result<AdjudicationRequest> {
-    let id = event::EventId::parse(&"f".repeat(64)).ok_or_else(|| anyhow!("probe id"))?;
-    let at = i64::try_from(now).map_err(|_| anyhow!("now out of range"))?;
-    Ok(AdjudicationRequest::new(
-        id,
-        me,
-        params.session(),
-        params.arbiter(),
-        Timestamp::from_unix(at),
-    ))
-}
+use crate::module::{self, End, Oracle, Verdict, VerdictAt};
+use crate::session::{Events, Seat, SessionTerms};
 
 /// What the bot knows about a session at an instant.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionView {
     /// The canonical chain's length (applied half-moves).
     pub chain_len: usize,
     /// The next play-order position (chain length + 1).
     pub next_half_move: u32,
-    /// The player on move at that position.
-    pub on_move: event::PublicKey,
+    /// The seat on move at that position.
+    pub on_move: Seat,
     /// The mover's own step ordinal there.
     pub step: u32,
-    /// The chain already reached a terminal verdict (awaiting the 3425).
+    /// The chain already reached a terminal verdict (a Conclusion is due).
     pub terminal: bool,
-    /// The tip position, for `sashite-sanki-player`.
-    pub tip: sashite_sanki_engine::position::Position,
-    /// FEEN occurrence counts along initial + chain (the kernel's own
-    /// bookkeeping, mirrored — ADR-0015 §2 caller obligation).
+    /// The tip position, as the module encodes it (FEEN).
+    pub tip: String,
+    /// Occurrence counts along initial + chain, keyed by the search engine's
+    /// own canonical FEEN of each position — the caller obligation of
+    /// ADR-0015 §2, mirrored from the module's replay.
     pub occurrences: Occurrences,
-    /// The tip's half-move clock.
+    /// The tip's half-move clock: plies since the last irreversible move.
     pub halfmove_clock: u32,
     /// The last canonical timing (t₀ or the last selected ply's) — the
     /// anchor the NEXT ply's elapsed runs from.
@@ -67,62 +53,117 @@ pub struct SessionView {
     pub last_ply_offers_draw: bool,
 }
 
-/// Compute the live view. Returns `Err` only on malformed inputs (a probe id
-/// or timestamp overflow — practically unreachable).
+/// The session members of a request: the terms (given t₀), the Plies and the
+/// attestations, in the ABI's shape — the base every session operation
+/// extends with its `op`.
+#[must_use]
+pub fn session_request(terms: &SessionTerms, start: u64, events: &Events) -> Value {
+    json!({
+        "session": terms.to_json(start),
+        "plies": events.plies,
+        "attestations": events.attestations,
+    })
+}
+
+/// The seat on move at a 1-based play-order position.
+#[must_use]
+pub const fn seat_at(half_move: u32) -> Seat {
+    if half_move % 2 == 1 {
+        Seat::First
+    } else {
+        Seat::Second
+    }
+}
+
+/// The mover's own step ordinal at a 1-based play-order position.
+#[must_use]
+pub const fn step_at(half_move: u32) -> u32 {
+    half_move.div_ceil(2)
+}
+
+/// Compute the live view at `now`.
+///
+/// # Errors
+///
+/// When the module gives no usable answer, or a selected Ply cannot be found
+/// among the events offered (a module answering with an id it was not given —
+/// a build defect, never a session fact).
 pub fn session_view(
-    params: &SessionParams,
-    plies: &[Ply],
-    attestations: &[Attestation],
-    me: event::PublicKey,
+    oracle: &mut impl Oracle,
+    terms: &SessionTerms,
+    start: u64,
+    events: &Events,
     now: u64,
 ) -> Result<SessionView> {
-    let probe = probe_request(params, me, now)?;
-    let state = natural_state(params, plies, attestations, &probe)
-        .ok_or_else(|| anyhow!("self-timed probe must always have a cutoff"))?;
+    let request = session_request(terms, start, events);
+    let state = module::natural_state(oracle, &request, now)?;
 
-    // Mirror the kernel's occurrence bookkeeping by replaying the selected
-    // chain over the engine (the kernel's map is not public — ADR-0015 §2).
+    // Mirror the history bookkeeping by replaying the selected chain through
+    // the module's `apply`.
     let mut occurrences = Occurrences::new();
-    let mut position = params.initial_position().clone();
-    occurrences.insert(position.to_feen(), 1);
-    for canonical in &state.chain {
-        let mv = Move::parse(&canonical.ply.content)
-            .map_err(|e| anyhow!("canonical ply must parse: {e:?}"))?;
-        position = engine::apply(&position, &mv)
-            .map_err(|e| anyhow!("canonical ply must apply: {e:?}"))?;
-        let count = occurrences.entry(position.to_feen()).or_insert(0);
-        *count = count.saturating_add(1);
+    let mut position = terms.position.clone();
+    let mut halfmove_clock: u32 = 0;
+    let mut last_ply_offers_draw = false;
+    bump(&mut occurrences, &position);
+    for link in &state.chain {
+        let ply = events
+            .plies
+            .iter()
+            .find(|ply| ply.get("id").and_then(Value::as_str) == Some(link.id.as_str()))
+            .ok_or_else(|| anyhow!("the module selected an unknown Ply {}", link.id))?;
+        let content = ply
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("a Ply offered without content"))?;
+        let applied = module::apply(oracle, &position, content)?;
+        position = applied.position;
+        halfmove_clock = if applied.irreversible {
+            0
+        } else {
+            halfmove_clock.saturating_add(1)
+        };
+        last_ply_offers_draw = ply.get("draw").and_then(Value::as_bool).unwrap_or(false);
+        bump(&mut occurrences, &position);
     }
 
-    let next_half_move = state.next_half_move();
-    let on_move = params.player_at(next_half_move);
-    let step = params.step_at(next_half_move);
-    let last_ply_offers_draw = state
-        .chain
-        .last()
-        .is_some_and(|canonical| canonical.ply.draw);
-
-    let (terminal, halfmove_clock, anchor, affordable) = match &state.conclusion {
-        Conclusion::Terminal(_, at) => (true, 0, unix(*at), 0),
-        Conclusion::Ongoing(session_state) => {
-            let side = side_at(params, next_half_move);
-            let clock = session_state.clocks().get(side);
+    let chain_len = state.chain.len();
+    let (terminal, next_half_move, tip, anchor, affordable) = match state.end {
+        End::Terminal { at, .. } => {
+            let next = u32::try_from(chain_len.saturating_add(1)).unwrap_or(u32::MAX);
+            (true, next, position, at, 0)
+        }
+        End::Ongoing {
+            anchor,
+            clocks,
+            half_move,
+            position: end_position,
+        } => {
+            if end_position != position {
+                return Err(anyhow!(
+                    "the replayed tip {position} differs from the module's end position {end_position}"
+                ));
+            }
+            let clock = match seat_at(half_move) {
+                Seat::First => clocks.first,
+                Seat::Second => clocks.second,
+            };
             (
                 false,
-                session_state.halfmove_clock(),
-                unix(session_state.last_attestation()),
-                max_affordable(session_state.time_control(), clock),
+                half_move,
+                end_position,
+                anchor,
+                max_affordable(&terms.time_control, clock),
             )
         }
     };
 
     Ok(SessionView {
-        chain_len: state.chain.len(),
+        chain_len,
         next_half_move,
-        on_move,
-        step,
+        on_move: seat_at(next_half_move),
+        step: step_at(next_half_move),
         terminal,
-        tip: position,
+        tip,
         occurrences,
         halfmove_clock,
         anchor,
@@ -131,29 +172,46 @@ pub fn session_view(
     })
 }
 
-/// The verdict an Adjudication Request signed by `me` and timed `now` would
-/// yield — the §6.6 prediction, via the arbiter crate itself. `None` when
-/// the probe would be non-conforming (not this session's player, …).
-#[must_use]
+/// Counts one occurrence of `feen`, keyed by the search engine's canonical
+/// form when it parses it (it is the form the search keys its own visits by),
+/// else by the module's string.
+fn bump(occurrences: &mut Occurrences, feen: &str) {
+    let key = Position::parse(feen).map_or_else(|_| feen.to_owned(), |p| p.to_feen());
+    let count = occurrences.entry(key).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+/// The verdict a Conclusion signed by the player seated `me` and timed `now`
+/// would have to claim — the prediction, via the module itself. `None` before
+/// t₀.
+///
+/// # Errors
+///
+/// When the module gives no usable answer.
 pub fn predicted_verdict(
-    params: &SessionParams,
-    plies: &[Ply],
-    attestations: &[Attestation],
-    me: event::PublicKey,
+    oracle: &mut impl Oracle,
+    terms: &SessionTerms,
+    start: u64,
+    events: &Events,
+    me: Seat,
     now: u64,
-) -> Option<Adjudication> {
-    let probe = probe_request(params, me, now).ok()?;
-    adjudicate(params, plies, attestations, &probe)
+) -> Result<Option<Verdict>> {
+    let request = session_request(terms, start, events);
+    Ok(
+        match module::verdict_at(oracle, &request, me.name(), now)? {
+            VerdictAt::Verdict(verdict) => Some(verdict),
+            VerdictAt::NoVerdict(_) => None,
+        },
+    )
 }
 
-/// The side on move at a 1-based play-order position.
+/// Whether `verdict` is a win for `seat`.
 #[must_use]
-pub fn side_at(params: &SessionParams, half_move: u32) -> Side {
-    params.side_at(half_move)
-}
-
-fn unix(at: Timestamp) -> u64 {
-    u64::try_from(at.as_unix()).unwrap_or(0)
+pub const fn wins(verdict: &Verdict, seat: Seat) -> bool {
+    match seat {
+        Seat::First => verdict.result.first > verdict.result.second,
+        Seat::Second => verdict.result.second > verdict.result.first,
+    }
 }
 
 #[cfg(test)]
@@ -166,101 +224,104 @@ mod tests {
     )]
 
     use super::*;
-    use sashite_sanki_engine::domain::status::Status;
-    use sashite_sanki_engine::domain::time::Duration;
-    use sashite_sanki_engine::domain::time_control::{Period, TimeControl};
-    use sashite_sanki_engine::position::Position;
+    use crate::module::native::Native;
+    use crate::session::fixtures::World;
+    use crate::session::{terms, Events};
+    use nostr_sdk::prelude::*;
 
-    const START: &str = "4k^3/8/8/8/8/8/8/R3K^3 / W/w";
-
-    fn key(byte: u8) -> event::PublicKey {
-        event::PublicKey::parse(&format!("{:02x}", byte).repeat(32)).unwrap()
-    }
-
-    fn id(byte: u8) -> event::EventId {
-        event::EventId::parse(&format!("{:02x}", byte).repeat(32)).unwrap()
-    }
-
-    fn params() -> SessionParams {
-        let period = Period::new(Duration::from_secs(300), Some(Duration::from_secs(3)), None)
-            .expect("period");
-        SessionParams::new(
-            id(0xAA),
-            key(2),
-            None, // self-timed
-            key(0x10),
-            key(0x20),
-            TimeControl::from_periods(vec![period]).unwrap(),
-            Position::parse(START).unwrap(),
-            Timestamp::from_unix(1_000),
-        )
-    }
-
-    fn ply(
-        byte: u8,
-        signer: event::PublicKey,
-        step: u32,
-        content: &str,
-        at: i64,
-        draw: bool,
-    ) -> Ply {
-        Ply::new(
-            id(byte),
-            signer,
-            id(0xAA),
-            step,
-            draw,
-            content.to_owned(),
-            Timestamp::from_unix(at),
-        )
+    /// A chess/chess session founded at t₀ = 1 000, 5 + 3 Fischer.
+    fn world() -> (World, SessionTerms) {
+        let w = World::new();
+        let pairing = w.pairing();
+        let session = w.session(&pairing, 1_000);
+        let t = terms(&session, &pairing).unwrap();
+        (w, t)
     }
 
     #[test]
     fn empty_session_is_the_first_players_turn_from_t0() {
-        let params = params();
-        let view = session_view(&params, &[], &[], key(0x10), 2_000).unwrap();
+        let (_, t) = world();
+        let view = session_view(&mut Native, &t, 1_000, &Events::default(), 2_000).unwrap();
         assert_eq!(view.chain_len, 0);
         assert_eq!(view.next_half_move, 1);
-        assert_eq!(view.on_move, key(0x10));
+        assert_eq!(view.on_move, Seat::First);
         assert_eq!(view.step, 1);
         assert!(!view.terminal);
         assert_eq!(view.anchor, 1_000); // t₀
         assert_eq!(view.affordable, 300);
         assert_eq!(view.occurrences.len(), 1);
+        assert_eq!(view.tip, t.position);
     }
 
     #[test]
     fn chain_advances_turn_anchor_and_occurrences() {
-        let params = params();
-        let plies = vec![
-            ply(1, key(0x10), 1, r#"["a1","a4",null]"#, 1_010, false),
-            ply(2, key(0x20), 1, r#"["e8","e7",null]"#, 1_025, true),
-        ];
-        let view = session_view(&params, &plies, &[], key(0x10), 2_000).unwrap();
+        let (w, t) = world();
+        let a = w.ply(&t.id, &w.first, 1, r#"["e2","e4",null]"#, 1_010);
+        let mut b = w.ply(&t.id, &w.second, 1, r#"["e7","e5",null]"#, 1_025);
+        // The second Ply offers a draw.
+        b = EventBuilder::new(b.kind, b.content.clone())
+            .tags(
+                b.tags
+                    .iter()
+                    .cloned()
+                    .chain([Tag::parse(["draw"]).unwrap()]),
+            )
+            .custom_created_at(b.created_at)
+            .finalize(&w.second)
+            .unwrap();
+        let events = Events::from_relay([&a, &b], &t, 300);
+        let view = session_view(&mut Native, &t, 1_000, &events, 2_000).unwrap();
         assert_eq!(view.chain_len, 2);
         assert_eq!(view.next_half_move, 3);
-        assert_eq!(view.on_move, key(0x10));
+        assert_eq!(view.on_move, Seat::First);
         assert_eq!(view.step, 2);
         assert_eq!(view.anchor, 1_025);
         assert!(view.last_ply_offers_draw);
         assert_eq!(view.occurrences.values().sum::<u32>(), 3);
-        // Both movers spent time and earned the increment: first 300−10+3,
-        // still to be spent by the mover at half-move 3.
+        // Both pawn moves are irreversible.
+        assert_eq!(view.halfmove_clock, 0);
+        // The first player spent 10 s and earned the increment: 300 − 10 + 3,
+        // still to be spent at half-move 3.
         assert_eq!(view.affordable, 293);
+        // The tip is a position the search engine parses.
+        assert!(sashite_sanki_player::Position::parse(&view.tip).is_ok());
     }
 
     #[test]
     fn prediction_matches_the_session_state() {
-        let params = params();
+        let (_, t) = world();
+        let events = Events::default();
         // No plies, probe far past the budget: the on-move first player has
-        // flagged by abandonment — the arbiter would rule timeout against
-        // them; the second player predicts a win on time.
-        let verdict = predicted_verdict(&params, &[], &[], key(0x20), 40_000).unwrap();
-        assert_eq!(verdict.status(), Status::Timeout);
+        // flagged by abandonment — the second player predicts a win on time.
+        let verdict = predicted_verdict(&mut Native, &t, 1_000, &events, Seat::Second, 40_000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(verdict.status, "timeout");
+        assert!(wins(&verdict, Seat::Second));
         // The same probe just after t₀ resolves as the residual resignation
-        // AGAINST THE INVOKER (calling for no reason) — which is exactly why
-        // the bot never publishes without wanting the predicted verdict.
-        let early = predicted_verdict(&params, &[], &[], key(0x20), 1_010).unwrap();
-        assert_eq!(early.status(), Status::Resignation);
+        // AGAINST THE INVOKER — which is exactly why the bot never concludes
+        // without wanting the predicted verdict.
+        let early = predicted_verdict(&mut Native, &t, 1_000, &events, Seat::Second, 1_010)
+            .unwrap()
+            .unwrap();
+        assert_eq!(early.status, "resignation");
+        assert!(wins(&early, Seat::First));
+        // Before t₀: no verdict.
+        assert!(
+            predicted_verdict(&mut Native, &t, 1_000, &events, Seat::Second, 999)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn seats_and_steps_follow_the_alternation() {
+        assert_eq!(seat_at(1), Seat::First);
+        assert_eq!(seat_at(2), Seat::Second);
+        assert_eq!(seat_at(7), Seat::First);
+        assert_eq!(step_at(1), 1);
+        assert_eq!(step_at(2), 1);
+        assert_eq!(step_at(3), 2);
+        assert_eq!(step_at(4), 2);
     }
 }
