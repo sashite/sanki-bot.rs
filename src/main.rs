@@ -25,6 +25,8 @@
 //!   `nsec_env` (never logged; the derived npub only).
 //! - `RUST_LOG` (optional): log filter; defaults to `info`.
 
+use tracing::Instrument;
+
 mod actor;
 mod admission;
 mod cadence;
@@ -152,11 +154,19 @@ async fn main() -> Result<()> {
             bot_seed,
             shutdown: shutdown_rx.clone(),
         };
-        handles.push(tokio::spawn(async move {
-            if let Err(error) = actor::run(ctx).await {
-                tracing::error!(error = %error, "bot actor stopped with an error");
+        // The persona's span wraps its whole task (`instrument`), so every
+        // line it logs — from any thread the runtime moves it to — wears its
+        // name, and no other task's. (An entered span held across `await`
+        // points would leak onto whatever else runs on the same thread.)
+        let span = tracing::info_span!("bot", bot = %ctx.name);
+        handles.push(tokio::spawn(
+            async move {
+                if let Err(error) = actor::run(ctx).await {
+                    tracing::error!(error = %error, "bot actor stopped with an error");
+                }
             }
-        }));
+            .instrument(span),
+        ));
     }
 
     shutdown_signal().await;

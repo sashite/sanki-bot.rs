@@ -3,6 +3,39 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.2] — 2026-09-12
+
+### Fixed
+
+- **An accepted Direct Challenge was never played.** The acceptance is the
+  Game Session the bot publishes itself, from a task of its own, and the
+  code then waited for the subscription to deliver that session back so it
+  could be tracked — but the client never notifies an event it sent (it
+  already holds it when the relay's echo arrives), so the session was never
+  tracked and the bot never moved, on the direct path and on a rematch it
+  accepted. Found on the first rematch in production. The task now hands the
+  founded session back to the actor's loop through an internal channel,
+  which tracks and serves it as it would one from the relay. The pool path,
+  which tracks explicitly after founding, was never affected.
+
+## [0.8.1] — 2026-09-12
+
+Two things the first production run showed in the log.
+
+### Fixed
+
+- **The persona's name on every log line.** The `bot{…}` span was entered
+  with a guard held across `await` points, so it leaked onto whichever task
+  ran next on the same thread — a move by `robotto-ogi` logged as
+  `robotto-chess`'s, a `tracking session` with no name at all — and the
+  publish tasks (`tokio::spawn`) carried no span. The actor's future is now
+  `instrument`ed by the supervisor and the spawned tasks inherit
+  `Span::current()`: a line wears its own persona's name, always.
+- **The pool feed no longer replays its whole history at start-up.** The
+  subscription carries a `since` of ten minutes — every live entry is
+  within it, and none of the hundreds of expired ones a restart used to
+  read and refuse one by one.
+
 ## [0.8.0] — 2026-09-12
 
 The three Robotto ([ADR-0040](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0040-three-robotto.md)):

@@ -18,6 +18,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{anyhow, bail, Context as AnyhowContext, Result};
 use nostr_sdk::prelude::*;
+use tracing::Instrument;
 
 use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Move, Position, Strength};
 
@@ -80,6 +81,12 @@ const REMATCH_WINDOW_SECS: u64 = 60;
 /// player sent a little before the restart.
 const SELF_REPLAY_LOOKBACK_SECS: u64 = 45 * 60;
 
+/// How far back the pool feed replays when the bot starts: the app's pool
+/// window is a minute, the fleet's own entries last three, and a third-party
+/// client's entry is bounded by its `accept_until` either way — ten minutes
+/// cover every live entry, and none of the pool's history.
+const POOL_REPLAY_LOOKBACK_SECS: u64 = 600;
+
 /// How far back the session recovery looks for Game Sessions naming the bot
 /// (§9): a correspondence game outlives a restart, a season-old one does not.
 /// Every recovered session costs one reconstruction on the first tick.
@@ -104,7 +111,7 @@ const REPUBLISH_GRACE_SECS: u64 = 15;
 
 /// Everything one bot actor needs, assembled by the supervisor.
 pub struct BotContext {
-    /// Persona name (tracing span).
+    /// Persona name — the supervisor's tracing span (`main.rs`).
     pub name: String,
     /// The bot's identity.
     pub keys: Keys,
@@ -199,9 +206,11 @@ struct PublishedPly {
 /// Run the actor until shutdown. Errors bubble only for unrecoverable
 /// startup conditions; per-event errors are logged and absorbed.
 pub async fn run(mut ctx: BotContext) -> Result<()> {
+    // The persona's span is the supervisor's: the whole of this future runs
+    // instrumented with it (`main.rs`), which is what keeps the name on every
+    // line — including those of the tasks spawned below, which inherit it
+    // explicitly with `Span::current()`.
     let me = ctx.keys.public_key();
-    let span = tracing::info_span!("bot", bot = %ctx.name);
-    let _enter = span.enter();
 
     // No signer on the client: this bot signs every event itself before
     // sending it (see `publish`).
@@ -229,6 +238,12 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     // concluded game's slot with the pair for the rematch window. Behind a
     // mutex so the publish tasks can release a commitment they failed to make.
     let slots: Arc<Mutex<Slots>> = Arc::new(Mutex::new(Slots::default()));
+    // What the bot publishes from a task of its own and must then act on —
+    // the Game Session that accepts a Direct Challenge — comes back to this
+    // loop through this channel, never through the relay: the client does
+    // not notify an event it sent itself (it already holds it when the echo
+    // arrives), so a subscription would never deliver it.
+    let (own_events, mut own_events_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -254,9 +269,17 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 .as_secs()
                 .saturating_sub(SELF_REPLAY_LOOKBACK_SECS),
         ));
+    // The pool feed replays nothing older than the longest window an entry
+    // may carry: what is older has expired, and a restart need not read the
+    // pool's whole history to learn so.
     let pool_filter = Filter::new()
         .kind(Kind::Custom(OPEN_CHALLENGE_KIND))
-        .pubkey(ctx.matchmaker);
+        .pubkey(ctx.matchmaker)
+        .since(Timestamp::from(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(POOL_REPLAY_LOOKBACK_SECS),
+        ));
     // The notification stream is opened BEFORE the subscriptions: it is a
     // broadcast channel, and what the relay replays on REQ before the stream
     // exists is lost to it — a Pairing that landed while the bot was
@@ -337,12 +360,20 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 )
                 .await;
             }
+            Some(event) = own_events_rx.recv() => {
+                handle_event(
+                    &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
+                    &mut considered_challenges, &mut founded_pairings,
+                    &mut offered_rematches, &slots, &own_events, &mut starred_today,
+                    &mut rng, me, event,
+                ).await;
+            }
             notification = notifications.next() => match notification {
                 Some(ClientNotification::Event { event, .. }) => {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut considered_challenges, &mut founded_pairings,
-                        &mut offered_rematches, &slots, &mut starred_today,
+                        &mut offered_rematches, &slots, &own_events, &mut starred_today,
                         &mut rng, me, *event,
                     ).await;
                 }
@@ -723,6 +754,7 @@ async fn handle_event(
     founded_pairings: &mut BTreeSet<EventId>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     slots: &Arc<Mutex<Slots>>,
+    own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
     starred_today: &mut u64,
     rng: &mut SplitMix64,
     me: PublicKey,
@@ -755,6 +787,7 @@ async fn handle_event(
                     relay_clock,
                     sessions,
                     slots,
+                    own_events,
                     offered_rematches,
                     rng,
                     me,
@@ -1047,62 +1080,65 @@ async fn court_pool_entry(
     // Timing NIP §Timing modes and mode selection) — also the relay hint of
     // the rules reference.
     let timing_relay = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
-    tokio::spawn(async move {
-        tokio::time::sleep(StdDuration::from_secs(delay)).await;
-        let result = publish_self_timed(
-            &client,
-            &keys,
-            &relay_clock,
-            Kind::Custom(OPEN_CHALLENGE_KIND),
-            pow,
-            move |created_at| {
-                let mut event_tags = vec![
-                    p_role(&matchmaker, "matchmaker"),
-                    Tag::custom(
-                        "e",
-                        [rules.to_hex(), timing_relay.clone(), "rules".to_owned()],
-                    ),
-                    Tag::custom("timing_relay", [timing_relay.clone()]),
-                    Tag::custom("game", [game.clone()]),
-                    Tag::custom("variant", ["self".to_owned(), variant.clone()]),
-                ];
-                // The free MIRROR form imposes the shared variant back; courting
-                // an ASYMMETRIC (premium) entry, our entry must leave the
-                // opponent unconstrained (see `courtship::PoolCandidate::mirror`).
-                if mirror {
+    tokio::spawn(
+        async move {
+            tokio::time::sleep(StdDuration::from_secs(delay)).await;
+            let result = publish_self_timed(
+                &client,
+                &keys,
+                &relay_clock,
+                Kind::Custom(OPEN_CHALLENGE_KIND),
+                pow,
+                move |created_at| {
+                    let mut event_tags = vec![
+                        p_role(&matchmaker, "matchmaker"),
+                        Tag::custom(
+                            "e",
+                            [rules.to_hex(), timing_relay.clone(), "rules".to_owned()],
+                        ),
+                        Tag::custom("timing_relay", [timing_relay.clone()]),
+                        Tag::custom("game", [game.clone()]),
+                        Tag::custom("variant", ["self".to_owned(), variant.clone()]),
+                    ];
+                    // The free MIRROR form imposes the shared variant back; courting
+                    // an ASYMMETRIC (premium) entry, our entry must leave the
+                    // opponent unconstrained (see `courtship::PoolCandidate::mirror`).
+                    if mirror {
+                        event_tags.push(Tag::custom(
+                            "variant",
+                            ["opponent".to_owned(), variant.clone()],
+                        ));
+                    }
                     event_tags.push(Tag::custom(
-                        "variant",
-                        ["opponent".to_owned(), variant.clone()],
+                        "accept_until",
+                        [created_at
+                            .as_secs()
+                            .saturating_add(OWN_ENTRY_WINDOW_SECS)
+                            .to_string()],
                     ));
+                    for row in &spec {
+                        event_tags.push(Tag::custom("time_control", row.clone()));
+                    }
+                    (event_tags, String::new())
+                },
+            )
+            .await;
+            match result {
+                Ok(own_entry) => {
+                    // The commitment now wears our entry's own id — the one any
+                    // Pairing that concerns it names, whoever it is paired with.
+                    lock_slots(&slots).rekey(&key, own_entry.id);
+                    ledger.pool_presence(me, true);
+                    tracing::info!(%against, entry = %own_entry.id, "entered the pool (reactive)");
                 }
-                event_tags.push(Tag::custom(
-                    "accept_until",
-                    [created_at
-                        .as_secs()
-                        .saturating_add(OWN_ENTRY_WINDOW_SECS)
-                        .to_string()],
-                ));
-                for row in &spec {
-                    event_tags.push(Tag::custom("time_control", row.clone()));
+                Err(error) => {
+                    lock_slots(&slots).release(&key);
+                    tracing::warn!(error = %error, "pool entry publish failed");
                 }
-                (event_tags, String::new())
-            },
-        )
-        .await;
-        match result {
-            Ok(own_entry) => {
-                // The commitment now wears our entry's own id — the one any
-                // Pairing that concerns it names, whoever it is paired with.
-                lock_slots(&slots).rekey(&key, own_entry.id);
-                ledger.pool_presence(me, true);
-                tracing::info!(%against, entry = %own_entry.id, "entered the pool (reactive)");
-            }
-            Err(error) => {
-                lock_slots(&slots).release(&key);
-                tracing::warn!(error = %error, "pool entry publish failed");
             }
         }
-    });
+        .instrument(tracing::Span::current()),
+    );
     Ok(())
 }
 
@@ -1214,6 +1250,7 @@ async fn consider_direct_challenge(
     relay_clock: &Arc<RelayClock>,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     rng: &mut SplitMix64,
     me: PublicKey,
@@ -1311,8 +1348,10 @@ async fn consider_direct_challenge(
 
     // The acceptance IS the Game Session (kind 3422 §Signing party) — after
     // the persona's reflection, in a task of its own so the actor's loop
-    // keeps serving its games meanwhile. The Game Session reaches the loop
-    // through the subscription (it names the bot) and is tracked then.
+    // keeps serving its games meanwhile. The Game Session comes back to the
+    // loop through `own_events` and is tracked then: the relay's echo of an
+    // event the client itself sent is never notified, so the subscription
+    // would not deliver it.
     let session_plan = founding::accept_direct_challenge(challenge, &plan, me, &ctx.describe)?;
     if let Some(refs) = plan.rematch {
         // Accepting theirs supersedes proposing ours.
@@ -1339,31 +1378,44 @@ async fn consider_direct_challenge(
     let challenger = plan.challenger;
     let rematch = plan.rematch.is_some();
     let slots = Arc::clone(slots);
-    tokio::spawn(async move {
-        tokio::time::sleep(StdDuration::from_secs(delay)).await;
-        let result = publish_self_timed(
-            &client,
-            &keys,
-            &relay_clock,
-            Kind::Custom(GAME_SESSION_KIND),
-            Pow::None,
-            move |_created_at| (session_plan.tags(&hint), session_plan.position.clone()),
-        )
-        .await;
-        match result {
-            Ok(session) => tracing::info!(
-                challenge = %challenge_id,
-                %challenger,
-                session = %session.id,
-                rematch,
-                "accepted a direct challenge by founding the session"
-            ),
-            Err(error) => {
-                lock_slots(&slots).release(&challenge_id);
-                tracing::warn!(error = %error, "acceptance publish failed");
+    let own_events = own_events.clone();
+    tokio::spawn(
+        async move {
+            tokio::time::sleep(StdDuration::from_secs(delay)).await;
+            let result = publish_self_timed(
+                &client,
+                &keys,
+                &relay_clock,
+                Kind::Custom(GAME_SESSION_KIND),
+                Pow::None,
+                move |_created_at| (session_plan.tags(&hint), session_plan.position.clone()),
+            )
+            .await;
+            match result {
+                Ok(session) => {
+                    tracing::info!(
+                        challenge = %challenge_id,
+                        %challenger,
+                        session = %session.id,
+                        rematch,
+                        "accepted a direct challenge by founding the session"
+                    );
+                    // Back to the loop, to be tracked and served.
+                    if own_events.send(session).is_err() {
+                        tracing::warn!(
+                            session = "dropped",
+                            "the actor loop is gone; the acceptance is not tracked"
+                        );
+                    }
+                }
+                Err(error) => {
+                    lock_slots(&slots).release(&challenge_id);
+                    tracing::warn!(error = %error, "acceptance publish failed");
+                }
             }
         }
-    });
+        .instrument(tracing::Span::current()),
+    );
     Ok(())
 }
 
