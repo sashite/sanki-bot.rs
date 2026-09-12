@@ -56,8 +56,6 @@ nsec_env = "PLAYER_NSEC_KAORU"
   # imposed variant must still appear in `variants` above. Leave the bot's variant
   # OPEN instead and it draws its own — no flag needed for that.
   # accept_imposed_variant = true
-  max_live            = 1
-  max_correspondence  = 4
   strength            = { time_ms = 2000, depth = 6 }
   resign_threshold    = -700
   draw_offer          = "balanced"   # never | balanced | eager
@@ -66,6 +64,16 @@ nsec_env = "PLAYER_NSEC_KAORU"
   # publishing the Conclusion claiming the win on time (default 5): a human
   # whose clock just fell is not flagged to the second.
   # timeout_courtesy_secs = 5
+
+    # Concurrent games PER CADENCE FAMILY (ADR-0039 §6; the families and the
+    # classifier: web-specs.md nostr/support/cadence-sanki.md). These are the
+    # defaults — an omitted family takes them; 0 disables a family. The old
+    # `max_live` / `max_correspondence` keys are rejected at start-up.
+    [bot.play.max_concurrent]
+    byoyomi        = 1
+    blitz          = 1
+    rapid          = 1
+    correspondence = 4
 
   [bot.schedule]
   timezone = "Asia/Tokyo"

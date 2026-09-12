@@ -422,7 +422,7 @@ mod tests {
             their_variant: "chess".to_owned(),
             my_seat: Seat::Second,
             accept_until: 2_000_000_300,
-            correspondence: false,
+            cadence: crate::cadence::Cadence::Blitz,
             rematch: None,
         };
         let session_plan = accept_direct_challenge(&challenge, &plan, me, &describe()).unwrap();

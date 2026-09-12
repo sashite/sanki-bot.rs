@@ -21,6 +21,7 @@ use nostr_sdk::prelude::*;
 
 use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Move, Position, Strength};
 
+use crate::cadence::Cadence;
 use crate::chain::{self, predicted_verdict, session_view, SessionView};
 use crate::conclusion::{self, Conclude};
 use crate::config::{BotConfig, DrawOffer, FleetSection};
@@ -145,7 +146,10 @@ struct SessionMeta {
     my_seat: Seat,
     /// The opponent.
     opponent: PublicKey,
-    correspondence: bool,
+    /// The session's cadence family (*Cadence — Sanki*): what its slot is
+    /// counted under; its correspondence bit paces the think and the
+    /// presence rules.
+    cadence: Cadence,
     my_side_evals: VecDeque<i32>,
     /// Earliest instant we may act on the pending duty (think pacing).
     next_action_at: u64,
@@ -209,9 +213,11 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     // proactively (on the verdict) or in reply to the opponent's; a lapsed
     // one may be renewed when the opponent proposes after it expired.
     let mut offered_rematches: BTreeMap<EventId, u64> = BTreeMap::new();
-    // Our own live pool entry's `accept_until`: one at a time, so N
-    // compatible strangers entering together do not become N sessions.
-    let own_entry_until: Arc<std::sync::atomic::AtomicU64> = Arc::new(0.into());
+    // Our own live pool entries' `accept_until`, ONE PER CADENCE (ADR-0039
+    // §7): one entry at a time per family, so N compatible strangers entering
+    // together at one cadence do not become N sessions, while a byōyomi
+    // entry never blocks a blitz one.
+    let own_entries: Arc<PoolLocks> = Arc::new(PoolLocks::default());
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -318,7 +324,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut considered_challenges, &mut founded_pairings,
-                        &mut offered_rematches, &own_entry_until, &mut starred_today,
+                        &mut offered_rematches, &own_entries, &mut starred_today,
                         &mut rng, me, *event,
                     ).await;
                 }
@@ -631,7 +637,11 @@ async fn track_session(
         .seat_of(&me)
         .ok_or_else(|| anyhow!("no seat for us"))?;
     let opponent = terms.player(my_seat.other());
-    let correspondence = courtship::is_correspondence(&tags::time_control_rows(&founding));
+    // The session's cadence, read off the founding's first period (*Cadence —
+    // Sanki*): a founding without one is non-conforming, and the bot was
+    // never admitted into it — it cannot be served under any cap.
+    let cadence = Cadence::of_rows(&tags::time_control_rows(&founding))
+        .ok_or_else(|| anyhow!("the founding has no cadence (malformed time_control)"))?;
     // One tracked session per slot: a canonical Game Session arriving after
     // a sibling (both players of a Pairing founding, both rematch
     // challenges accepted) evicts the stale one, whose events would never
@@ -649,7 +659,7 @@ async fn track_session(
         }
     }
     ctx.ledger.session_changed(&me, &opponent, true);
-    tracing::info!(session = %canonical.id, %opponent, seat = my_seat.name(), correspondence, "tracking session");
+    tracing::info!(session = %canonical.id, %opponent, seat = my_seat.name(), cadence = cadence.token(), "tracking session");
     sessions.insert(
         canonical.id,
         SessionMeta {
@@ -659,7 +669,7 @@ async fn track_session(
             start,
             my_seat,
             opponent,
-            correspondence,
+            cadence,
             my_side_evals: VecDeque::new(),
             next_action_at: 0,
             planned_half_move: 0,
@@ -683,7 +693,7 @@ async fn handle_event(
     considered_challenges: &mut BTreeSet<EventId>,
     founded_pairings: &mut BTreeSet<EventId>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
-    own_entry_until: &Arc<std::sync::atomic::AtomicU64>,
+    own_entries: &Arc<PoolLocks>,
     starred_today: &mut u64,
     rng: &mut SplitMix64,
     me: PublicKey,
@@ -697,7 +707,7 @@ async fn handle_event(
                     ctx,
                     relay_clock,
                     sessions,
-                    own_entry_until,
+                    own_entries,
                     rng,
                     me,
                     &event,
@@ -885,7 +895,7 @@ async fn court_pool_entry(
     ctx: &BotContext,
     relay_clock: &Arc<RelayClock>,
     sessions: &BTreeMap<EventId, SessionMeta>,
-    own_entry_until: &Arc<std::sync::atomic::AtomicU64>,
+    own_entries: &Arc<PoolLocks>,
     rng: &mut SplitMix64,
     me: PublicKey,
     entry: &Event,
@@ -905,18 +915,14 @@ async fn court_pool_entry(
         now,
         COURT_MARGIN_SECS,
     )?;
-    // The concurrency caps, and one own entry at a time: a Pairing founds a
-    // session the bot must then serve.
-    let (live, correspondence) = load_of(sessions);
-    if courtship::is_correspondence(&candidate.spec) {
-        if correspondence >= ctx.config.play.max_correspondence {
-            return Err("correspondence cap reached");
-        }
-    } else if live >= ctx.config.play.max_live {
-        return Err("live cap reached");
+    // The per-cadence cap, and one own entry at a time PER CADENCE: a
+    // Pairing founds a session the bot must then serve, under that cap.
+    let cadence = candidate.cadence;
+    if load_of(sessions, cadence) >= ctx.config.play.max_concurrent.cap(cadence) {
+        return Err("cap reached for this cadence");
     }
-    if own_entry_until.load(std::sync::atomic::Ordering::Relaxed) > now {
-        return Err("our own entry is still live");
+    if own_entries.until(cadence) > now {
+        return Err("our own entry at this cadence is still live");
     }
     if ctx.ledger.is_member(&candidate.challenger) && !ctx.ledger.may_court_sibling() {
         return Err("bot-vs-bot budget spent");
@@ -942,16 +948,16 @@ async fn court_pool_entry(
             .saturating_sub(COURT_MARGIN_SECS),
     )
     .min(30);
-    own_entry_until.store(
+    own_entries.hold(
+        cadence,
         now.saturating_add(delay)
             .saturating_add(OWN_ENTRY_WINDOW_SECS),
-        std::sync::atomic::Ordering::Relaxed,
     );
     let client = client.clone();
     let keys = ctx.keys.clone();
     let relay_clock = Arc::clone(relay_clock);
     let ledger = Arc::clone(&ctx.ledger);
-    let own_entry_until = Arc::clone(own_entry_until);
+    let own_entries = Arc::clone(own_entries);
     let pow = Pow::Mined(ctx.fleet.pow_difficulty);
     let variant = candidate.variant.clone();
     let mirror = candidate.mirror;
@@ -1012,7 +1018,7 @@ async fn court_pool_entry(
                 tracing::info!(%against, "entered the pool (reactive)");
             }
             Err(error) => {
-                own_entry_until.store(0, std::sync::atomic::Ordering::Relaxed);
+                own_entries.release(cadence);
                 tracing::warn!(error = %error, "pool entry publish failed");
             }
         }
@@ -1020,18 +1026,52 @@ async fn court_pool_entry(
     Ok(())
 }
 
-/// The concurrency caps: how many live and correspondence sessions are
-/// tracked.
-fn load_of(sessions: &BTreeMap<EventId, SessionMeta>) -> (u32, u32) {
+/// The load of one cadence family: how many tracked sessions it holds (the
+/// per-family caps, ADR-0039 §6).
+fn load_of(sessions: &BTreeMap<EventId, SessionMeta>, cadence: Cadence) -> u32 {
     sessions
         .values()
-        .fold((0_u32, 0_u32), |(live, corr), meta| {
-            if meta.correspondence {
-                (live, corr.saturating_add(1))
-            } else {
-                (live.saturating_add(1), corr)
-            }
-        })
+        .filter(|meta| meta.cadence == cadence)
+        .fold(0_u32, |n, _| n.saturating_add(1))
+}
+
+/// The pool's one-entry lock, per cadence (ADR-0039 §7): the `accept_until`
+/// of the bot's own live entry in each family, `0` when none. Shared with the
+/// publish task, which releases the lock on a failed publish.
+#[derive(Debug, Default)]
+struct PoolLocks {
+    byoyomi: std::sync::atomic::AtomicU64,
+    blitz: std::sync::atomic::AtomicU64,
+    rapid: std::sync::atomic::AtomicU64,
+    correspondence: std::sync::atomic::AtomicU64,
+}
+
+impl PoolLocks {
+    const fn slot(&self, cadence: Cadence) -> &std::sync::atomic::AtomicU64 {
+        match cadence {
+            Cadence::Byoyomi => &self.byoyomi,
+            Cadence::Blitz => &self.blitz,
+            Cadence::Rapid => &self.rapid,
+            Cadence::Correspondence => &self.correspondence,
+        }
+    }
+
+    /// The family's live entry deadline (unix seconds), `0` when none.
+    fn until(&self, cadence: Cadence) -> u64 {
+        self.slot(cadence)
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hold the family until `until`.
+    fn hold(&self, cadence: Cadence, until: u64) {
+        self.slot(cadence)
+            .store(until, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Release the family (a failed publish).
+    fn release(&self, cadence: Cadence) {
+        self.hold(cadence, 0);
+    }
 }
 
 /// Found the session a Pairing naming us declares (kind 3422 §Signing party,
@@ -1158,18 +1198,13 @@ async fn consider_direct_challenge(
             return Err("rematch declined (persona)");
         }
     }
-    // Concurrency caps.
-    let (live, correspondence) = load_of(sessions);
-    if plan.correspondence {
-        if correspondence >= ctx.config.play.max_correspondence {
-            return Err("correspondence cap reached");
-        }
-    } else if live >= ctx.config.play.max_live {
-        return Err("live cap reached");
+    // The per-cadence cap.
+    if load_of(sessions, plan.cadence) >= ctx.config.play.max_concurrent.cap(plan.cadence) {
+        return Err("cap reached for this cadence");
     }
     // Acceptance timing by pace (resolved question 5): live only while
     // present; correspondence at any hour after a credible delay.
-    if !plan.correspondence
+    if !plan.cadence.is_correspondence()
         && !crate::persona::is_present(&ctx.config.schedule, ctx.bot_seed, chrono::Utc::now())
     {
         return Err("absent (live challenge)");
@@ -1564,7 +1599,7 @@ async fn service_session(
     }
 
     // Our turn. Pace it: presence for correspondence, think delay for all.
-    let sigma = if meta.correspondence {
+    let sigma = if meta.cadence.is_correspondence() {
         SIGMA_CORRESPONDENCE_SECS
     } else {
         SIGMA_LIVE_SECS
@@ -1573,7 +1608,7 @@ async fn service_session(
     let latest_start = deadline.saturating_sub(sigma);
     if meta.planned_half_move != view.next_half_move {
         // (Re)plan the reflection for this half-move.
-        let think_cfg = if meta.correspondence {
+        let think_cfg = if meta.cadence.is_correspondence() {
             &ctx.config.tempo.correspondence_think
         } else {
             &ctx.config.tempo.think
@@ -1583,7 +1618,7 @@ async fn service_session(
         let mut play_at = now.saturating_add(think);
         // Correspondence realism: prefer the presence window, except under
         // clock pressure (§6.7: realism never outranks not flagging).
-        if meta.correspondence
+        if meta.cadence.is_correspondence()
             && !crate::persona::is_present(&ctx.config.schedule, ctx.bot_seed, chrono::Utc::now())
         {
             let next_window = crate::persona::next_presence(
@@ -1607,7 +1642,7 @@ async fn service_session(
         // away, and always for correspondence. A LIVE game whose planned move
         // falls WITHIN one tick must not defer: sleep the sub-tick residual
         // and play in-call so we hit the planned instant precisely.
-        if meta.correspondence || wait >= TICK_SECS {
+        if meta.cadence.is_correspondence() || wait >= TICK_SECS {
             return Ok(None); // a later tick will come back
         }
         tokio::time::sleep(StdDuration::from_secs(wait)).await;

@@ -3,6 +3,43 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] — 2026-09-12
+
+One cadence ([ADR-0039](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0039-one-cadence.md)):
+the four families — `byoyomi`, `blitz`, `rapid`, `correspondence` — are
+classified once, in the suite's documents ([Cadence — Sanki](https://github.com/sashite/web-specs.md/blob/main/nostr/support/cadence-sanki.md)),
+and the fleet derives its reading from there instead of keeping one of its
+own.
+
+### Changed
+
+- **BREAKING (config) — `[bot.play.max_concurrent]` replaces `max_live` and
+  `max_correspondence`.** One table, one cap per cadence family
+  (`byoyomi`, `blitz`, `rapid`, `correspondence`; defaults `1`, `1`, `1`,
+  `4`; an omitted family takes its default, `0` disables one). The old keys
+  are **rejected** at start-up, not silently honoured. A persona's
+  `time_controls` must each classify (a `time_control` the classifier calls
+  malformed — a `duration` of `0` outside the per-move form, a leading zero
+  — fails the fleet file).
+- **The cadence classifier is the spec's** (`src/cadence.rs`): the ordered
+  rules of *Cadence — Sanki* on a founding's **first** period — a day in the
+  bank or in the increment is correspondence; `duration 0` is byōyomi; five
+  minutes or less is blitz; the rest is rapid — and a malformed or absent
+  first period has **no cadence**. The fleet's own
+  `duration >= 7200 || increment >= 3600` is gone. Two behaviours move in
+  consequence: a `["7200"]` challenge is a **live** rapid game (live think
+  distribution, accepted only while present), and a `["300", "3600"]` one
+  is blitz. Both admission gates — the pool's and the direct challenge's —
+  count sessions per family; a challenge whose first period has no cadence
+  is refused, `accept_any_time_control` or not.
+- **The pool's one-entry lock is per cadence** (ADR-0039 §7): a persona that
+  has just mirrored a blitz entry no longer ignores every other entry for
+  three minutes — only blitz ones. With caps per family the four slots can
+  now actually fill.
+- The category-G conformance vectors (`conformance/cadence.json`, vendored
+  from `web-specs.md`) run in the unit suite, the same file the app's
+  `cadence.spec.ts` runs. Each persona's caps are logged at spawn.
+
 ## [0.6.0] — 2026-09-05
 
 The fleet plays the **arbiterless** protocol under an **executable rule

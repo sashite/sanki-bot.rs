@@ -1,0 +1,240 @@
+{
+	"version": 1,
+	"category": "cadence",
+	"vectors": [
+		{
+			"id": "cadence.preset.byoyomi",
+			"note": "the app's byōyomi preset: 10 s per move (rule 2)",
+			"timeControls": [["0", "10", "1"]],
+			"cadence": "byoyomi"
+		},
+		{
+			"id": "cadence.preset.blitz",
+			"note": "the app's blitz preset: 3 + 2 (rule 3)",
+			"timeControls": [["180", "2"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.preset.rapid",
+			"note": "the app's rapid preset: 10 + 0 (rule 4)",
+			"timeControls": [["600"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.preset.correspondence",
+			"note": "the app's correspondence preset: 3 days per move (rule 1, on the increment)",
+			"timeControls": [["0", "259200", "1"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.boundary.d299",
+			"note": "one second under the five-minute boundary",
+			"timeControls": [["299"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.boundary.d300",
+			"note": "exactly five minutes is blitz (rule 3: d ≤ 300)",
+			"timeControls": [["300"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.boundary.d301",
+			"note": "one second over the five-minute boundary",
+			"timeControls": [["301"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.boundary.d300-with-increment",
+			"note": "the increment does not move a blitz bank (5 + 3 stays blitz)",
+			"timeControls": [["300", "3"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.boundary.d86399",
+			"note": "one second under a day in the bank is still a live game",
+			"timeControls": [["86399"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.boundary.d86400",
+			"note": "a full day in the bank is correspondence (rule 1 on d)",
+			"timeControls": [["86400"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.boundary.d604800",
+			"note": "a seven-day bank — the input neither prior implementation classified as correspondence",
+			"timeControls": [["604800"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.boundary.huge-bank",
+			"note": "a well-formed value beyond any native integer still classifies: past a day is correspondence, in every language (an implementation saturates, it never declares the value malformed)",
+			"timeControls": [["99999999999999999999999"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.boundary.i86399",
+			"note": "one second under a day of increment leaves the bank's family (rule 1 does not fire; rule 3 does)",
+			"timeControls": [["300", "86399"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.boundary.i86400",
+			"note": "a day of increment is correspondence whatever the bank (rule 1 on i)",
+			"timeControls": [["300", "86400"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.boundary.per-move-i86399",
+			"note": "per-move form one second under a day is byōyomi",
+			"timeControls": [["0", "86399", "1"]],
+			"cadence": "byoyomi"
+		},
+		{
+			"id": "cadence.boundary.per-move-i86400",
+			"note": "per-move form of exactly a day is correspondence (rule 1 before rule 2)",
+			"timeControls": [["0", "86400", "1"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.order.rule1-beats-rule2",
+			"note": "rule 1 is checked first: a per-move form with a day-long increment is not byōyomi",
+			"timeControls": [["0", "259200", "1"]],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.moved.two-hour-bank",
+			"note": "the fleet's old two-hour rule is gone: a two-hour bank is a live rapid game",
+			"timeControls": [["7200"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.moved.hour-increment",
+			"note": "the fleet's old one-hour-increment rule is gone: 5 min + 1 h is blitz",
+			"timeControls": [["300", "3600"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.shape.explicit-zero-increment",
+			"note": "an explicit increment of 0 is a valid, distinct period; it classifies like the bank alone",
+			"timeControls": [["600", "0"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.shape.quota-with-bank",
+			"note": "a quota period with a main time is read on its duration; plies never enter",
+			"timeControls": [["600", "5", "40"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.shape.tiny-bank",
+			"note": "a one-second bank is blitz, not byōyomi: only d = 0 is the per-move form",
+			"timeControls": [["1", "1", "1"]],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.periods.first-bank-then-per-move",
+			"note": "several periods: the cadence is the first period's",
+			"timeControls": [["600"], ["0", "30", "1"]],
+			"cadence": "rapid"
+		},
+		{
+			"id": "cadence.periods.first-per-move-then-bank",
+			"note": "several periods: a later bank does not change the family",
+			"timeControls": [["0", "10", "1"], ["3600"]],
+			"cadence": "byoyomi"
+		},
+		{
+			"id": "cadence.periods.first-correspondence",
+			"note": "several periods: a later blitz phase does not change the family",
+			"timeControls": [
+				["0", "259200", "1"],
+				["180", "2"]
+			],
+			"cadence": "correspondence"
+		},
+		{
+			"id": "cadence.periods.malformed-second-ignored",
+			"note": "only the first period is read; a malformed later period is not this document's concern",
+			"timeControls": [
+				["180", "2"],
+				["0", "10"]
+			],
+			"cadence": "blitz"
+		},
+		{
+			"id": "cadence.none.absent",
+			"note": "no time_control tag: no cadence",
+			"timeControls": [],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.per-move-without-plies",
+			"note": "duration 0 outside the three-element form is malformed (kind 3420): no cadence, not blitz",
+			"timeControls": [["0", "10"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.zero-alone",
+			"note": "a bare zero duration is malformed: no cadence",
+			"timeControls": [["0"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.zero-plies",
+			"note": "plies must be strictly positive: malformed",
+			"timeControls": [["300", "3", "0"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.plies-without-increment",
+			"note": "an empty element is malformed; increment cannot be skipped",
+			"timeControls": [["300", "", "1"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.too-many-elements",
+			"note": "more than three values: malformed",
+			"timeControls": [["300", "3", "1", "2"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.empty-row",
+			"note": "a time_control tag with no values: malformed",
+			"timeControls": [[]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.leading-zero",
+			"note": "leading zeros are excluded by the format: malformed, not blitz",
+			"timeControls": [["0300"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.not-a-number",
+			"note": "a non-numeric duration: malformed, not rapid by arithmetic accident",
+			"timeControls": [["five"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.negative",
+			"note": "a negative duration does not match the format: malformed",
+			"timeControls": [["-5"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.decimal",
+			"note": "a decimal is not a bare integer: malformed",
+			"timeControls": [["300.5"]],
+			"cadence": null
+		},
+		{
+			"id": "cadence.none.malformed-first-valid-second",
+			"note": "a malformed first period yields no cadence even when a later one is valid",
+			"timeControls": [["0", "10"], ["600"]],
+			"cadence": null
+		}
+	]
+}

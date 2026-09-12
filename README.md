@@ -84,6 +84,12 @@ See ADR-0014 for the full design, ADR-0033 and ADR-0034 for the arbiterless
 protocol and the module. Notable v1 choices: self-timed only, a single relay,
 no premoves, no outbound fresh Direct Challenges, stateless restart from relay
 replay (sessions, rematch challenges and pending Pairings are recovered).
+Concurrency is capped **per cadence family** — `[bot.play.max_concurrent]`,
+one table of four (ADR-0039 §6) — and the pool's one-own-entry lock is per
+cadence too (§7); the family of a founding is read by the one classifier of
+[Cadence — Sanki](https://github.com/sashite/web-specs.md/blob/main/nostr/support/cadence-sanki.md)
+(`src/cadence.rs`), pinned to the app's by the shared category-G vectors
+(`conformance/cadence.json`, vendored from `web-specs.md`).
 Timed behavior (think pacing, correspondence scheduling, win-on-time wakes)
 runs through a coarse periodic tick so the notification loop never blocks;
 per-bot randomness is seeded from the bot's pubkey, so a persona stays

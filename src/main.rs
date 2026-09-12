@@ -26,6 +26,7 @@
 //! - `RUST_LOG` (optional): log filter; defaults to `info`.
 
 mod actor;
+mod cadence;
 mod chain;
 mod clockmath;
 mod conclusion;
@@ -126,7 +127,13 @@ async fn main() -> Result<()> {
     let mut handles = Vec::new();
     for (bot, keys) in roster {
         let npub = keys.public_key();
-        tracing::info!(bot = %bot.name, %npub, "spawning persona");
+        // The per-cadence caps, in canonical order (ADR-0039 §6) — the one
+        // line an operator reads to know how many games a persona may hold.
+        let caps: Vec<String> = cadence::Cadence::ALL
+            .iter()
+            .map(|c| format!("{}={}", c.token(), bot.play.max_concurrent.cap(*c)))
+            .collect();
+        tracing::info!(bot = %bot.name, %npub, caps = caps.join(" "), "spawning persona");
         // The bot seed derives from the pubkey: stable across restarts,
         // distinct across bots (personas stay consistent with themselves).
         let bot_seed = seed_from_pubkey(&npub);

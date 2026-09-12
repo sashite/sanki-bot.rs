@@ -11,6 +11,7 @@
 
 use nostr_sdk::prelude::*;
 
+use crate::cadence::Cadence;
 use crate::config::PlayConfig;
 use crate::prng::SplitMix64;
 use crate::session::{self, Seat, Timing};
@@ -34,6 +35,9 @@ pub struct PoolCandidate {
     /// The `time_control` rows to carry — byte-identical to the entry's (the
     /// matchmaker pairs identical configurations).
     pub spec: Vec<Vec<String>>,
+    /// The entry's cadence family (*Cadence — Sanki*): the per-family cap
+    /// and the per-cadence pool lock are indexed by it.
+    pub cadence: Cadence,
     /// The entry's `accept_until` (unix seconds).
     pub accept_until: u64,
     /// Whether the entry carries a `following` filter — the async layer must
@@ -155,12 +159,16 @@ pub fn evaluate_open_challenge(
     {
         return Err("cadence outside the persona");
     }
+    // A persona's time controls all classify (config validation), so this
+    // cannot fail for a row that just matched one; it is checked, not assumed.
+    let cadence = Cadence::of_rows(&rows).ok_or("no cadence (malformed time control)")?;
 
     Ok(PoolCandidate {
         challenger: event.pubkey,
         variant: variant.to_owned(),
         mirror,
         spec: rows,
+        cadence,
         accept_until,
         needs_following_check,
     })
@@ -192,9 +200,10 @@ pub struct AcceptPlan {
     pub my_seat: Seat,
     /// The challenge's `accept_until`.
     pub accept_until: u64,
-    /// Whether the cadence is correspondence-paced (acceptance at any hour —
-    /// resolved question 5; live challenges only while present).
-    pub correspondence: bool,
+    /// The challenge's cadence family (*Cadence — Sanki*): the per-family
+    /// cap is indexed by it, and its correspondence bit decides acceptance
+    /// timing (at any hour — resolved question 5; live only while present).
+    pub cadence: Cadence,
     /// The rematch references when the challenge is a rematch challenge —
     /// the async layer verifies them against the concluded session before
     /// accepting (kind 3420 §Rematch challenge).
@@ -272,6 +281,9 @@ pub fn evaluate_direct_challenge(
     {
         return Err("cadence outside the persona");
     }
+    // Whatever the persona's gate, the first period must classify: a
+    // challenge with no cadence has no cap to be admitted under.
+    let cadence = Cadence::of_rows(&rows).ok_or("no cadence (malformed time control)")?;
 
     // Variant terms (§6.3): every ASYMMETRIC imposition of our variant is
     // refused as persona policy (needs no premium lookup); a MIRROR
@@ -342,19 +354,8 @@ pub fn evaluate_direct_challenge(
         their_variant,
         my_seat,
         accept_until,
-        correspondence: is_correspondence(&rows),
+        cadence,
         rematch,
-    })
-}
-
-/// Whether a cadence is correspondence-paced: any period whose per-move
-/// allowance or bank is measured in hours (§6.3, resolved question 5).
-#[must_use]
-pub fn is_correspondence(rows: &[Vec<String>]) -> bool {
-    rows.iter().any(|row| {
-        let duration: u64 = row.first().and_then(|v| v.parse().ok()).unwrap_or(0);
-        let increment: u64 = row.get(1).and_then(|v| v.parse().ok()).unwrap_or(0);
-        duration >= 7_200 || increment >= 3_600
     })
 }
 
@@ -363,7 +364,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use crate::config::{PlayConfig, StrengthConfig, WeightedTimeControl};
+    use crate::config::{MaxConcurrent, PlayConfig, StrengthConfig, WeightedTimeControl};
     use std::collections::BTreeMap;
 
     const RELAY: &str = "wss://relay.example.com";
@@ -383,8 +384,7 @@ mod tests {
             ],
             accept_any_time_control: false,
             accept_imposed_variant: false,
-            max_live: 1,
-            max_correspondence: 4,
+            max_concurrent: MaxConcurrent::default(),
             strength: StrengthConfig {
                 time_ms: 1000,
                 depth: 4,
@@ -642,7 +642,7 @@ mod tests {
         // (the mirror rule) and the seat.
         assert_eq!(plan.their_variant, plan.my_variant);
         assert!(plan.my_variant == "ogi" || plan.my_variant == "chess");
-        assert!(!plan.correspondence);
+        assert_eq!(plan.cadence, Cadence::Blitz); // the fixture's 5 + 3
         assert_eq!(plan.rematch, None);
         assert_eq!(plan.challenger, human.public_key());
     }
@@ -918,18 +918,95 @@ mod tests {
     }
 
     #[test]
-    fn correspondence_paces_are_recognized() {
-        assert!(is_correspondence(&[vec![
-            "0".into(),
-            "259200".into(),
-            "1".into()
-        ]]));
-        assert!(is_correspondence(&[vec!["86400".into()]]));
-        assert!(!is_correspondence(&[vec!["300".into(), "3".into()]]));
-        assert!(!is_correspondence(&[vec![
-            "0".into(),
-            "10".into(),
-            "1".into()
-        ]]));
+    fn a_courted_entry_carries_its_cadence() {
+        let (me, human, mm) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate().public_key(),
+        );
+        let entry = open_challenge(
+            &human,
+            &mm,
+            &rules(),
+            vec![tag("variant", &["self", "ogi"])],
+        );
+        let candidate = evaluate_open_challenge(
+            &entry,
+            &me.public_key(),
+            RELAY,
+            &mm,
+            &rules(),
+            "sanki",
+            &play(),
+            2_000_000_000,
+            60,
+        )
+        .unwrap();
+        assert_eq!(candidate.cadence, Cadence::Byoyomi);
+    }
+
+    #[test]
+    fn a_direct_challenge_without_a_cadence_is_refused_even_at_any_time_control() {
+        // `accept_any_time_control` relaxes the persona's gate, not the
+        // format: a malformed first period has no cadence and no cap.
+        let (me, human) = (Keys::generate(), Keys::generate());
+        let mut rng = SplitMix64::new(1);
+        let any = PlayConfig {
+            accept_any_time_control: true,
+            ..play()
+        };
+        let their_variant = human.public_key().to_hex();
+        let tags_of = |rows: &[&[&str]]| -> Vec<Tag> {
+            let mut v = vec![
+                p_role(&me.public_key(), "opponent"),
+                e_marked(&rules(), "rules"),
+                tag("timing_relay", &[RELAY]),
+                tag("game", &["sanki"]),
+                tag("accept_until", &["2000000300"]),
+                tag("nonce", &["0", "0"]),
+                tag("variant", &[their_variant.as_str(), "ogi"]),
+            ];
+            for row in rows {
+                v.push(tag("time_control", row));
+            }
+            v
+        };
+        let sign = |t: Vec<Tag>| {
+            EventBuilder::new(Kind::Custom(3420), "")
+                .tags(t)
+                .finalize(&human)
+                .expect("sign")
+        };
+        let odd = sign(tags_of(&[&["7200"]]));
+        let plan = evaluate_direct_challenge(
+            &odd,
+            &me.public_key(),
+            RELAY,
+            &rules(),
+            "sanki",
+            &any,
+            2_000_000_000,
+            60,
+            &mut rng,
+        )
+        .unwrap();
+        // ADR-0039: a two-hour bank is a live rapid game, not correspondence.
+        assert_eq!(plan.cadence, Cadence::Rapid);
+        assert!(!plan.cadence.is_correspondence());
+        let malformed = sign(tags_of(&[&["0", "10"]]));
+        assert_eq!(
+            evaluate_direct_challenge(
+                &malformed,
+                &me.public_key(),
+                RELAY,
+                &rules(),
+                "sanki",
+                &any,
+                2_000_000_000,
+                60,
+                &mut rng,
+            ),
+            Err("no cadence (malformed time control)")
+        );
     }
 }

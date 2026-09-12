@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
+use crate::cadence::Cadence;
+
 /// The whole fleet file: one global section plus one `[[bot]]` per identity.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,12 +122,11 @@ pub struct PlayConfig {
     /// must still be one the persona plays (`variants` weight > 0).
     #[serde(default)]
     pub accept_imposed_variant: bool,
-    /// Concurrent live games (per bot).
-    #[serde(default = "default_max_live")]
-    pub max_live: u32,
-    /// Concurrent correspondence games (per bot).
-    #[serde(default = "default_max_correspondence")]
-    pub max_correspondence: u32,
+    /// Concurrent games per cadence family (per bot) — `[bot.play.max_concurrent]`
+    /// (ADR-0014 §8 as amended by ADR-0039 §6). An omitted family takes its
+    /// default; `0` disables a family outright.
+    #[serde(default)]
+    pub max_concurrent: MaxConcurrent,
     /// Search parameters for `sashite-sanki-player`.
     pub strength: StrengthConfig,
     /// Sustained centi-eval below which the bot resigns (§6.6). Negative.
@@ -145,11 +146,56 @@ pub struct PlayConfig {
     pub timeout_courtesy_secs: u64,
 }
 
-const fn default_max_live() -> u32 {
+const fn default_cap_live() -> u32 {
     1
 }
-const fn default_max_correspondence() -> u32 {
+const fn default_cap_correspondence() -> u32 {
     4
+}
+
+/// The per-cadence concurrency caps (ADR-0039 §6): one slot per live family
+/// and four correspondence games by default. The old `max_live` /
+/// `max_correspondence` keys are rejected by `deny_unknown_fields`, not
+/// silently honoured.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaxConcurrent {
+    /// Concurrent byōyomi games.
+    #[serde(default = "default_cap_live")]
+    pub byoyomi: u32,
+    /// Concurrent blitz games.
+    #[serde(default = "default_cap_live")]
+    pub blitz: u32,
+    /// Concurrent rapid games.
+    #[serde(default = "default_cap_live")]
+    pub rapid: u32,
+    /// Concurrent correspondence games.
+    #[serde(default = "default_cap_correspondence")]
+    pub correspondence: u32,
+}
+
+impl Default for MaxConcurrent {
+    fn default() -> Self {
+        Self {
+            byoyomi: default_cap_live(),
+            blitz: default_cap_live(),
+            rapid: default_cap_live(),
+            correspondence: default_cap_correspondence(),
+        }
+    }
+}
+
+impl MaxConcurrent {
+    /// The cap of one family.
+    #[must_use]
+    pub const fn cap(&self, cadence: Cadence) -> u32 {
+        match cadence {
+            Cadence::Byoyomi => self.byoyomi,
+            Cadence::Blitz => self.blitz,
+            Cadence::Rapid => self.rapid,
+            Cadence::Correspondence => self.correspondence,
+        }
+    }
 }
 const fn default_resign_threshold() -> i32 {
     -700
@@ -291,6 +337,16 @@ fn validate(config: &FleetConfig) -> Result<()> {
                     bail!("bot {}: a malformed time_control row", bot.name);
                 }
             }
+            // The first period must classify (kind 3420 §Match-terms tags,
+            // *Cadence — Sanki* §Well-formedness): a persona never offers, nor
+            // caps under, a cadence that does not exist.
+            if Cadence::of_rows(&preference.spec).is_none() {
+                bail!(
+                    "bot {}: a time_control the cadence classifier rejects: {:?}",
+                    bot.name,
+                    preference.spec
+                );
+            }
         }
         if bot.play.resign_threshold >= 0 {
             bail!("bot {}: resign_threshold must be negative", bot.name);
@@ -351,12 +407,16 @@ nsec_env = "PLAYER_NSEC_KAORU"
     { spec = [["0", "10", "1"]],     weight = 0.7 },
     { spec = [["300", "3"]],         weight = 0.3 },
   ]
-  max_live            = 1
-  max_correspondence  = 4
   strength            = { time_ms = 2000, depth = 8 }
   resign_threshold    = -700
   draw_offer          = "balanced"
   challenge_policy    = "everyone"
+
+    [bot.play.max_concurrent]
+    byoyomi        = 1
+    blitz          = 1
+    rapid          = 1
+    correspondence = 4
 
   [bot.schedule]
   timezone = "Asia/Tokyo"
@@ -384,6 +444,43 @@ nsec_env = "PLAYER_NSEC_KAORU"
         assert_eq!(bot.play.time_controls[0].spec, vec![vec!["0", "10", "1"]]);
         assert_eq!(bot.play.draw_offer, DrawOffer::Balanced);
         assert!((bot.schedule.presence_probability - 0.85).abs() < 1e-9);
+        assert_eq!(bot.play.max_concurrent.cap(Cadence::Rapid), 1);
+        assert_eq!(bot.play.max_concurrent.cap(Cadence::Correspondence), 4);
+    }
+
+    #[test]
+    fn caps_default_per_family_and_reject_the_old_keys() {
+        let contents = EXAMPLE.replace(r#"distribution = "lognormal", "#, "");
+        // The whole table omitted: the defaults.
+        let without = contents.replace(
+            "    [bot.play.max_concurrent]\n    byoyomi        = 1\n    blitz          = 1\n    rapid          = 1\n    correspondence = 4\n",
+            "",
+        );
+        assert!(without.contains("[bot.schedule]"));
+        assert!(!without.contains("[bot.play.max_concurrent]"));
+        let config = parse(&without).unwrap();
+        let caps = config.bots[0].play.max_concurrent;
+        assert_eq!(
+            (caps.byoyomi, caps.blitz, caps.rapid, caps.correspondence),
+            (1, 1, 1, 4)
+        );
+        // One family omitted takes its default; zero disables it.
+        let partial = contents
+            .replace("    rapid          = 1\n", "")
+            .replace("    blitz          = 1\n", "    blitz          = 0\n");
+        let config = parse(&partial).unwrap();
+        let caps = config.bots[0].play.max_concurrent;
+        assert_eq!((caps.blitz, caps.rapid), (0, 1));
+        // ADR-0039 §6: the removed keys fail loudly.
+        let old = contents.replace(
+            "  strength            = { time_ms = 2000, depth = 8 }",
+            "  max_live = 1\n  strength            = { time_ms = 2000, depth = 8 }",
+        );
+        assert!(parse(&old).is_err());
+        // A persona cadence the classifier rejects (duration 0 outside the
+        // per-move form) fails at start-up.
+        let malformed = contents.replace(r#"[["0", "10", "1"]]"#, r#"[["0", "10"]]"#);
+        assert!(parse(&malformed).is_err());
     }
 
     #[test]
