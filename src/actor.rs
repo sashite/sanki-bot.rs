@@ -21,6 +21,7 @@ use nostr_sdk::prelude::*;
 
 use sashite_sanki_player::{choose, Context as PlayerContext, Limits, Move, Position, Strength};
 
+use crate::admission;
 use crate::cadence::Cadence;
 use crate::chain::{self, predicted_verdict, session_view, SessionView};
 use crate::conclusion::{self, Conclude};
@@ -34,6 +35,7 @@ use crate::publish::{publish_self_timed, Pow, RelayClock};
 use crate::rematch;
 use crate::rules::LoadedRuleSystem;
 use crate::session::{self, Events, Seat, SessionTerms, Timing};
+use crate::slots::Slots;
 use crate::tags;
 
 const OPEN_CHALLENGE_KIND: u16 = 3418;
@@ -62,19 +64,21 @@ const SIGMA_CORRESPONDENCE_SECS: u64 = 60;
 const COURT_MARGIN_SECS: u64 = 30;
 const OWN_ENTRY_WINDOW_SECS: u64 = 180;
 
-/// The `accept_until` window of a rematch challenge (§9). The bot keeps ONE
-/// LIVE challenge per concluded game, so this is the opponent's window to
-/// accept — sized for a human lingering on the game-over screen.
-const REMATCH_WINDOW_SECS: u64 = 900;
+/// The `accept_until` window of a rematch challenge — the one published
+/// rematch window of every Sashité client, `W` (ADR-0040 §4): the app's
+/// `rematch-window.ts` publishes the same sixty seconds. It is also how long
+/// a concluded game's cadence slot stays with the pair (`slots`, §3): long
+/// enough for the Rematch button, and for nobody else.
+const REMATCH_WINDOW_SECS: u64 = 60;
 
 /// How far back the self-subscription replays when the bot starts. The
 /// subscription carries *live* traffic; the state a restart needs is rebuilt by
 /// the explicit recovery fetches. The window is not zero because `created_at`
-/// is the publisher's clock, not ours: the longest-lived thing that arrives
-/// here and still deserves acting on is a rematch challenge inside its
-/// acceptance window, and three of those windows absorb both the skew and a
-/// slow start.
-const SELF_REPLAY_LOOKBACK_SECS: u64 = 3 * REMATCH_WINDOW_SECS;
+/// is the publisher's clock, not ours, and because a Direct Challenge sent
+/// while the bot was down may still be inside its acceptance window: three
+/// quarters of an hour absorb the skew, a slow start, and a challenge a
+/// player sent a little before the restart.
+const SELF_REPLAY_LOOKBACK_SECS: u64 = 45 * 60;
 
 /// How far back the session recovery looks for Game Sessions naming the bot
 /// (§9): a correspondence game outlives a restart, a season-old one does not.
@@ -85,6 +89,12 @@ const RECOVERY_LOOKBACK_SECS: u64 = 30 * 86_400;
 /// founding window is a minute or two (kind 3419 §Lifecycle tags), so an
 /// older one has lapsed.
 const PAIRING_RECOVERY_LOOKBACK_SECS: u64 = 600;
+
+/// How far back a rematch chain is walked to its first founding (the
+/// registry's `max_rematch_hops`): the premium re-check at rematch asks about
+/// the ORIGINAL imposer of an asymmetric configuration, which a rematch
+/// challenge inherits rather than restates (*Premium* §1.3).
+const MAX_REMATCH_HOPS: usize = 64;
 
 /// Grace before re-sending an already-published Ply or Conclusion whose echo
 /// has not come back (three coarse ticks): long enough for any realistic
@@ -213,11 +223,12 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     // proactively (on the verdict) or in reply to the opponent's; a lapsed
     // one may be renewed when the opponent proposes after it expired.
     let mut offered_rematches: BTreeMap<EventId, u64> = BTreeMap::new();
-    // Our own live pool entries' `accept_until`, ONE PER CADENCE (ADR-0039
-    // §7): one entry at a time per family, so N compatible strangers entering
-    // together at one cadence do not become N sessions, while a byōyomi
-    // entry never blocks a blitz one.
-    let own_entries: Arc<PoolLocks> = Arc::new(PoolLocks::default());
+    // The cadence slots (ADR-0040 §3): every founding — a pool entry, an
+    // acceptance, the bot's own rematch proposal — is admitted through this
+    // automaton, which is what keeps the bot at its cap per cadence and a
+    // concluded game's slot with the pair for the rematch window. Behind a
+    // mutex so the publish tasks can release a commitment they failed to make.
+    let slots: Arc<Mutex<Slots>> = Arc::new(Mutex::new(Slots::default()));
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -261,7 +272,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
         .context("subscribing to the pool")?;
 
     // Stateless restart (§9): rebuild active sessions from relay replay.
-    if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, me).await {
+    if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, &slots, me).await {
         tracing::warn!(error = %error, "session recovery incomplete");
     }
     // …and rebuild what we have already challenged, for the same reason: the
@@ -289,9 +300,16 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
         Ok(pairings) => {
             for pairing in pairings {
                 if founded_pairings.insert(pairing.id) {
-                    if let Err(reason) =
-                        consider_pairing(&client, &ctx, &relay_clock, &mut sessions, me, &pairing)
-                            .await
+                    if let Err(reason) = consider_pairing(
+                        &client,
+                        &ctx,
+                        &relay_clock,
+                        &mut sessions,
+                        &slots,
+                        me,
+                        &pairing,
+                    )
+                    .await
                     {
                         tracing::debug!(pairing = %pairing.id, reason, "recovered pairing not founded");
                     }
@@ -314,7 +332,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
             }
             _ = tick.tick() => {
                 service_all(
-                    &client, &ctx, &relay_clock, &mut sessions, &mut rng, me,
+                    &client, &ctx, &relay_clock, &mut sessions, &slots, &mut rng, me,
                     &mut starred_today, &mut offered_rematches, None,
                 )
                 .await;
@@ -324,7 +342,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut considered_challenges, &mut founded_pairings,
-                        &mut offered_rematches, &own_entries, &mut starred_today,
+                        &mut offered_rematches, &slots, &mut starred_today,
                         &mut rng, me, *event,
                     ).await;
                 }
@@ -399,6 +417,7 @@ async fn recover_sessions(
     client: &Client,
     ctx: &BotContext,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
+    slots: &Arc<Mutex<Slots>>,
     me: PublicKey,
 ) -> Result<()> {
     let game_sessions = fetch_many(
@@ -414,7 +433,7 @@ async fn recover_sessions(
     )
     .await?;
     for session in game_sessions {
-        if let Err(error) = track_session(client, ctx, sessions, me, session).await {
+        if let Err(error) = track_session(client, ctx, sessions, slots, me, session).await {
             tracing::debug!(error = %error, "skipping unresumable session");
         }
     }
@@ -575,6 +594,7 @@ async fn track_session(
     client: &Client,
     ctx: &BotContext,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
+    slots: &Arc<Mutex<Slots>>,
     me: PublicKey,
     session: Event,
 ) -> Result<()> {
@@ -655,10 +675,19 @@ async fn track_session(
     for id in stale {
         if let Some(meta) = sessions.remove(&id) {
             ctx.ledger.session_changed(&me, &meta.opponent, false);
+            lock_slots(slots).drop_session(&id);
             tracing::info!(session = %id, canonical = %canonical.id, "superseded by the canonical Game Session of its slot");
         }
     }
     ctx.ledger.session_changed(&me, &opponent, true);
+    // Committed → Playing (ADR-0040 §3): the commitments this founding
+    // consumes are the founding itself and, on a Pairing, the two entries it
+    // paired (ours was keyed by the entry it mirrored); a rematch consumes the
+    // concluded session's cooling hold as well.
+    let mut keys = vec![founding.id];
+    keys.extend(tags::events_with_marker(&founding, "open_challenge"));
+    let rematch_of = (slot != founding.id).then_some(slot);
+    lock_slots(slots).play(cadence, canonical.id, &keys, rematch_of.as_ref());
     tracing::info!(session = %canonical.id, %opponent, seat = my_seat.name(), cadence = cadence.token(), "tracking session");
     sessions.insert(
         canonical.id,
@@ -693,7 +722,7 @@ async fn handle_event(
     considered_challenges: &mut BTreeSet<EventId>,
     founded_pairings: &mut BTreeSet<EventId>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
-    own_entries: &Arc<PoolLocks>,
+    slots: &Arc<Mutex<Slots>>,
     starred_today: &mut u64,
     rng: &mut SplitMix64,
     me: PublicKey,
@@ -702,17 +731,8 @@ async fn handle_event(
     match event.kind {
         Kind::Custom(OPEN_CHALLENGE_KIND) => {
             if courted_entries.insert(event.id) {
-                if let Err(reason) = court_pool_entry(
-                    client,
-                    ctx,
-                    relay_clock,
-                    sessions,
-                    own_entries,
-                    rng,
-                    me,
-                    &event,
-                )
-                .await
+                if let Err(reason) =
+                    court_pool_entry(client, ctx, relay_clock, slots, rng, me, &event).await
                 {
                     tracing::debug!(entry = %event.id, reason, "pool entry not courted");
                 }
@@ -721,7 +741,7 @@ async fn handle_event(
         Kind::Custom(PAIRING_KIND) => {
             if founded_pairings.insert(event.id) {
                 if let Err(reason) =
-                    consider_pairing(client, ctx, relay_clock, sessions, me, &event).await
+                    consider_pairing(client, ctx, relay_clock, sessions, slots, me, &event).await
                 {
                     tracing::debug!(pairing = %event.id, reason, "pairing not founded");
                 }
@@ -734,6 +754,7 @@ async fn handle_event(
                     ctx,
                     relay_clock,
                     sessions,
+                    slots,
                     offered_rematches,
                     rng,
                     me,
@@ -746,7 +767,7 @@ async fn handle_event(
             }
         }
         Kind::Custom(GAME_SESSION_KIND) => {
-            if let Err(error) = track_session(client, ctx, sessions, me, event).await {
+            if let Err(error) = track_session(client, ctx, sessions, slots, me, event).await {
                 tracing::debug!(error = %error, "session not tracked");
             }
         }
@@ -764,6 +785,7 @@ async fn handle_event(
                         ctx,
                         relay_clock,
                         sessions,
+                        slots,
                         rng,
                         me,
                         starred_today,
@@ -779,29 +801,38 @@ async fn handle_event(
 }
 
 /// Terminate a tracked session on its canonical Conclusion: release the
-/// fleet budget slot, then (if the persona is willing) propose a rematch.
+/// fleet budget slot, move its cadence hold to `Cooling` — the slot stays
+/// with the pair for the rematch window (ADR-0040 §3) — then (if the persona
+/// is willing) propose a rematch.
 #[allow(clippy::too_many_arguments)]
 async fn terminate_session(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
+    slots: &Arc<Mutex<Slots>>,
     me: PublicKey,
     meta: &SessionMeta,
     conclusion: &EventId,
     concluded_at: u64,
     offered: &mut BTreeMap<EventId, u64>,
 ) {
-    // A game that ended long ago — re-observed after a restart — is not
-    // proposed a rematch of: the offer is for a player still at the board.
+    ctx.ledger.session_changed(&me, &meta.opponent, false);
+    // Playing → Cooling(t_end + W). A game that ended long ago — re-observed
+    // after a restart — cools into the past and expires at once.
+    lock_slots(slots).cool(
+        &meta.session.id,
+        concluded_at.saturating_add(REMATCH_WINDOW_SECS),
+    );
+    // The offer is for a player still at the board.
     if relay_clock.now_secs().saturating_sub(concluded_at) > REMATCH_WINDOW_SECS {
-        ctx.ledger.session_changed(&me, &meta.opponent, false);
         return;
     }
-    ctx.ledger.session_changed(&me, &meta.opponent, false);
     maybe_offer_rematch(
         client,
         ctx,
         relay_clock,
+        slots,
+        &meta.session,
         &meta.terms,
         conclusion,
         false,
@@ -813,15 +844,20 @@ async fn terminate_session(
 /// Challenge the opponent to a rematch of `concluded`, unless our own
 /// challenge for this game is still LIVE, the persona is unwilling (a
 /// per-game decision the `always` flag overrides — reciprocating a human's
-/// explicit proposal is unconditional), or — against a sibling bot — the
-/// bot-vs-bot budget is spent. Shared by both triggers (the proactive
-/// challenge on the verdict and the reply to an incoming one), which is why
-/// the one-live-challenge-per-game guard lives here. Best-effort: a failure
-/// is logged, never propagated.
+/// explicit proposal is unconditional), the concluded game's cadence slot is
+/// no longer cooling (ADR-0040 §3: a proposal is a founding the bot commits
+/// to, admitted like one — through the hold the game left), or — against a
+/// sibling bot — the bot-vs-bot budget is spent. Shared by both triggers
+/// (the proactive challenge on the verdict and the reply to an incoming
+/// one), which is why the one-live-challenge-per-game guard lives here.
+/// Best-effort: a failure is logged, never propagated.
+#[allow(clippy::too_many_arguments)]
 async fn maybe_offer_rematch(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
+    slots: &Arc<Mutex<Slots>>,
+    concluded_session: &Event,
     concluded: &SessionTerms,
     conclusion: &EventId,
     always: bool,
@@ -838,6 +874,10 @@ async fn maybe_offer_rematch(
     {
         return;
     }
+    if !lock_slots(slots).is_cooling(&concluded.id, relay_clock.now_secs()) {
+        tracing::debug!(rematch_of = %concluded.id, "rematch not proposed: the slot is no longer with the pair");
+        return;
+    }
     if !always
         && !rematch::wants_rematch(
             ctx.bot_seed,
@@ -850,6 +890,22 @@ async fn maybe_offer_rematch(
     if ctx.ledger.is_member(&opponent) && !ctx.ledger.may_court_sibling() {
         tracing::debug!(against = %opponent, "rematch not proposed: bot-vs-bot budget spent");
         return;
+    }
+    // The premium re-check on the proposing side (*Premium* §1.3): a rematch
+    // restates the concluded terms, so an asymmetric imposition is proposed
+    // again only while its original imposer is premium — fail-closed.
+    match original_imposer(client, concluded_session, concluded).await {
+        Ok(None) => {}
+        Ok(Some(imposer)) => {
+            if !admission::is_premium(ctx.fleet.admission_url.as_deref(), &imposer).await {
+                tracing::debug!(rematch_of = %concluded.id, "rematch not proposed: the original imposer is not premium");
+                return;
+            }
+        }
+        Err(reason) => {
+            tracing::debug!(rematch_of = %concluded.id, reason, "rematch not proposed: the chain could not be read");
+            return;
+        }
     }
     let terms = concluded.clone();
     let conclusion = *conclusion;
@@ -875,6 +931,8 @@ async fn maybe_offer_rematch(
                 .and_then(|value| value.parse().ok())
                 .unwrap_or_else(|| now.saturating_add(REMATCH_WINDOW_SECS));
             offered.insert(concluded.id, deadline);
+            // Our challenge lives until `deadline`: so does the hold.
+            lock_slots(slots).extend_cooling(&concluded.id, deadline);
             tracing::info!(
                 rematch_of = %concluded.id,
                 against = %opponent,
@@ -894,8 +952,7 @@ async fn court_pool_entry(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &Arc<RelayClock>,
-    sessions: &BTreeMap<EventId, SessionMeta>,
-    own_entries: &Arc<PoolLocks>,
+    slots: &Arc<Mutex<Slots>>,
     rng: &mut SplitMix64,
     me: PublicKey,
     entry: &Event,
@@ -914,15 +971,18 @@ async fn court_pool_entry(
         &ctx.config.play,
         now,
         COURT_MARGIN_SECS,
+        rng,
     )?;
-    // The per-cadence cap, and one own entry at a time PER CADENCE: a
-    // Pairing founds a session the bot must then serve, under that cap.
+    // Admission through the cadence slots (ADR-0040 §3): a Pairing founds a
+    // session the bot must then serve, under the family's cap — and one own
+    // entry at a time per cadence (ADR-0039 §7).
     let cadence = candidate.cadence;
-    if load_of(sessions, cadence) >= ctx.config.play.max_concurrent.cap(cadence) {
-        return Err("cap reached for this cadence");
-    }
-    if own_entries.until(cadence) > now {
-        return Err("our own entry at this cadence is still live");
+    {
+        let mut held = lock_slots(slots);
+        if held.pool_committed(cadence, now) {
+            return Err("our own entry at this cadence is still live");
+        }
+        held.admit_fresh(cadence, ctx.config.play.max_concurrent.cap(cadence), now)?;
     }
     if ctx.ledger.is_member(&candidate.challenger) && !ctx.ledger.may_court_sibling() {
         return Err("bot-vs-bot budget spent");
@@ -934,6 +994,18 @@ async fn court_pool_entry(
     }
     if candidate.needs_following_check && !follows(client, &candidate.challenger, &me).await {
         return Err("their following filter excludes us (fail-closed)");
+    }
+    // A FULLY OPEN entry is one every member of the fleet could answer: the
+    // ledger hands it to the first that claims it — last, once this member
+    // has actually cleared every gate, so a sibling with a free slot is never
+    // locked out by one without — and a human who said "anything" meets one
+    // bot, not three racing for them (ADR-0040 §2).
+    if candidate.open
+        && !ctx
+            .ledger
+            .claim_open_entry(entry.id, me, candidate.accept_until)
+    {
+        return Err("open entry claimed by a sibling");
     }
 
     // Persona reaction delay (bounded by the entry's life) — then the entry,
@@ -948,16 +1020,21 @@ async fn court_pool_entry(
             .saturating_sub(COURT_MARGIN_SECS),
     )
     .min(30);
-    own_entries.hold(
+    // Committed, keyed by the entry we mirror (the Pairing names it), until
+    // our own entry's window closes.
+    lock_slots(slots).commit(
         cadence,
+        entry.id,
         now.saturating_add(delay)
             .saturating_add(OWN_ENTRY_WINDOW_SECS),
+        true,
     );
     let client = client.clone();
     let keys = ctx.keys.clone();
     let relay_clock = Arc::clone(relay_clock);
     let ledger = Arc::clone(&ctx.ledger);
-    let own_entries = Arc::clone(own_entries);
+    let slots = Arc::clone(slots);
+    let key = entry.id;
     let pow = Pow::Mined(ctx.fleet.pow_difficulty);
     let variant = candidate.variant.clone();
     let mirror = candidate.mirror;
@@ -1013,12 +1090,15 @@ async fn court_pool_entry(
         )
         .await;
         match result {
-            Ok(_) => {
+            Ok(own_entry) => {
+                // The commitment now wears our entry's own id — the one any
+                // Pairing that concerns it names, whoever it is paired with.
+                lock_slots(&slots).rekey(&key, own_entry.id);
                 ledger.pool_presence(me, true);
-                tracing::info!(%against, "entered the pool (reactive)");
+                tracing::info!(%against, entry = %own_entry.id, "entered the pool (reactive)");
             }
             Err(error) => {
-                own_entries.release(cadence);
+                lock_slots(&slots).release(&key);
                 tracing::warn!(error = %error, "pool entry publish failed");
             }
         }
@@ -1026,52 +1106,13 @@ async fn court_pool_entry(
     Ok(())
 }
 
-/// The load of one cadence family: how many tracked sessions it holds (the
-/// per-family caps, ADR-0039 §6).
-fn load_of(sessions: &BTreeMap<EventId, SessionMeta>, cadence: Cadence) -> u32 {
-    sessions
-        .values()
-        .filter(|meta| meta.cadence == cadence)
-        .fold(0_u32, |n, _| n.saturating_add(1))
-}
-
-/// The pool's one-entry lock, per cadence (ADR-0039 §7): the `accept_until`
-/// of the bot's own live entry in each family, `0` when none. Shared with the
-/// publish task, which releases the lock on a failed publish.
-#[derive(Debug, Default)]
-struct PoolLocks {
-    byoyomi: std::sync::atomic::AtomicU64,
-    blitz: std::sync::atomic::AtomicU64,
-    rapid: std::sync::atomic::AtomicU64,
-    correspondence: std::sync::atomic::AtomicU64,
-}
-
-impl PoolLocks {
-    const fn slot(&self, cadence: Cadence) -> &std::sync::atomic::AtomicU64 {
-        match cadence {
-            Cadence::Byoyomi => &self.byoyomi,
-            Cadence::Blitz => &self.blitz,
-            Cadence::Rapid => &self.rapid,
-            Cadence::Correspondence => &self.correspondence,
-        }
-    }
-
-    /// The family's live entry deadline (unix seconds), `0` when none.
-    fn until(&self, cadence: Cadence) -> u64 {
-        self.slot(cadence)
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Hold the family until `until`.
-    fn hold(&self, cadence: Cadence, until: u64) {
-        self.slot(cadence)
-            .store(until, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Release the family (a failed publish).
-    fn release(&self, cadence: Cadence) {
-        self.hold(cadence, 0);
-    }
+/// The cadence slots, locked. A poisoned lock is recovered rather than
+/// propagated: the automaton's invariants hold hold-by-hold, and a panic in
+/// another task must not take the slots — and the bot — down with it.
+fn lock_slots(slots: &Arc<Mutex<Slots>>) -> std::sync::MutexGuard<'_, Slots> {
+    slots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Found the session a Pairing naming us declares (kind 3422 §Signing party,
@@ -1082,6 +1123,7 @@ async fn consider_pairing(
     ctx: &BotContext,
     relay_clock: &RelayClock,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
+    slots: &Arc<Mutex<Slots>>,
     me: PublicKey,
     pairing: &Event,
 ) -> std::result::Result<(), &'static str> {
@@ -1103,6 +1145,15 @@ async fn consider_pairing(
         COURT_MARGIN_SECS.min(10),
     )?;
     ctx.ledger.pool_presence(me, false);
+    // The commitment behind the paired entry now lasts until the Pairing's
+    // founding deadline (ADR-0040 §3): a Pairing landing in the entry's last
+    // second cannot find the slot handed to someone else meanwhile.
+    if let Some(deadline) = founding_deadline(pairing) {
+        lock_slots(slots).extend_commitment(
+            &tags::events_with_marker(pairing, "open_challenge"),
+            deadline,
+        );
+    }
     // Do not publish if a canonical Game Session for the Pairing is already
     // observed (the other player founded first): track it instead.
     let existing = fetch_many(
@@ -1115,7 +1166,7 @@ async fn consider_pairing(
     .unwrap_or_default();
     if let Some((canonical, _)) = founding::canonical_session(existing.iter(), pairing) {
         let canonical = canonical.clone();
-        if let Err(error) = track_session(client, ctx, sessions, me, canonical).await {
+        if let Err(error) = track_session(client, ctx, sessions, slots, me, canonical).await {
             tracing::debug!(error = %error, "the existing Game Session is not trackable");
         }
         return Err("already founded by the other player");
@@ -1127,7 +1178,7 @@ async fn consider_pairing(
             "publish failed"
         })?;
     tracing::info!(pairing = %pairing.id, session = %session.id, "founded the session on the Pairing");
-    if let Err(error) = track_session(client, ctx, sessions, me, session).await {
+    if let Err(error) = track_session(client, ctx, sessions, slots, me, session).await {
         tracing::debug!(error = %error, "our Game Session is not tracked yet");
     }
     Ok(())
@@ -1162,6 +1213,7 @@ async fn consider_direct_challenge(
     ctx: &BotContext,
     relay_clock: &Arc<RelayClock>,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
+    slots: &Arc<Mutex<Slots>>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     rng: &mut SplitMix64,
     me: PublicKey,
@@ -1198,9 +1250,30 @@ async fn consider_direct_challenge(
             return Err("rematch declined (persona)");
         }
     }
-    // The per-cadence cap.
-    if load_of(sessions, plan.cadence) >= ctx.config.play.max_concurrent.cap(plan.cadence) {
-        return Err("cap reached for this cadence");
+    // Admission through the cadence slots (ADR-0040 §3): a fresh challenge
+    // needs a free hold; a rematch goes through the cooling hold its
+    // concluded game left — which its own life extends, so a challenge
+    // published in the window's last second is honoured whole.
+    {
+        let cap = ctx.config.play.max_concurrent.cap(plan.cadence);
+        let mut held = lock_slots(slots);
+        match plan.rematch {
+            Some(refs) => {
+                held.extend_cooling(&refs.concluded, plan.accept_until);
+                held.admit_rematch(plan.cadence, &refs.concluded, cap, now)?;
+            }
+            None => held.admit_fresh(plan.cadence, cap, now)?,
+        }
+    }
+    // An ASYMMETRIC imposition of our variant is the premium-only form: honoured
+    // for a premium challenger only, asked of the admission service, fail-closed
+    // (*Premium* §1.3; ADR-0040 §2) — after the local gates, so a challenge
+    // with no slot to be admitted under costs no request. The free forms never
+    // reach here.
+    if plan.premium_imposition
+        && !admission::is_premium(ctx.fleet.admission_url.as_deref(), &plan.challenger).await
+    {
+        return Err("asymmetric imposition by a challenger who is not premium (fail-closed)");
     }
     // Acceptance timing by pace (resolved question 5): live only while
     // present; correspondence at any hour after a credible delay.
@@ -1230,7 +1303,7 @@ async fn consider_direct_challenge(
     .unwrap_or_default();
     if let Some((accepted, _)) = founding::canonical_session(existing.iter(), challenge) {
         let accepted = accepted.clone();
-        if let Err(error) = track_session(client, ctx, sessions, me, accepted).await {
+        if let Err(error) = track_session(client, ctx, sessions, slots, me, accepted).await {
             tracing::debug!(error = %error, "the existing acceptance is not trackable");
         }
         return Err("already accepted");
@@ -1245,6 +1318,11 @@ async fn consider_direct_challenge(
         // Accepting theirs supersedes proposing ours.
         offered_rematches.insert(refs.concluded, u64::MAX);
     }
+    // Committed, keyed by the challenge, until its acceptance window closes:
+    // the Game Session is published after the persona's reflection, and the
+    // slot must be held meanwhile (a rematch keeps its cooling hold beside
+    // this one; the tracked session consumes both).
+    lock_slots(slots).commit(plan.cadence, challenge.id, plan.accept_until, false);
     let delay = crate::persona::think_seconds(
         &ctx.config.tempo.think,
         rng,
@@ -1260,6 +1338,7 @@ async fn consider_direct_challenge(
     let challenge_id = challenge.id;
     let challenger = plan.challenger;
     let rematch = plan.rematch.is_some();
+    let slots = Arc::clone(slots);
     tokio::spawn(async move {
         tokio::time::sleep(StdDuration::from_secs(delay)).await;
         let result = publish_self_timed(
@@ -1279,10 +1358,71 @@ async fn consider_direct_challenge(
                 rematch,
                 "accepted a direct challenge by founding the session"
             ),
-            Err(error) => tracing::warn!(error = %error, "acceptance publish failed"),
+            Err(error) => {
+                lock_slots(&slots).release(&challenge_id);
+                tracing::warn!(error = %error, "acceptance publish failed");
+            }
         }
     });
     Ok(())
+}
+
+/// The player who **asymmetrically** imposed the other's variant in the
+/// founding a concluded session's configuration descends from — a rematch
+/// chain is walked back to its first founding, bounded by
+/// `MAX_REMATCH_HOPS` — or `None` when the configuration is the mirror, or a
+/// cross-variant one reached by delegation (*Premium* §1.2: the free forms).
+/// `Err` when the chain cannot be read; the caller fails closed.
+async fn original_imposer(
+    client: &Client,
+    session: &Event,
+    terms: &SessionTerms,
+) -> std::result::Result<Option<PublicKey>, &'static str> {
+    if terms.first_variant == terms.second_variant {
+        return Ok(None);
+    }
+    let mut founding = fetch_founding(client, session)
+        .await
+        .map_err(|_| "the concluded session's founding is unavailable")?;
+    let mut hops = 0_usize;
+    while let [prior] = tags::events_with_marker(&founding, "rematch_of").as_slice() {
+        hops = hops.saturating_add(1);
+        if hops > MAX_REMATCH_HOPS {
+            return Err("rematch chain deeper than max_rematch_hops");
+        }
+        let prior = fetch_event(client, *prior)
+            .await
+            .map_err(|_| "a prior session of the rematch chain is unavailable")?;
+        founding = fetch_founding(client, &prior)
+            .await
+            .map_err(|_| "a prior founding of the rematch chain is unavailable")?;
+    }
+    if founding.kind == Kind::Custom(PAIRING_KIND) {
+        // The pool: an entry whose `opponent`-role variant differs from its
+        // own `self` (or has no `self`) imposed asymmetrically (kind 3418).
+        for entry_id in tags::events_with_marker(&founding, "open_challenge") {
+            let entry = fetch_event(client, entry_id)
+                .await
+                .map_err(|_| "a paired Open Challenge is unavailable")?;
+            let imposed = tags::role_variant(&entry, "opponent");
+            if imposed.is_some() && tags::role_variant(&entry, "self") != imposed {
+                return Ok(Some(entry.pubkey));
+            }
+        }
+        return Ok(None);
+    }
+    // The directed path: the challenger assigned the challenged player's
+    // variant, differently from their own or while leaving their own open.
+    let challenger = founding.pubkey;
+    let challenged = tags::pubkeys_with_role(&founding, "opponent");
+    let [challenged] = challenged.as_slice() else {
+        return Err("the first founding names no single challenged player");
+    };
+    let imposed = tags::variant_for(&founding, challenged);
+    if imposed.is_some() && tags::variant_for(&founding, &challenger) != imposed {
+        return Ok(Some(challenger));
+    }
+    Ok(None)
 }
 
 /// Verify a rematch challenge against the concluded session it names (kind
@@ -1316,6 +1456,17 @@ async fn verify_rematch(
         return Err("concluded_by has an invalid signature");
     }
     founding::rematch_terms_ok(challenge, &terms, &conclusion)?;
+    // The premium re-check at rematch (*Premium* §1.3): an asymmetrically
+    // imposed configuration is not perpetuated once its original imposer is
+    // no longer premium. The mirror form, and a cross-variant game reached by
+    // delegation, inherit without any check.
+    if let Some(imposer) = original_imposer(client, &concluded, &terms).await? {
+        if !admission::is_premium(ctx.fleet.admission_url.as_deref(), &imposer).await {
+            return Err(
+                "the original imposer of an asymmetric variant is not premium (fail-closed)",
+            );
+        }
+    }
     // One rematch per concluded session: a Game Session already founded on
     // any rematch challenge of it makes this one moot.
     let siblings = fetch_many(
@@ -1376,6 +1527,7 @@ async fn service_all(
     ctx: &BotContext,
     relay_clock: &RelayClock,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
+    slots: &Arc<Mutex<Slots>>,
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
@@ -1399,6 +1551,7 @@ async fn service_all(
                         client,
                         ctx,
                         relay_clock,
+                        slots,
                         me,
                         &meta,
                         &conclusion_id,

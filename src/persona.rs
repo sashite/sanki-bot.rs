@@ -66,6 +66,19 @@ pub fn parse_hhmm(value: &str) -> Option<u32> {
     hours.checked_mul(60)?.checked_add(minutes)
 }
 
+/// A window's end, `HH:MM` local, where `24:00` is also legal and means the
+/// end of the local day (ADR-0040 §5): a persona present around the clock
+/// writes `from = "00:00", to = "24:00"` and has no one-minute hole at
+/// 23:59 — the end is exclusive, so `to = "23:59"` would leave that minute
+/// absent.
+#[must_use]
+pub fn parse_hhmm_end(value: &str) -> Option<u32> {
+    if value == "24:00" {
+        return Some(24 * 60);
+    }
+    parse_hhmm(value)
+}
+
 /// A day's per-window jitter and the show-up decision, derived
 /// deterministically from `(bot_seed, local date)` — stable for the whole
 /// day, different across days (ADR-0014 §4: window edges randomized per
@@ -104,7 +117,7 @@ pub fn is_present(schedule: &ScheduleConfig, bot_seed: u64, now: DateTime<Utc>) 
         if !days.contains(&weekday) {
             continue;
         }
-        let (Some(from), Some(to)) = (parse_hhmm(&window.from), parse_hhmm(&window.to)) else {
+        let (Some(from), Some(to)) = (parse_hhmm(&window.from), parse_hhmm_end(&window.to)) else {
             continue;
         };
         // Per-window daily jitter: each edge shifts by up to ± jitter.
@@ -267,6 +280,32 @@ mod tests {
             let sample = think_seconds(&think, &mut rng, 5);
             assert!((1..=5).contains(&sample));
         }
+    }
+
+    #[test]
+    fn a_window_ending_at_24_00_covers_the_last_minute_of_the_day() {
+        let around_the_clock = ScheduleConfig {
+            timezone: "Europe/Paris".to_owned(),
+            windows: vec![WindowConfig {
+                days: "mon-sun".to_owned(),
+                from: "00:00".to_owned(),
+                to: "24:00".to_owned(),
+            }],
+            jitter_minutes: 0,
+            presence_probability: 1.0,
+        };
+        // 2026-07-20 23:59 Europe/Paris (CEST, UTC+2) == 21:59 UTC — the
+        // minute a `to = "23:59"` window leaves absent.
+        let last_minute = Utc.with_ymd_and_hms(2026, 7, 20, 21, 59, 30).unwrap();
+        assert!(is_present(&around_the_clock, 7, last_minute));
+        assert!(is_present(
+            &around_the_clock,
+            7,
+            Utc.with_ymd_and_hms(2026, 7, 20, 22, 0, 0).unwrap()
+        ));
+        assert_eq!(parse_hhmm_end("24:00"), Some(24 * 60));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm_end("24:01"), None);
     }
 
     #[test]

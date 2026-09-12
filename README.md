@@ -36,6 +36,10 @@ FLEET_CONFIG_PATH=~/sanki-e2e/fleet.local.toml cargo run --bin players
 Environment: `FLEET_CONFIG_PATH` (required), one `PLAYER_NSEC_*` per bot
 (named by each `[[bot]]`'s `nsec_env`; never logged), `RUST_LOG` (optional).
 
+The fleet file's optional `admission_url` names the admission service the
+premium checks ask (one GET, only on an asymmetric variant imposition or the
+rematch of one; absent, such impositions are refused without a request).
+
 The fleet file names the rule system (`fleet.rules`, the kind-`3417` event id
 — the same id the app, the matchmaker and the rater are configured with) and
 where its event and module are cached (`fleet.rules_cache_dir`, default
@@ -55,7 +59,11 @@ hold the module before entering a pool, challenging, founding or accepting.
   the content is the initial position the module prescribes.
 - **Accepts** a Direct Challenge (kind `3420`) addressed to it by publishing
   the Game Session — the acceptance IS the founding — supplying what the
-  challenge delegated (an open variant, an open seat). A rematch challenge is
+  challenge delegated (an open variant, an open seat), whenever it can play
+  its **own** variant; the challenger's is theirs, so a cross-variant game
+  by delegation is accepted, and an **asymmetric** imposition of the bot's
+  variant is honoured iff the challenger is premium, asked of the admission
+  service (`fleet.admission_url`, fail-closed — *Premium* §1.3, ADR-0040 §2). A rematch challenge is
   verified against the concluded session (both players, terms inherited,
   seats swapped, its `concluded_by` checked by the module) before it is
   accepted; a human's is answered unconditionally, a sibling bot's per the
@@ -81,12 +89,17 @@ hold the module before entering a pool, challenging, founding or accepting.
 ## Design notes
 
 See ADR-0014 for the full design, ADR-0033 and ADR-0034 for the arbiterless
-protocol and the module. Notable v1 choices: self-timed only, a single relay,
+protocol and the module, ADR-0039 for the cadence families and ADR-0040 for
+the slots, the direct-path variant rule and the Robotto roster. Notable v1 choices: self-timed only, a single relay,
 no premoves, no outbound fresh Direct Challenges, stateless restart from relay
 replay (sessions, rematch challenges and pending Pairings are recovered).
 Concurrency is capped **per cadence family** — `[bot.play.max_concurrent]`,
-one table of four (ADR-0039 §6) — and the pool's one-own-entry lock is per
-cadence too (§7); the family of a founding is read by the one classifier of
+one table of four (ADR-0039 §6) — through the **cadence slots** of ADR-0040
+§3 (`src/slots.rs`): every founding, the bot's own rematch proposal included,
+is admitted through a per-(bot, cadence) automaton — committed, playing,
+cooling — that keeps a concluded game's slot with the pair for the rematch
+window (`REMATCH_WINDOW_SECS = 60`, the app's number too) and with nobody
+else. The family of a founding is read by the one classifier of
 [Cadence — Sanki](https://github.com/sashite/web-specs.md/blob/main/nostr/support/cadence-sanki.md)
 (`src/cadence.rs`), pinned to the app's by the shared category-G vectors
 (`conformance/cadence.json`, vendored from `web-specs.md`).

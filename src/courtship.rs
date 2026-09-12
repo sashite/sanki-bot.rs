@@ -38,6 +38,10 @@ pub struct PoolCandidate {
     /// The entry's cadence family (*Cadence — Sanki*): the per-family cap
     /// and the per-cadence pool lock are indexed by it.
     pub cadence: Cadence,
+    /// The entry carried **no variant term** at all — the whole fleet could
+    /// answer it, so the async layer claims it in the ledger first: one
+    /// member courts it, not three (ADR-0040 §2).
+    pub open: bool,
     /// The entry's `accept_until` (unix seconds).
     pub accept_until: u64,
     /// Whether the entry carries a `following` filter — the async layer must
@@ -91,6 +95,7 @@ pub fn evaluate_open_challenge(
     play: &PlayConfig,
     now: u64,
     margin_secs: u64,
+    rng: &mut SplitMix64,
 ) -> Result<PoolCandidate, Skip> {
     if event.pubkey == *me {
         return Err("own entry");
@@ -133,6 +138,7 @@ pub fn evaluate_open_challenge(
     // must actually play the resolved variant.
     let their_self = tags::role_variant(event, "self");
     let their_opponent = tags::role_variant(event, "opponent");
+    let mut open = false;
     let (variant, mirror) = match (their_self, their_opponent) {
         (Some(own), Some(imposed)) if own != imposed => {
             if !play.accept_imposed_variant {
@@ -143,7 +149,13 @@ pub fn evaluate_open_challenge(
         (Some(own), _) => (own, true),
         (None, Some(imposed)) => (imposed, true),
         (None, None) => {
-            return Err("no variant term to mirror (persona draw is for spontaneous entries)")
+            // A FULLY OPEN entry — "anything" — is mirrored with the
+            // persona's own draw (ADR-0040 §2); the async layer claims it
+            // fleet-wide so one member answers it.
+            open = true;
+            let drawn = crate::persona::draw_weighted_key(&play.variants, rng)
+                .ok_or("no persona variant")?;
+            (drawn, true)
         }
     };
     if play.variants.get(variant).copied().unwrap_or(0.0) <= 0.0 {
@@ -169,6 +181,7 @@ pub fn evaluate_open_challenge(
         mirror,
         spec: rows,
         cadence,
+        open,
         accept_until,
         needs_following_check,
     })
@@ -208,6 +221,14 @@ pub struct AcceptPlan {
     /// the async layer verifies them against the concluded session before
     /// accepting (kind 3420 §Rematch challenge).
     pub rematch: Option<RematchRefs>,
+    /// The challenge **asymmetrically** imposes the bot's variant — a
+    /// different one than the challenger's own, or while their own is left
+    /// open — the premium-only form (*Premium* §1.2). The async layer accepts
+    /// only if the challenger is premium, asked of the admission service,
+    /// fail-closed (§1.3; ADR-0040 §2). `false` for the free forms
+    /// (delegation, the mirror imposition) and for a rematch, whose
+    /// inherited terms are re-checked by their own rule.
+    pub premium_imposition: bool,
 }
 
 /// Evaluate a Direct Challenge addressed to the bot (§6.3). `rng` covers the
@@ -285,42 +306,35 @@ pub fn evaluate_direct_challenge(
     // challenge with no cadence has no cap to be admitted under.
     let cadence = Cadence::of_rows(&rows).ok_or("no cadence (malformed time control)")?;
 
-    // Variant terms (§6.3): every ASYMMETRIC imposition of our variant is
-    // refused as persona policy (needs no premium lookup); a MIRROR
-    // imposition is judged on the variant itself. A rematch fixes both as
-    // they were: what we played, we play again.
+    // Variant terms (§6.3 as amended by ADR-0040 §2): the bot plays its own
+    // variant — left open, the persona supplies it; imposed, it must be one
+    // the persona plays — and the challenger's is theirs to choose, so a
+    // cross-variant game by delegation is accepted as it is. An imposition
+    // that is ASYMMETRIC (the challenger plays something else, or left their
+    // own open) is the premium-only form: the plan says so, and the async
+    // layer honours it only for a premium challenger (*Premium* §1.3). A
+    // MIRROR imposition is free and judged on the variant alone. A rematch
+    // fixes both as they were: what we played, we play again.
     let their_variant = tags::variant_for(event, &challenger).map(str::to_owned);
     let imposed_mine = tags::variant_for(event, me).map(str::to_owned);
+    if rematch.is_some() && (their_variant.is_none() || imposed_mine.is_none()) {
+        // Both are inherited terms (kind 3420 §Rematch challenge): a rematch
+        // that leaves one open is malformed, not a premium question.
+        return Err("a rematch challenge must fix both variants");
+    }
+    let mut premium_imposition = false;
     let my_variant = match (&their_variant, &imposed_mine) {
         (Some(_), Some(mine)) if rematch.is_some() => mine.clone(),
-        (Some(theirs), Some(mine)) if theirs != mine => {
-            // Explicit cross-variant: the challenger plays `theirs` and assigns
-            // us the DIFFERENT `mine`. Refused as persona policy UNLESS the
-            // persona opts in (`accept_imposed_variant`), and even then only
-            // for a variant it actually plays.
-            if !play.accept_imposed_variant {
-                return Err("asymmetric variant imposition (persona policy)");
-            }
-            if play.variants.get(mine).copied().unwrap_or(0.0) <= 0.0 {
-                return Err("imposed variant outside the persona");
-            }
-            mine.clone()
-        }
-        (None, Some(_)) => return Err("imposed variant while theirs is open (asymmetric)"),
         (_, Some(mine)) => {
             if play.variants.get(mine).copied().unwrap_or(0.0) <= 0.0 {
                 return Err("imposed variant outside the persona");
             }
+            premium_imposition = their_variant.as_deref() != Some(mine.as_str());
             mine.clone()
         }
-        (_, None) => {
-            if rematch.is_some() {
-                return Err("a rematch challenge must fix both variants");
-            }
-            crate::persona::draw_weighted_key(&play.variants, rng)
-                .ok_or("no persona variant")?
-                .to_owned()
-        }
+        (_, None) => crate::persona::draw_weighted_key(&play.variants, rng)
+            .ok_or("no persona variant")?
+            .to_owned(),
     };
     if !session::is_identifier(&my_variant)
         || their_variant
@@ -356,6 +370,7 @@ pub fn evaluate_direct_challenge(
         accept_until,
         cadence,
         rematch,
+        premium_imposition,
     })
 }
 
@@ -463,6 +478,7 @@ mod tests {
             &play(),
             2_000_000_000,
             60,
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         assert_eq!(candidate.variant, "ogi");
@@ -504,6 +520,7 @@ mod tests {
             &opted_in,
             2_000_000_000,
             60,
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         assert_eq!(candidate.variant, "chess");
@@ -528,6 +545,7 @@ mod tests {
             &opted_in,
             2_000_000_000,
             60,
+            &mut SplitMix64::new(1),
         )
         .is_err());
     }
@@ -552,8 +570,19 @@ mod tests {
                 &play(),
                 2_000_000_000,
                 60,
+                &mut SplitMix64::new(1),
             )
         };
+        // A FULLY OPEN entry is courted with the persona's draw, flagged for
+        // the fleet-wide claim (ADR-0040 §2).
+        let open = eval(&base(vec![])).expect("an open entry is courted");
+        assert!(open.open && open.mirror);
+        assert!(open.variant == "ogi" || open.variant == "chess");
+        assert!(
+            !eval(&base(vec![tag("variant", &["self", "ogi"])]))
+                .unwrap()
+                .open
+        );
 
         // Asymmetric variant terms.
         assert!(eval(&base(vec![
@@ -599,7 +628,8 @@ mod tests {
             "sanki",
             &play(),
             2_000_000_290,
-            60
+            60,
+            &mut SplitMix64::new(1),
         )
         .is_err());
     }
@@ -667,7 +697,8 @@ mod tests {
             )
         };
 
-        // Asymmetric: our variant imposed differently from theirs.
+        // Asymmetric: our variant imposed differently from theirs — a plan,
+        // flagged for the premium check the async layer performs.
         let asymmetric = direct_challenge(
             &human,
             &me_pk,
@@ -677,7 +708,34 @@ mod tests {
                 Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
             ],
         );
-        assert!(eval(&asymmetric).is_err());
+        let plan = eval(&asymmetric).expect("a plan pending the premium check");
+        assert!(plan.premium_imposition);
+        // Asymmetric too: ours imposed while theirs is left open; the mirror
+        // rule then gives them ours.
+        let open_theirs = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![Tag::custom("variant", [me_pk.to_hex(), "ogi".into()])],
+        );
+        let plan = eval(&open_theirs).expect("a plan pending the premium check");
+        assert!(plan.premium_imposition);
+        assert_eq!(
+            (plan.my_variant.as_str(), plan.their_variant.as_str()),
+            ("ogi", "ogi")
+        );
+        // An imposition of a variant the persona does not play is refused
+        // before any lookup.
+        let foreign = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![
+                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "xiongqi".into()]),
+            ],
+        );
+        assert_eq!(eval(&foreign), Err("imposed variant outside the persona"));
 
         // Mirror imposition: judged on the variant (ogi is in the persona);
         // the challenger declares `first`, so we hold `second`.
@@ -771,27 +829,21 @@ mod tests {
     }
 
     #[test]
-    fn accept_imposed_variant_allows_explicit_cross_variant() {
+    fn cross_variant_by_delegation_is_free_and_the_pool_knob_does_not_reach_the_direct_path() {
         let (me, human) = (Keys::generate(), Keys::generate());
         let me_pk = me.public_key();
         let human_pk = human.public_key();
-        // The challenger plays chess and imposes ogi on us — an explicit
-        // cross-variant game. The cadence is a persona one, so only the variant
-        // terms are under test.
-        let cross = direct_challenge(
+        let mut rng = SplitMix64::new(1);
+        // The challenger plays chess and leaves ours open: the persona draws,
+        // the game is cross-variant, and nothing premium is involved.
+        let delegated = direct_challenge(
             &human,
             &me_pk,
             &rules(),
-            vec![
-                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
-                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
-            ],
+            vec![Tag::custom("variant", [human_pk.to_hex(), "chess".into()])],
         );
-        let mut rng = SplitMix64::new(1);
-
-        // Default persona: the asymmetric imposition is refused.
-        assert!(evaluate_direct_challenge(
-            &cross,
+        let plan = evaluate_direct_challenge(
+            &delegated,
             &me_pk,
             RELAY,
             &rules(),
@@ -801,25 +853,43 @@ mod tests {
             60,
             &mut rng,
         )
-        .is_err());
-
-        // With accept_imposed_variant set, the bot takes the imposed ogi.
-        let mut any = play();
-        any.accept_imposed_variant = true;
-        let plan = evaluate_direct_challenge(
-            &cross,
-            &me_pk,
-            RELAY,
-            &rules(),
-            "sanki",
-            &any,
-            2_000_000_000,
-            60,
-            &mut rng,
-        )
-        .expect("accept the imposed variant");
-        assert_eq!(plan.my_variant, "ogi");
+        .expect("delegation is free");
+        assert!(!plan.premium_imposition);
         assert_eq!(plan.their_variant, "chess");
+        assert!(plan.my_variant == "ogi" || plan.my_variant == "chess");
+        // The pool knob (`accept_imposed_variant`) changes nothing here: the
+        // direct path's asymmetric imposition is a premium question, not a
+        // persona one (ADR-0040 §2).
+        let cross = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![
+                Tag::custom("variant", [human_pk.to_hex(), "chess".into()]),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
+            ],
+        );
+        for knob in [false, true] {
+            let persona = PlayConfig {
+                accept_imposed_variant: knob,
+                ..play()
+            };
+            let plan = evaluate_direct_challenge(
+                &cross,
+                &me_pk,
+                RELAY,
+                &rules(),
+                "sanki",
+                &persona,
+                2_000_000_000,
+                60,
+                &mut rng,
+            )
+            .expect("a plan pending the premium check");
+            assert!(plan.premium_imposition);
+            assert_eq!(plan.my_variant, "ogi");
+            assert_eq!(plan.their_variant, "chess");
+        }
     }
 
     #[test]
@@ -896,6 +966,33 @@ mod tests {
             &mut rng,
         )
         .is_err());
+        // A rematch fixing only OUR variant is malformed too — refused as such,
+        // never read as an asymmetric imposition (no premium lookup).
+        let ours_only = direct_challenge(
+            &human,
+            &me_pk,
+            &rules(),
+            vec![
+                e_marked(&concluded, "rematch_of"),
+                e_marked(&conclusion, "concluded_by"),
+                Tag::custom("variant", [me_pk.to_hex(), "ogi".into()]),
+                tag("seat", &["second"]),
+            ],
+        );
+        assert_eq!(
+            evaluate_direct_challenge(
+                &ours_only,
+                &me_pk,
+                RELAY,
+                &rules(),
+                "sanki",
+                &play(),
+                2_000_000_000,
+                60,
+                &mut rng,
+            ),
+            Err("a rematch challenge must fix both variants")
+        );
         // One rematch tag without the other is malformed.
         let half = direct_challenge(
             &human,
@@ -940,6 +1037,7 @@ mod tests {
             &play(),
             2_000_000_000,
             60,
+            &mut SplitMix64::new(1),
         )
         .unwrap();
         assert_eq!(candidate.cadence, Cadence::Byoyomi);

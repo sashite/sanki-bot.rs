@@ -26,6 +26,7 @@
 //! - `RUST_LOG` (optional): log filter; defaults to `info`.
 
 mod actor;
+mod admission;
 mod cadence;
 mod chain;
 mod clockmath;
@@ -41,6 +42,7 @@ mod publish;
 mod rematch;
 mod rules;
 mod session;
+mod slots;
 mod tags;
 
 use std::collections::BTreeSet;

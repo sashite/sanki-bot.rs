@@ -3,6 +3,59 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] — 2026-09-12
+
+The three Robotto ([ADR-0040](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0040-three-robotto.md)):
+what a mono-variant persona answers on each founding path, one game per
+cadence with the rematch kept possible, and the pieces a fleet on a personal
+machine needs.
+
+### Changed
+
+- **The cadence slots (`src/slots.rs`).** A family's cap is a number of
+  holds, and a hold is an automaton — `Committed(until)` (the bot's own pool
+  entry, or its acceptance not yet founded) → `Playing(g)` → `Cooling(g,
+  t_end + W)` → free — that **every** founding is admitted through: the
+  mirror entry in the pool, a fresh or rematch Direct Challenge, and the
+  bot's **own rematch proposal**, which used to bypass the cap. A concluded
+  game's slot stays with the pair for the rematch window and admits nothing
+  but a rematch of that game; a rematch challenge observed or published in
+  the window's last second is honoured for its whole life. A Pairing landing
+  in an entry's last second extends the commitment to its founding deadline.
+  `Committed` and `Cooling` expire by themselves; nothing leaks. Replaces
+  the per-family session count and the per-cadence pool lock of 0.7.0
+  (both are now states of the same automaton).
+- **`REMATCH_WINDOW_SECS` 900 → 60**, the one published rematch window of
+  every Sashité client (the app's `rematch-window.ts` publishes the same
+  sixty seconds). The self-subscription replay lookback no longer derives
+  from it (45 minutes, its own constant).
+- **The direct path plays cross-variant, and honours a premium imposition
+  (ADR-0040 §2).** A Direct Challenge is accepted whenever the bot can play
+  its own variant — left open, the persona supplies it; imposed, it must be
+  one the persona plays — and the challenger's variant is theirs: a
+  cross-variant game by delegation is accepted as before. An **asymmetric**
+  imposition (the challenger plays something else, or left their own open)
+  is no longer refused flat: it is honoured **iff the challenger is
+  premium**, asked of the admission service — `GET {admission_url}/premium/
+  {pubkey}` (`src/admission.rs`), fail-closed, five-second bound — as
+  *Premium* §1.3 prescribes for a Sashité client. The §1.3 re-check at
+  rematch is implemented on both sides: a rematch of a session whose
+  configuration descends from an asymmetric imposition (the chain walked
+  back to its first founding, on either path) is accepted or proposed only
+  while the original imposer is premium. `accept_imposed_variant` is now
+  the **pool** knob only.
+- **New `[fleet] admission_url`** (optional): the admission service's
+  origin. Absent, every asymmetric imposition is refused without a request
+  — for a deployment with no admission service (the e2e bench); a
+  production fleet sets it from day one, since premium status does not
+  exist apart from that service.
+- **A fully open pool entry (no variant term) is courted**, mirrored with
+  the persona's own draw, by **one** member of the fleet: the ledger hands
+  it to the first that claims it (`Ledger::claim_open_entry`), so a human
+  who said "anything" meets one bot rather than three racing for them.
+- **A window may end at `24:00`** (`to` only): the end of the local day,
+  closing the one-minute hole a `to = "23:59"` schedule left at 23:59.
+
 ## [0.7.0] — 2026-09-12
 
 One cadence ([ADR-0039](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0039-one-cadence.md)):

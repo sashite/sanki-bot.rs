@@ -424,6 +424,7 @@ mod tests {
             accept_until: 2_000_000_300,
             cadence: crate::cadence::Cadence::Blitz,
             rematch: None,
+            premium_imposition: false,
         };
         let session_plan = accept_direct_challenge(&challenge, &plan, me, &describe()).unwrap();
         assert_eq!(session_plan.first, challenger.public_key());

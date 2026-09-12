@@ -52,6 +52,14 @@ pub struct FleetSection {
     /// advertised minimum; a config value in v1).
     #[serde(default = "default_pow")]
     pub pow_difficulty: u8,
+    /// The admission service (ADR-0008), asked — `GET {admission_url}/premium/
+    /// {pubkey}`, fail-closed, bounded — whether the challenger of an
+    /// **asymmetric** variant imposition is premium (*Premium* §1.3, ADR-0040
+    /// §2). Absent: every such imposition is refused without a request — for
+    /// a deployment that has no admission service at all (the e2e bench); a
+    /// production fleet sets it from day one.
+    #[serde(default)]
+    pub admission_url: Option<String>,
 }
 
 fn default_game() -> String {
@@ -312,6 +320,11 @@ fn validate(config: &FleetConfig) -> Result<()> {
     if nostr_sdk::prelude::EventId::from_hex(&config.fleet.rules).is_err() {
         bail!("fleet.rules is not a Rule System event id (64 hex characters)");
     }
+    if let Some(url) = &config.fleet.admission_url {
+        if !(url.starts_with("https://") || url.starts_with("http://")) || url.ends_with('/') {
+            bail!("fleet.admission_url must be an http(s) origin without a trailing slash");
+        }
+    }
     let mut names = std::collections::BTreeSet::new();
     for bot in &config.bots {
         if !names.insert(bot.name.as_str()) {
@@ -366,7 +379,7 @@ fn validate(config: &FleetConfig) -> Result<()> {
                 .ok_or_else(|| anyhow!("bot {}: bad days {}", bot.name, window.days))?;
             crate::persona::parse_hhmm(&window.from)
                 .ok_or_else(|| anyhow!("bot {}: bad time {}", bot.name, window.from))?;
-            crate::persona::parse_hhmm(&window.to)
+            crate::persona::parse_hhmm_end(&window.to)
                 .ok_or_else(|| anyhow!("bot {}: bad time {}", bot.name, window.to))?;
         }
     }
@@ -491,6 +504,30 @@ nsec_env = "PLAYER_NSEC_KAORU"
         assert!(parse(&contents.replace("Asia/Tokyo", "Mars/Olympus")).is_err());
         assert!(parse(&contents.replace("mon-sun", "lundi")).is_err());
         assert!(parse(&contents.replace("20:30", "25:99")).is_err());
+        // `24:00` is legal as an END only (ADR-0040 §5).
+        assert!(parse(&contents.replace("23:30", "24:00")).is_ok());
+        assert!(parse(&contents.replace("20:30", "24:00")).is_err());
         assert!(parse(&contents.replace(&"7".repeat(64), "not-an-id")).is_err());
+    }
+
+    #[test]
+    fn admission_url_is_optional_and_shaped() {
+        let contents = EXAMPLE.replace(r#"distribution = "lognormal", "#, "");
+        assert_eq!(parse(&contents).unwrap().fleet.admission_url, None);
+        let with = contents.replace(
+            "pow_difficulty = 10\n",
+            "pow_difficulty = 10\nadmission_url = \"https://admission.sanki.app\"\n",
+        );
+        assert_eq!(
+            parse(&with).unwrap().fleet.admission_url.as_deref(),
+            Some("https://admission.sanki.app")
+        );
+        for bad in ["admission.sanki.app", "https://admission.sanki.app/"] {
+            let bad = contents.replace(
+                "pow_difficulty = 10\n",
+                &format!("pow_difficulty = 10\nadmission_url = \"{bad}\"\n"),
+            );
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
     }
 }
