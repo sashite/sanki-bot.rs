@@ -80,6 +80,23 @@ pub struct Slots {
 }
 
 impl Slots {
+    /// One line for the pulse: each family's load against its cap, in
+    /// canonical order — `byoyomi=0/1 blitz=1/1 rapid=0/1 correspondence=0/1`.
+    pub fn summary(&mut self, now: u64, cap: impl Fn(Cadence) -> u32) -> String {
+        Cadence::ALL
+            .iter()
+            .map(|cadence| {
+                format!(
+                    "{}={}/{}",
+                    cadence.token(),
+                    self.load(*cadence, now),
+                    cap(*cadence)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Drop every hold that has run out at `now`.
     pub fn expire(&mut self, now: u64) {
         self.holds.retain(|hold| !hold.expired(now));
@@ -366,6 +383,16 @@ mod tests {
         assert_eq!(slots.load(Cadence::Correspondence, 0), 0);
         slots.cool(&id(7), 100);
         assert_eq!(slots.load(Cadence::Correspondence, 0), 0);
+    }
+
+    #[test]
+    fn the_summary_reads_load_over_cap_in_canonical_order() {
+        let mut slots = Slots::default();
+        slots.play(Cadence::Blitz, id(1), &[], None);
+        assert_eq!(
+            slots.summary(0, |_| 1),
+            "byoyomi=0/1 blitz=1/1 rapid=0/1 correspondence=0/1"
+        );
     }
 
     #[test]

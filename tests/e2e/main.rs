@@ -34,6 +34,14 @@
 //! never moves again — and the bot, after its courtesy delay, publishes a
 //! Conclusion claiming the win on time, and exactly one.
 //!
+//! A third bench pins the **directed path** (ADR-0014 §6.3; ADR-0040 §2):
+//! the opponent challenges the bot directly (kind 3420), the bot accepts by
+//! founding the Game Session itself — and then PLAYS it. The incident this
+//! one pins: the acceptance was published from a task of its own and the
+//! bot waited for the relay to hand the session back through its
+//! subscription, which never happens for an event the client itself sent;
+//! the session was never tracked and the bot never moved (0.8.2).
+//!
 //! Runtime ≈ 60 s each (ticks + grace), single-threaded on the wire — run
 //! them as `SANKI_MODULE=<path to the module> cargo test --test e2e`; without
 //! the module the benches are skipped.
@@ -59,6 +67,7 @@ use serde_json::Value;
 const RULE_SYSTEM_KIND: u16 = 3417;
 const GAME_SESSION_KIND: u16 = 3422;
 const PAIRING_KIND: u16 = 3419;
+const DIRECT_CHALLENGE_KIND: u16 = 3420;
 const PLY_KIND: u16 = 3423;
 const CONCLUSION_KIND: u16 = 3425;
 const ABI: &str = "sashite.sanki.kernel-abi/1";
@@ -103,7 +112,7 @@ nsec_env = "PLAYER_NSEC_E2E"
 
   [bot.schedule]
   timezone = "UTC"
-  windows  = [{{ days = "mon-sun", from = "00:00", to = "23:59" }}]
+  windows  = [{{ days = "mon-sun", from = "00:00", to = "24:00" }}]
   jitter_minutes = 0
   presence_probability = 1.0
 
@@ -281,10 +290,40 @@ impl Bench {
         id
     }
 
-    /// Wait for the bot's Game Session on `pairing_id` and check it: founded
-    /// on the Pairing, the rules mirrored, the prescribed position. Returns
-    /// the session's id and its `created_at` — t₀.
-    async fn founded(&self, pairing_id: &str) -> (String, u64) {
+    /// Challenge the bot directly (the opponent signs a kind 3420): the
+    /// mirror form, both on chess, the opponent `first` so the bot is on move
+    /// second, a two-minute acceptance window. Returns the challenge's id.
+    async fn challenge(&self, time_control: &[&str]) -> String {
+        let now = Timestamp::now().as_secs();
+        let mut tc = vec!["time_control"];
+        tc.extend_from_slice(time_control);
+        let challenge = EventBuilder::new(Kind::Custom(DIRECT_CHALLENGE_KIND), "")
+            .tags([
+                tag(&["p", &self.bot_hex, "", "opponent"]),
+                tag(&["e", &self.rules_hex, "", "rules"]),
+                tag(&["timing_relay", &self.relay.url]),
+                tag(&["game", "sanki"]),
+                tag(&["variant", &self.opponent.public_key().to_hex(), "chess"]),
+                tag(&["variant", &self.bot_hex, "chess"]),
+                tag(&["seat", "first"]),
+                tag(&tc),
+                tag(&["accept_until", &(now + 120).to_string()]),
+                tag(&["nonce", "0", "0"]),
+            ])
+            .finalize(&self.opponent)
+            .expect("sign direct challenge");
+        let id = challenge.id.to_hex();
+        self.relay
+            .inject(serde_json::to_value(&challenge).expect("challenge json"))
+            .await;
+        id
+    }
+
+    /// Wait for the bot's Game Session on `founding_id` — a Pairing
+    /// (`marker` = `pairing`) or a Direct Challenge (`direct_challenge`) —
+    /// and check it: founded on it, the rules mirrored, the prescribed
+    /// position. Returns the session's id and its `created_at` — t₀.
+    async fn founded(&self, founding_id: &str, marker: &str) -> (String, u64) {
         let bot_hex = self.bot_hex.clone();
         wait_until("the bot's Game Session", Duration::from_secs(30), || {
             let relay = &self.relay;
@@ -320,8 +359,8 @@ impl Bench {
             })
         };
         assert!(
-            has("e", pairing_id, Some("pairing")),
-            "founded on the Pairing"
+            has("e", founding_id, Some(marker)),
+            "founded on the {marker}"
         );
         assert!(
             has("e", &self.rules_hex, Some("rules")),
@@ -399,7 +438,7 @@ async fn founds_on_the_pairing_then_republishes_the_same_content_after_grace() {
 
     // ── 0. Paired, the bot founds the session on the Pairing ───────────────
     let pairing_id = bench.pair(&["300", "3"]).await;
-    let (session_id, start) = bench.founded(&pairing_id).await;
+    let (session_id, start) = bench.founded(&pairing_id, "pairing").await;
     bench.open(&session_id, start).await;
 
     // ── 1. The bot answers its slot (frame #1, swallowed on arrival) ───────
@@ -476,7 +515,7 @@ async fn concludes_with_the_win_on_time_the_rule_system_yields_once() {
     // 10 s per move: the opponent opens, the bot answers, the opponent's
     // clock then runs out.
     let pairing_id = bench.pair(&["0", "10", "1"]).await;
-    let (session_id, start) = bench.founded(&pairing_id).await;
+    let (session_id, start) = bench.founded(&pairing_id, "pairing").await;
     bench.open(&session_id, start).await;
     wait_until("the bot's answer", Duration::from_secs(30), || {
         let bench = &bench;
@@ -551,5 +590,43 @@ async fn concludes_with_the_win_on_time_the_rule_system_yields_once() {
         conclusions(&bench.relay.received().await).len(),
         1,
         "one Conclusion, never two"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accepts_a_direct_challenge_then_plays_it() {
+    let Some(bench) = Bench::start().await else {
+        return;
+    };
+    // ── The opponent challenges the bot directly; the acceptance IS the
+    //    Game Session the bot publishes (kind 3422 §Signing party) ──────────
+    let challenge_id = bench.challenge(&["300", "3"]).await;
+    let (session_id, start) = bench.founded(&challenge_id, "direct_challenge").await;
+
+    // ── And the bot then serves what it founded: the opponent opens, the
+    //    bot answers. (0.8.2: the session it published itself never came
+    //    back through the subscription, so it was never tracked, and this
+    //    wait timed out.) ────────────────────────────────────────────────────
+    bench.open(&session_id, start).await;
+    wait_until(
+        "the bot's answer in the session it accepted",
+        Duration::from_secs(30),
+        || {
+            let bench = &bench;
+            async move { !bench.bot_plies().await.is_empty() }
+        },
+    )
+    .await;
+    // One acceptance, one session: the bot founded exactly once.
+    let sessions = bench
+        .relay
+        .received()
+        .await
+        .iter()
+        .filter(|frame| frame.kind == u64::from(GAME_SESSION_KIND) && frame.pubkey == bench.bot_hex)
+        .count();
+    assert_eq!(
+        sessions, 1,
+        "the bot published {sessions} Game Sessions for one challenge"
     );
 }

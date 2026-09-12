@@ -103,6 +103,11 @@ const PAIRING_RECOVERY_LOOKBACK_SECS: u64 = 600;
 /// challenge inherits rather than restates (*Premium* §1.3).
 const MAX_REMATCH_HOPS: usize = 64;
 
+/// The pulse period: one `INFO` line every ten minutes with the bot's load
+/// and the relay's silence — what `tail` shows an operator, and what a
+/// later alert would watch.
+const PULSE_SECS: u64 = 600;
+
 /// Grace before re-sending an already-published Ply or Conclusion whose echo
 /// has not come back (three coarse ticks): long enough for any realistic
 /// relay round trip, short enough never to threaten a clock even on a fast
@@ -244,6 +249,10 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     // not notify an event it sent itself (it already holds it when the echo
     // arrives), so a subscription would never deliver it.
     let (own_events, mut own_events_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
+    // Sessions this process saw conclude: a replayed founding (a recovered
+    // Pairing, a challenge in the subscription's lookback) must not track a
+    // finished game a second time and conclude it again.
+    let mut concluded: BTreeSet<EventId> = BTreeSet::new();
     let mut starred_today: u64 = 0;
 
     reconcile_standing_events(&client, &ctx, &relay_clock).await;
@@ -295,7 +304,8 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
         .context("subscribing to the pool")?;
 
     // Stateless restart (§9): rebuild active sessions from relay replay.
-    if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, &slots, me).await {
+    if let Err(error) = recover_sessions(&client, &ctx, &mut sessions, &slots, &concluded, me).await
+    {
         tracing::warn!(error = %error, "session recovery incomplete");
     }
     // …and rebuild what we have already challenged, for the same reason: the
@@ -329,6 +339,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                         &relay_clock,
                         &mut sessions,
                         &slots,
+                        &concluded,
                         me,
                         &pairing,
                     )
@@ -344,6 +355,11 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     tracing::info!(sessions = sessions.len(), "bot up");
 
     let mut tick = tokio::time::interval(StdDuration::from_secs(TICK_SECS));
+    let mut pulse = tokio::time::interval(StdDuration::from_secs(PULSE_SECS));
+    // The instant the relay last delivered anything to this bot: a
+    // subscription that has gone quiet for a long time is what the pulse
+    // shows, and what an operator reads first.
+    let mut last_relay_event = std::time::Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -355,26 +371,41 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
             }
             _ = tick.tick() => {
                 service_all(
-                    &client, &ctx, &relay_clock, &mut sessions, &slots, &mut rng, me,
-                    &mut starred_today, &mut offered_rematches, None,
+                    &client, &ctx, &relay_clock, &mut sessions, &slots, &mut concluded,
+                    &mut rng, me, &mut starred_today, &mut offered_rematches, None,
                 )
                 .await;
+            }
+            _ = pulse.tick() => {
+                // The one line an operator reads to know the bot lives: what
+                // it holds per cadence, and how long since the relay spoke.
+                let holds = lock_slots(&slots).summary(
+                    relay_clock.now_secs(),
+                    |cadence| ctx.config.play.max_concurrent.cap(cadence),
+                );
+                tracing::info!(
+                    sessions = sessions.len(),
+                    %holds,
+                    relay_quiet_secs = last_relay_event.elapsed().as_secs(),
+                    "pulse"
+                );
             }
             Some(event) = own_events_rx.recv() => {
                 handle_event(
                     &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                     &mut considered_challenges, &mut founded_pairings,
-                    &mut offered_rematches, &slots, &own_events, &mut starred_today,
-                    &mut rng, me, event,
+                    &mut offered_rematches, &slots, &mut concluded, &own_events,
+                    &mut starred_today, &mut rng, me, event,
                 ).await;
             }
             notification = notifications.next() => match notification {
                 Some(ClientNotification::Event { event, .. }) => {
+                    last_relay_event = std::time::Instant::now();
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut considered_challenges, &mut founded_pairings,
-                        &mut offered_rematches, &slots, &own_events, &mut starred_today,
-                        &mut rng, me, *event,
+                        &mut offered_rematches, &slots, &mut concluded, &own_events,
+                        &mut starred_today, &mut rng, me, *event,
                     ).await;
                 }
                 Some(_) => {}
@@ -449,6 +480,7 @@ async fn recover_sessions(
     ctx: &BotContext,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &BTreeSet<EventId>,
     me: PublicKey,
 ) -> Result<()> {
     let game_sessions = fetch_many(
@@ -464,7 +496,9 @@ async fn recover_sessions(
     )
     .await?;
     for session in game_sessions {
-        if let Err(error) = track_session(client, ctx, sessions, slots, me, session).await {
+        if let Err(error) =
+            track_session(client, ctx, sessions, slots, concluded, me, session).await
+        {
             tracing::debug!(error = %error, "skipping unresumable session");
         }
     }
@@ -626,10 +660,11 @@ async fn track_session(
     ctx: &BotContext,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &BTreeSet<EventId>,
     me: PublicKey,
     session: Event,
 ) -> Result<()> {
-    if sessions.contains_key(&session.id) {
+    if sessions.contains_key(&session.id) || concluded.contains(&session.id) {
         return Ok(());
     }
     if session.verify().is_err() {
@@ -754,6 +789,7 @@ async fn handle_event(
     founded_pairings: &mut BTreeSet<EventId>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &mut BTreeSet<EventId>,
     own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
     starred_today: &mut u64,
     rng: &mut SplitMix64,
@@ -772,8 +808,17 @@ async fn handle_event(
         }
         Kind::Custom(PAIRING_KIND) => {
             if founded_pairings.insert(event.id) {
-                if let Err(reason) =
-                    consider_pairing(client, ctx, relay_clock, sessions, slots, me, &event).await
+                if let Err(reason) = consider_pairing(
+                    client,
+                    ctx,
+                    relay_clock,
+                    sessions,
+                    slots,
+                    concluded,
+                    me,
+                    &event,
+                )
+                .await
                 {
                     tracing::debug!(pairing = %event.id, reason, "pairing not founded");
                 }
@@ -787,6 +832,7 @@ async fn handle_event(
                     relay_clock,
                     sessions,
                     slots,
+                    concluded,
                     own_events,
                     offered_rematches,
                     rng,
@@ -800,7 +846,9 @@ async fn handle_event(
             }
         }
         Kind::Custom(GAME_SESSION_KIND) => {
-            if let Err(error) = track_session(client, ctx, sessions, slots, me, event).await {
+            if let Err(error) =
+                track_session(client, ctx, sessions, slots, concluded, me, event).await
+            {
                 tracing::debug!(error = %error, "session not tracked");
             }
         }
@@ -819,6 +867,7 @@ async fn handle_event(
                         relay_clock,
                         sessions,
                         slots,
+                        concluded,
                         rng,
                         me,
                         starred_today,
@@ -1154,12 +1203,14 @@ fn lock_slots(slots: &Arc<Mutex<Slots>>) -> std::sync::MutexGuard<'_, Slots> {
 /// Found the session a Pairing naming us declares (kind 3422 §Signing party,
 /// matchmaking path): as soon as it is observed, unless a canonical Game
 /// Session for it already exists.
+#[allow(clippy::too_many_arguments)]
 async fn consider_pairing(
     client: &Client,
     ctx: &BotContext,
     relay_clock: &RelayClock,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &BTreeSet<EventId>,
     me: PublicKey,
     pairing: &Event,
 ) -> std::result::Result<(), &'static str> {
@@ -1202,7 +1253,9 @@ async fn consider_pairing(
     .unwrap_or_default();
     if let Some((canonical, _)) = founding::canonical_session(existing.iter(), pairing) {
         let canonical = canonical.clone();
-        if let Err(error) = track_session(client, ctx, sessions, slots, me, canonical).await {
+        if let Err(error) =
+            track_session(client, ctx, sessions, slots, concluded, me, canonical).await
+        {
             tracing::debug!(error = %error, "the existing Game Session is not trackable");
         }
         return Err("already founded by the other player");
@@ -1214,7 +1267,7 @@ async fn consider_pairing(
             "publish failed"
         })?;
     tracing::info!(pairing = %pairing.id, session = %session.id, "founded the session on the Pairing");
-    if let Err(error) = track_session(client, ctx, sessions, slots, me, session).await {
+    if let Err(error) = track_session(client, ctx, sessions, slots, concluded, me, session).await {
         tracing::debug!(error = %error, "our Game Session is not tracked yet");
     }
     Ok(())
@@ -1250,6 +1303,7 @@ async fn consider_direct_challenge(
     relay_clock: &Arc<RelayClock>,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &BTreeSet<EventId>,
     own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
     offered_rematches: &mut BTreeMap<EventId, u64>,
     rng: &mut SplitMix64,
@@ -1340,7 +1394,9 @@ async fn consider_direct_challenge(
     .unwrap_or_default();
     if let Some((accepted, _)) = founding::canonical_session(existing.iter(), challenge) {
         let accepted = accepted.clone();
-        if let Err(error) = track_session(client, ctx, sessions, slots, me, accepted).await {
+        if let Err(error) =
+            track_session(client, ctx, sessions, slots, concluded, me, accepted).await
+        {
             tracing::debug!(error = %error, "the existing acceptance is not trackable");
         }
         return Err("already accepted");
@@ -1580,6 +1636,7 @@ async fn service_all(
     relay_clock: &RelayClock,
     sessions: &mut BTreeMap<EventId, SessionMeta>,
     slots: &Arc<Mutex<Slots>>,
+    concluded: &mut BTreeSet<EventId>,
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
@@ -1599,6 +1656,7 @@ async fn service_all(
             // the rematch challenge cites it as its `concluded_by` proof.
             Ok(Some((conclusion_id, concluded_at))) => {
                 if let Some(meta) = sessions.remove(&id) {
+                    concluded.insert(id);
                     terminate_session(
                         client,
                         ctx,

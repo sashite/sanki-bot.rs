@@ -3,6 +3,36 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.0] — 2026-09-12
+
+What the first day in production asked for: a log that rotates itself, a
+pulse to read, no double bookkeeping after a restart, and the bench that
+would have caught 0.8.2's bug.
+
+### Added
+
+- **`PLAYERS_LOG_DIR`**: when set, the fleet writes daily log files there
+  (`players.YYYY-MM-DD.log`, the last fourteen kept, no ANSI) through a
+  non-blocking writer, instead of stdout. launchd redirects stdout to a
+  file nothing rotates; the bot now rotates its own. Unset (development,
+  the e2e bench), stdout as before. What escapes tracing — a fatal start-up
+  error, a panic — still goes to stderr.
+- **A pulse**: one `INFO` line every ten minutes per persona — tracked
+  sessions, each family's load against its cap
+  (`byoyomi=0/1 blitz=1/1 …`), and how long the relay has been silent —
+  the line an operator reads to know the bot lives.
+- **e2e: `accepts_a_direct_challenge_then_plays_it`** — the opponent
+  challenges the bot directly, the bot founds the Game Session and then
+  answers the opening. Fails on 0.8.1 at "the bot's answer", passes on
+  0.8.2: the regression bench the directed path never had.
+
+### Fixed
+
+- A session concluded in this process is not tracked — and concluded —
+  a second time when a replay (a recovered Pairing, a challenge inside the
+  subscription's lookback) delivers its founding again.
+- The e2e persona's window ends at `24:00` rather than `23:59`.
+
 ## [0.8.2] — 2026-09-12
 
 ### Fixed

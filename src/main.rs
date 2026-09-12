@@ -24,8 +24,14 @@
 //! - one `PLAYER_NSEC_*` variable per bot, named by each `[[bot]]`'s
 //!   `nsec_env` (never logged; the derived npub only).
 //! - `RUST_LOG` (optional): log filter; defaults to `info`.
+//! - `PLAYERS_LOG_DIR` (optional): a directory for daily log files
+//!   (`players.YYYY-MM-DD.log`, the last fourteen kept); stdout when unset.
 
 use tracing::Instrument;
+
+/// Daily log files kept under `PLAYERS_LOG_DIR`: two weeks — enough to read
+/// back a correspondence game's whole life, small enough to never matter.
+const LOG_FILES_KEPT: usize = 14;
 
 mod actor;
 mod admission;
@@ -57,12 +63,35 @@ use nostr_sdk::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Where the log goes: daily files with a fortnight's retention under
+    // `PLAYERS_LOG_DIR` when it is set — the production shape, where launchd
+    // would otherwise redirect stdout to one file nothing rotates — and
+    // stdout otherwise (development, the e2e bench). The guard flushes the
+    // non-blocking writer on exit and must outlive everything below.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _log_guard = match env::var("PLAYERS_LOG_DIR") {
+        Ok(dir) if !dir.is_empty() => {
+            let appender = tracing_appender::rolling::Builder::new()
+                .rotation(tracing_appender::rolling::Rotation::DAILY)
+                .filename_prefix("players")
+                .filename_suffix("log")
+                .max_log_files(LOG_FILES_KEPT)
+                .build(&dir)
+                .with_context(|| format!("PLAYERS_LOG_DIR {dir}: cannot open the log directory"))?;
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .init();
+            Some(guard)
+        }
+        _ => {
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+            None
+        }
+    };
 
     let config_path =
         env::var("FLEET_CONFIG_PATH").context("FLEET_CONFIG_PATH must point to the fleet TOML")?;

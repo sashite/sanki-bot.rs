@@ -34,7 +34,10 @@ FLEET_CONFIG_PATH=~/sanki-e2e/fleet.local.toml cargo run --bin players
 ```
 
 Environment: `FLEET_CONFIG_PATH` (required), one `PLAYER_NSEC_*` per bot
-(named by each `[[bot]]`'s `nsec_env`; never logged), `RUST_LOG` (optional).
+(named by each `[[bot]]`'s `nsec_env`; never logged), `RUST_LOG` (optional),
+`PLAYERS_LOG_DIR` (optional: daily log files there, the last fourteen kept;
+stdout when unset). Every ten minutes each persona logs a `pulse` — its
+tracked sessions, each cadence's load against its cap, the relay's silence.
 
 The fleet file's optional `admission_url` names the admission service the
 premium checks ask (one GET, only on an asymmetric variant imposition or the
