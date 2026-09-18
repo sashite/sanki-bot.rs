@@ -32,7 +32,7 @@ use crate::fleet::Ledger;
 use crate::founding;
 use crate::module::{self, Check, Describe, Runtime};
 use crate::prng::SplitMix64;
-use crate::publish::{publish_self_timed, Pow, RelayClock};
+use crate::publish::{publish_profile_abroad, publish_self_timed, Pow, RelayClock};
 use crate::rematch;
 use crate::rules::LoadedRuleSystem;
 use crate::session::{self, Events, Seat, SessionTerms, Timing};
@@ -446,6 +446,36 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
     .await;
     if let Err(error) = result {
         tracing::warn!(error = %error, "profile publish failed");
+    }
+
+    // The same profile abroad, with the relay list that lets a client find
+    // her (ADR-0042). Logged, never fatal: a public relay is not ours.
+    if !ctx.fleet.profile_relays.is_empty() {
+        match publish_profile_abroad(
+            &ctx.keys,
+            &metadata,
+            &ctx.fleet.relay_url,
+            &ctx.fleet.profile_relays,
+        )
+        .await
+        {
+            Ok((accepted, 0)) => {
+                tracing::info!(
+                    accepted,
+                    "profile and relay list published on the profile relays"
+                );
+            }
+            Ok((accepted, refused)) => {
+                tracing::warn!(
+                    accepted,
+                    refused,
+                    "some profile relays refused the profile or the relay list"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "profile relays unreachable — the profile stays on the game relay");
+            }
+        }
     }
 
     let mode = ctx.config.play.challenge_policy.clone();

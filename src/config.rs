@@ -60,6 +60,14 @@ pub struct FleetSection {
     /// production fleet sets it from day one.
     #[serde(default)]
     pub admission_url: Option<String>,
+    /// Public relays the persona's PROFILE is also published on — the kind-0
+    /// and a NIP-65 relay list (kind 10002) naming the game relay and these
+    /// — at every start (ADR-0042): a Nostr client anywhere then shows her
+    /// name and picture and knows where her notes live. Nothing else goes
+    /// there: the game's events stay on `relay_url`. Empty (the default),
+    /// the profile lives on the game relay only, as before.
+    #[serde(default)]
+    pub profile_relays: Vec<String>,
 }
 
 fn default_game() -> String {
@@ -323,6 +331,11 @@ fn validate(config: &FleetConfig) -> Result<()> {
     if let Some(url) = &config.fleet.admission_url {
         if !(url.starts_with("https://") || url.starts_with("http://")) || url.ends_with('/') {
             bail!("fleet.admission_url must be an http(s) origin without a trailing slash");
+        }
+    }
+    for url in &config.fleet.profile_relays {
+        if nostr_sdk::prelude::RelayUrl::parse(url).is_err() {
+            bail!("fleet.profile_relays: `{url}` is not a relay URL (wss://…)");
         }
     }
     let mut names = std::collections::BTreeSet::new();

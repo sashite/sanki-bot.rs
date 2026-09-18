@@ -28,6 +28,68 @@ const MAX_SKEW_SECS: i64 = 60;
 /// Timing attempts per publish before giving up.
 const MAX_TIMING_ATTEMPTS: u32 = 6;
 
+/// How long the profile relays get to answer the dial (ADR-0042).
+const PROFILE_RELAY_DIAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Publish the persona's profile ABROAD (ADR-0042): the kind-0 `metadata`
+/// — the same JSON the game relay just received — and a NIP-65 relay list
+/// (kind 10002) naming the game relay and the profile relays, on the
+/// profile relays only. Not self-timed: these relays keep no `created_at`
+/// window, and the timing relay's clock is not theirs. A throwaway client,
+/// connected for the two sends and dropped: the bot's own client stays on
+/// the game relay alone, so no subscription of the game ever reaches a
+/// public relay. Best effort — the answer counts what accepted and what
+/// refused, and the caller logs it; a public relay's refusal (rate limit,
+/// web-of-trust gate) is never the bot's failure.
+pub async fn publish_profile_abroad(
+    keys: &Keys,
+    metadata: &str,
+    game_relay: &str,
+    profile_relays: &[String],
+) -> Result<(usize, usize)> {
+    let client = Client::builder().build();
+    for url in profile_relays {
+        client
+            .add_relay(url)
+            .await
+            .map_err(|e| anyhow!("profile relay {url}: {e}"))?;
+    }
+    client.connect().and_wait(PROFILE_RELAY_DIAL).await;
+
+    let profile = EventBuilder::new(Kind::Metadata, metadata.to_owned())
+        .finalize_unsigned(keys.public_key())
+        .finalize(keys)
+        .map_err(|e| anyhow!("signing the profile: {e}"))?;
+
+    let mut listed: Vec<(RelayUrl, Option<RelayMetadata>)> = Vec::new();
+    listed.push((RelayUrl::parse(game_relay)?, None));
+    for url in profile_relays {
+        listed.push((RelayUrl::parse(url)?, None));
+    }
+    let relay_list = RelayList::new(listed)
+        .into_event_builder()
+        .finalize_unsigned(keys.public_key())
+        .finalize(keys)
+        .map_err(|e| anyhow!("signing the relay list: {e}"))?;
+
+    let mut accepted: usize = 0;
+    let mut refused: usize = 0;
+    for event in [profile, relay_list] {
+        match client.send_event(&event).await {
+            Ok(output) => {
+                accepted = accepted.saturating_add(output.success.len());
+                refused = refused.saturating_add(output.failed.len());
+            }
+            Err(e) => {
+                client.disconnect().await;
+                return Err(anyhow!("sending to the profile relays: {e}"));
+            }
+        }
+    }
+    client.disconnect().await;
+    Ok((accepted, refused))
+}
+
 /// The per-connection relay-clock skew estimate (relay − local), signed.
 /// Shared by every publish of one bot; starts at zero (local UTC).
 #[derive(Debug, Default)]

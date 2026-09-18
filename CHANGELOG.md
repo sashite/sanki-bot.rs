@@ -3,6 +3,25 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] — 2026-09-18
+
+The personas become Nostr citizens (ADR-0042): their profile, with a
+picture, where the clients are.
+
+### Added
+- `[fleet] profile_relays` — public relays the persona's kind-0 (the same
+  JSON the game relay receives, `bot: true` included) and a NIP-65 relay
+  list (kind 10002, naming the game relay and these) are also published
+  on, at every start, through a throwaway client that carries none of the
+  game's subscriptions (`publish::publish_profile_abroad`). Not
+  self-timed: those relays keep no `created_at` window. Best effort,
+  logged at `info` (all accepted), `warn` (some refused: a rate limit, a
+  web-of-trust gate) or `warn` (unreachable); never fatal. Empty or
+  absent: the game relay only, as before. Validated as relay URLs at
+  load.
+- `[bot.profile] picture` is now set in the production fleet file: the
+  three avatars, on the content-addressed store (`blobs.sanki.app`).
+
 ## [0.9.0] — 2026-09-12
 
 What the first day in production asked for: a log that rotates itself, a
