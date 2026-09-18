@@ -38,15 +38,16 @@ const PROFILE_RELAY_DIAL: std::time::Duration = std::time::Duration::from_secs(1
 /// window, and the timing relay's clock is not theirs. A throwaway client,
 /// connected for the two sends and dropped: the bot's own client stays on
 /// the game relay alone, so no subscription of the game ever reaches a
-/// public relay. Best effort — the answer counts what accepted and what
-/// refused, and the caller logs it; a public relay's refusal (rate limit,
-/// web-of-trust gate) is never the bot's failure.
+/// public relay. Best effort — the answer is how many sends were accepted
+/// and each refusal as `relay (what): reason`, for the caller to log; a
+/// count alone would say nothing to act on, and a public relay's refusal
+/// (rate limit, web-of-trust gate) is never the bot's failure.
 pub async fn publish_profile_abroad(
     keys: &Keys,
     metadata: &str,
     game_relay: &str,
     profile_relays: &[String],
-) -> Result<(usize, usize)> {
+) -> Result<(usize, Vec<String>)> {
     let client = Client::builder().build();
     for url in profile_relays {
         client
@@ -73,12 +74,17 @@ pub async fn publish_profile_abroad(
         .map_err(|e| anyhow!("signing the relay list: {e}"))?;
 
     let mut accepted: usize = 0;
-    let mut refused: usize = 0;
-    for event in [profile, relay_list] {
+    let mut refused: Vec<String> = Vec::new();
+    for (what, event) in [("profile", profile), ("relay list", relay_list)] {
         match client.send_event(&event).await {
             Ok(output) => {
                 accepted = accepted.saturating_add(output.success.len());
-                refused = refused.saturating_add(output.failed.len());
+                refused.extend(
+                    output
+                        .failed
+                        .iter()
+                        .map(|(relay, reason)| format!("{relay} ({what}): {reason}")),
+                );
             }
             Err(e) => {
                 client.disconnect().await;

@@ -459,7 +459,7 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
         )
         .await
         {
-            Ok((accepted, 0)) => {
+            Ok((accepted, refused)) if refused.is_empty() => {
                 tracing::info!(
                     accepted,
                     "profile and relay list published on the profile relays"
@@ -468,7 +468,7 @@ async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_cloc
             Ok((accepted, refused)) => {
                 tracing::warn!(
                     accepted,
-                    refused,
+                    refused = %refused.join("; "),
                     "some profile relays refused the profile or the relay list"
                 );
             }
