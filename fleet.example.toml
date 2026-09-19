@@ -49,6 +49,9 @@ nsec_env = "PLAYER_NSEC_KAORU"
 
   [bot.profile]
   display_name = "Kaoru"
+  # name       = "kaoru"                 # the handle (kind-0 `name`, NIP-05's local part); the display name when absent
+  # nip05      = "kaoru@example.com"     # the WHOLE address the key claims — the domain's /.well-known/nostr.json must answer for it
+  # website    = "https://example.com/"
   about        = "Ōgi enthusiast. Osaka evenings. (bot)"
   # picture    = "https://…"
 

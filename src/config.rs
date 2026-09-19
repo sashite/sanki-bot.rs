@@ -101,18 +101,36 @@ pub struct BotConfig {
     pub tempo: TempoConfig,
 }
 
-/// kind-0 profile fields.
+/// kind-0 profile fields — the whole profile, since the fleet file is its
+/// ONE owner (ADR-0040 §7): every start republishes exactly this, on the game
+/// relay and abroad, so a field edited by hand in a client survives only if
+/// it is here too.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
-    /// Display name shown by Nostr clients.
+    /// Display name shown by Nostr clients (`display_name`).
     pub display_name: String,
+    /// The handle (`name`): NIP-05's local part by convention, lowercase
+    /// `[a-z0-9-_.]+` — `julee`, `ogichan`, `zhuying`. Absent, the display
+    /// name serves as the handle, as before 2026-09-19.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Free-text description (conventionally mentioning the bot nature).
     #[serde(default)]
     pub about: String,
     /// Avatar URL, if any.
     #[serde(default)]
     pub picture: Option<String>,
+    /// The NIP-05 identifier the key CLAIMS — `julee@sanki.app`, the whole
+    /// address, never the local part alone — answered by the domain's
+    /// `/.well-known/nostr.json` (the app's `platform-identity.ts`, ADR-0023
+    /// amended 2026-09-19). A claim without the answer verifies as nothing;
+    /// the answer without the claim shows no check mark.
+    #[serde(default)]
+    pub nip05: Option<String>,
+    /// The persona's home page (`website`) — the game's origin.
+    #[serde(default)]
+    pub website: Option<String>,
 }
 
 /// Play preferences: variants, cadences, concurrency, strength, temperament.

@@ -3,6 +3,26 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] — 2026-09-19
+
+The personas get a NIP-05 (ADR-0023 §4): `julee@`, `ogichan@`,
+`zhuying@sanki.app`, answered by the app's `/.well-known/nostr.json`.
+
+### Added
+- `[bot.profile] name` (the handle, NIP-05's local part; the display name
+  serves when absent), `nip05` (the whole address the key claims) and
+  `website` (the game's origin). The kind-0 `content` is built by ONE
+  function (`actor::metadata_json`, unit-tested) for the game relay and the
+  profile relays alike, and now carries the whole profile — `name`,
+  `display_name`, `about`, `bot`, and the optional `picture`, `nip05`,
+  `website` — so a field edited by hand in a client survives the next start
+  only if the fleet file has it: the file is the profile's one owner
+  (ADR-0040 §7), and it says everything the profile says.
+
+### Changed
+- The kind-0 `name` was the display name; it is the handle now when one is
+  set, and `display_name` is published beside it (clients read both).
+
 ## [0.10.0] — 2026-09-18
 
 The personas become Nostr citizens (ADR-0042): their profile, with a

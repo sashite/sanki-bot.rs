@@ -424,17 +424,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
 /// Publish/refresh the standing events (§6.1): the kind-0 profile with the
 /// NIP-24 `bot: true` flag, and the kind-30420 policy for the game.
 async fn reconcile_standing_events(client: &Client, ctx: &BotContext, relay_clock: &RelayClock) {
-    let profile = &ctx.config.profile;
-    let metadata = format!(
-        r#"{{"name":{},"about":{},"bot":true{}}}"#,
-        json_string(&profile.display_name),
-        json_string(&profile.about),
-        profile
-            .picture
-            .as_deref()
-            .map(|url| format!(r#","picture":{}"#, json_string(url)))
-            .unwrap_or_default(),
-    );
+    let metadata = metadata_json(&ctx.config.profile);
     let result = publish_self_timed(
         client,
         &ctx.keys,
@@ -2272,6 +2262,31 @@ fn p_role(pubkey: &PublicKey, role: &str) -> Tag {
     Tag::custom("p", [pubkey.to_hex(), String::new(), role.to_owned()])
 }
 
+/// The kind-0 `content` a persona publishes — the fleet file's profile, whole
+/// (config.rs `ProfileConfig`): `name` (the handle, or the display name when
+/// no handle is set), `display_name`, `about`, the NIP-24 `bot: true` flag,
+/// and the optional `picture`, `nip05` and `website`. One builder for the
+/// game relay and the profile relays abroad, so the two copies never differ.
+fn metadata_json(profile: &crate::config::ProfileConfig) -> String {
+    let mut out = format!(
+        r#"{{"name":{},"display_name":{},"about":{},"bot":true"#,
+        json_string(profile.name.as_deref().unwrap_or(&profile.display_name)),
+        json_string(&profile.display_name),
+        json_string(&profile.about),
+    );
+    for (field, value) in [
+        ("picture", profile.picture.as_deref()),
+        ("nip05", profile.nip05.as_deref()),
+        ("website", profile.website.as_deref()),
+    ] {
+        if let Some(value) = value {
+            out.push_str(&format!(r#","{field}":{}"#, json_string(value)));
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// Minimal JSON string escaping for the kind-0 metadata fields.
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len().saturating_add(2));
@@ -2328,6 +2343,38 @@ mod tests {
     fn json_string_escapes() {
         assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
         assert_eq!(json_string("a\nb"), r#""a\nb""#);
+    }
+
+    #[test]
+    fn metadata_json_carries_the_whole_profile() {
+        let profile = crate::config::ProfileConfig {
+            display_name: "Julee".to_owned(),
+            name: Some("julee".to_owned()),
+            about: "a bot".to_owned(),
+            picture: Some("https://blobs.sanki.app/x.png".to_owned()),
+            nip05: Some("julee@sanki.app".to_owned()),
+            website: Some("https://chess.page/".to_owned()),
+        };
+        assert_eq!(
+            metadata_json(&profile),
+            r#"{"name":"julee","display_name":"Julee","about":"a bot","bot":true,"picture":"https://blobs.sanki.app/x.png","nip05":"julee@sanki.app","website":"https://chess.page/"}"#
+        );
+    }
+
+    #[test]
+    fn metadata_json_without_a_handle_names_the_display_name_and_omits_the_absent_fields() {
+        let profile = crate::config::ProfileConfig {
+            display_name: "Kaoru".to_owned(),
+            name: None,
+            about: String::new(),
+            picture: None,
+            nip05: None,
+            website: None,
+        };
+        assert_eq!(
+            metadata_json(&profile),
+            r#"{"name":"Kaoru","display_name":"Kaoru","about":"","bot":true}"#
+        );
     }
 
     #[test]
