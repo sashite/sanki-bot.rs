@@ -84,9 +84,10 @@ hold the module before entering a pool, challenging, founding or accepting.
   module's `select_conclusion` then decides the session is over; a
   non-conforming Conclusion — the opponent's or a stranger's — is logged and
   ignored.
-- **Proposes a rematch** (a kind-`3420` rematch challenge citing the
-  canonical Conclusion) per its willingness, one live challenge per
-  concluded game.
+- **Never proposes a rematch.** It accepts one — from a human or a sibling —
+  whenever it is free: the concluded game's cadence slot stays with the pair
+  for the rematch window, then any free slot of the cadence will do; against
+  a sibling, the bot-vs-bot budget applies too.
 - **Stars** a notable game (kind `7`), rarely.
 
 ## Design notes
@@ -94,11 +95,11 @@ hold the module before entering a pool, challenging, founding or accepting.
 See ADR-0014 for the full design, ADR-0033 and ADR-0034 for the arbiterless
 protocol and the module, ADR-0039 for the cadence families and ADR-0040 for
 the slots, the direct-path variant rule and the Robotto roster. Notable v1 choices: self-timed only, a single relay,
-no premoves, no outbound fresh Direct Challenges, stateless restart from relay
-replay (sessions, rematch challenges and pending Pairings are recovered).
+no premoves, no outbound Direct Challenges (fresh or rematch), stateless restart
+from relay replay (sessions and pending Pairings are recovered).
 Concurrency is capped **per cadence family** — `[bot.play.max_concurrent]`,
 one table of four (ADR-0039 §6) — through the **cadence slots** of ADR-0040
-§3 (`src/slots.rs`): every founding, the bot's own rematch proposal included,
+§3 (`src/slots.rs`): every founding, an accepted rematch included,
 is admitted through a per-(bot, cadence) automaton — committed, playing,
 cooling — that keeps a concluded game's slot with the pair for the rematch
 window (`REMATCH_WINDOW_SECS = 60`, the app's number too) and with nobody

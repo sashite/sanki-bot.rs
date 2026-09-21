@@ -12,7 +12,7 @@
 //! session a Pairing declares and accepting Direct Challenges by founding
 //! the Game Session (3422), exchanging Plies (3423) under the Time
 //! Accounting discipline, concluding (3425) only with the verdict the rule
-//! system yields, and proposing rematches (3420).
+//! system yields, and accepting — never proposing — rematches (3420).
 //!
 //! Rule semantics are never reimplemented (ADR-0034): the session's module
 //! is the one oracle of state, legality and verdict; `sashite-sanki-player`
@@ -47,7 +47,6 @@ mod module;
 mod persona;
 mod prng;
 mod publish;
-mod rematch;
 mod rules;
 mod session;
 mod slots;

@@ -32,7 +32,9 @@
 //! the player concludes, with the verdict the rule system yields): at a
 //! 10 s/move cadence the opponent opens, the bot answers, the opponent
 //! never moves again — and the bot, after its courtesy delay, publishes a
-//! Conclusion claiming the win on time, and exactly one.
+//! Conclusion claiming the win on time, and exactly one — and no rematch
+//! proposal after it: the bots answer rematches, they never ask for one
+//! (0.12.0).
 //!
 //! A third bench pins the **directed path** (ADR-0014 §6.3; ADR-0040 §2):
 //! the opponent challenges the bot directly (kind 3420), the bot accepts by
@@ -584,13 +586,20 @@ async fn concludes_with_the_win_on_time_the_rule_system_yields_once() {
     }));
 
     // Exactly one Conclusion: once its echo is back, the session is
-    // concluded for the bot and nothing more is published for it.
+    // concluded for the bot and nothing more is published for it — no
+    // second Conclusion, and no rematch proposal either (before 0.12.0 the
+    // bot published a kind-3420 right after the Conclusion, three games in
+    // four; twenty seconds is ample to catch it).
     tokio::time::sleep(Duration::from_secs(20)).await;
-    assert_eq!(
-        conclusions(&bench.relay.received().await).len(),
-        1,
-        "one Conclusion, never two"
-    );
+    let received = bench.relay.received().await;
+    assert_eq!(conclusions(&received).len(), 1, "one Conclusion, never two");
+    let proposals = received
+        .iter()
+        .filter(|frame| {
+            frame.kind == u64::from(DIRECT_CHALLENGE_KIND) && frame.pubkey == bench.bot_hex
+        })
+        .count();
+    assert_eq!(proposals, 0, "the bot never proposes a rematch");
 }
 
 #[tokio::test(flavor = "multi_thread")]

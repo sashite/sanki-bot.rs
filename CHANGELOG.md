@@ -3,6 +3,26 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] — 2026-09-21
+
+The bots answer rematches; they no longer ask for them — so two members of
+a fleet may meet on a direct challenge without the game turning into a
+series.
+
+### Removed
+- The bot's own rematch proposal: no kind-`3420` rematch challenge is ever
+  published (`maybe_offer_rematch`, the `offered_rematches` set and its
+  recovery at start, and the `rematch` module — `wants_rematch`,
+  `rematch_challenge_tags` — are gone).
+- The per-game willingness dice on an incoming SIBLING rematch challenge.
+
+### Changed
+- An incoming rematch challenge, from a human or a sibling, is accepted
+  whenever the bot is free: through the cooling hold the concluded game
+  left, or any free slot of the cadence once it has run out; against a
+  sibling the bot-vs-bot budget applies as to any founding. Its checks
+  against the concluded session (`verify_rematch`) are unchanged.
+
 ## [0.11.0] — 2026-09-19
 
 The personas get a NIP-05 (ADR-0023 §4): `julee@`, `ogichan@`,

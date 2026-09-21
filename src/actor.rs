@@ -33,7 +33,6 @@ use crate::founding;
 use crate::module::{self, Check, Describe, Runtime};
 use crate::prng::SplitMix64;
 use crate::publish::{publish_profile_abroad, publish_self_timed, Pow, RelayClock};
-use crate::rematch;
 use crate::rules::LoadedRuleSystem;
 use crate::session::{self, Events, Seat, SessionTerms, Timing};
 use crate::slots::Slots;
@@ -65,11 +64,11 @@ const SIGMA_CORRESPONDENCE_SECS: u64 = 60;
 const COURT_MARGIN_SECS: u64 = 30;
 const OWN_ENTRY_WINDOW_SECS: u64 = 180;
 
-/// The `accept_until` window of a rematch challenge — the one published
-/// rematch window of every Sashité client, `W` (ADR-0040 §4): the app's
-/// `rematch-window.ts` publishes the same sixty seconds. It is also how long
-/// a concluded game's cadence slot stays with the pair (`slots`, §3): long
-/// enough for the Rematch button, and for nobody else.
+/// The rematch window of every Sashité client, `W` (ADR-0040 §4): the app's
+/// `rematch-window.ts` publishes the same sixty seconds as the `accept_until`
+/// of its rematch challenges. It is how long a concluded game's cadence slot
+/// stays with the pair (`slots`, §3): long enough for the opponent's Rematch
+/// button, and for nobody else.
 const REMATCH_WINDOW_SECS: u64 = 60;
 
 /// How far back the self-subscription replays when the bot starts. The
@@ -232,13 +231,8 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     let mut courted_entries: BTreeSet<EventId> = BTreeSet::new();
     let mut considered_challenges: BTreeSet<EventId> = BTreeSet::new();
     let mut founded_pairings: BTreeSet<EventId> = BTreeSet::new();
-    // Games we have already challenged to a rematch, keyed to OUR challenge's
-    // `accept_until` — one LIVE challenge per game, whether it went out
-    // proactively (on the verdict) or in reply to the opponent's; a lapsed
-    // one may be renewed when the opponent proposes after it expired.
-    let mut offered_rematches: BTreeMap<EventId, u64> = BTreeMap::new();
     // The cadence slots (ADR-0040 §3): every founding — a pool entry, an
-    // acceptance, the bot's own rematch proposal — is admitted through this
+    // acceptance, a rematch the opponent proposes — is admitted through this
     // automaton, which is what keeps the bot at its cap per cadence and a
     // concluded game's slot with the pair for the rematch window. Behind a
     // mutex so the publish tasks can release a commitment they failed to make.
@@ -308,12 +302,6 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
     {
         tracing::warn!(error = %error, "session recovery incomplete");
     }
-    // …and rebuild what we have already challenged, for the same reason: the
-    // one-challenge-per-game gate lives in memory, so a restart would
-    // otherwise reopen every game the bot ever finished.
-    if let Err(error) = recover_offered_rematches(&client, &mut offered_rematches, me).await {
-        tracing::warn!(error = %error, "rematch recovery incomplete");
-    }
     // …and found the Pairings that landed while the bot was down, while
     // their founding window is open (a Pairing has no other trigger).
     match fetch_many(
@@ -372,7 +360,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
             _ = tick.tick() => {
                 service_all(
                     &client, &ctx, &relay_clock, &mut sessions, &slots, &mut concluded,
-                    &mut rng, me, &mut starred_today, &mut offered_rematches, None,
+                    &mut rng, me, &mut starred_today, None,
                 )
                 .await;
             }
@@ -394,7 +382,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                 handle_event(
                     &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                     &mut considered_challenges, &mut founded_pairings,
-                    &mut offered_rematches, &slots, &mut concluded, &own_events,
+                    &slots, &mut concluded, &own_events,
                     &mut starred_today, &mut rng, me, event,
                 ).await;
             }
@@ -404,7 +392,7 @@ pub async fn run(mut ctx: BotContext) -> Result<()> {
                     handle_event(
                         &client, &ctx, &relay_clock, &mut sessions, &mut courted_entries,
                         &mut considered_challenges, &mut founded_pairings,
-                        &mut offered_rematches, &slots, &mut concluded, &own_events,
+                        &slots, &mut concluded, &own_events,
                         &mut starred_today, &mut rng, me, *event,
                     ).await;
                 }
@@ -522,44 +510,6 @@ async fn recover_sessions(
             tracing::debug!(error = %error, "skipping unresumable session");
         }
     }
-    Ok(())
-}
-
-/// Rebuild the set of games the bot has already challenged to a rematch (§9,
-/// stateless restart). Our own rematch challenges are the durable record of
-/// what we already proposed, so they are what is read back. A failure here is
-/// warned about, not fatal: the cost is a possible duplicate challenge, which
-/// the `(rematch, concluded session)` slot absorbs.
-async fn recover_offered_rematches(
-    client: &Client,
-    offered_rematches: &mut BTreeMap<EventId, u64>,
-    me: PublicKey,
-) -> Result<()> {
-    let challenges = fetch_many(
-        client,
-        Filter::new()
-            .kind(Kind::Custom(DIRECT_CHALLENGE_KIND))
-            .author(me),
-    )
-    .await?;
-    for challenge in &challenges {
-        if let [concluded] = tags::events_with_marker(challenge, "rematch_of").as_slice() {
-            let deadline: u64 = tags::accept_until(challenge)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| {
-                    challenge
-                        .created_at
-                        .as_secs()
-                        .saturating_add(REMATCH_WINDOW_SECS)
-                });
-            let entry = offered_rematches.entry(*concluded).or_insert(0);
-            *entry = (*entry).max(deadline);
-        }
-    }
-    tracing::debug!(
-        games = offered_rematches.len(),
-        "recovered the already-challenged rematch set"
-    );
     Ok(())
 }
 
@@ -807,7 +757,6 @@ async fn handle_event(
     courted_entries: &mut BTreeSet<EventId>,
     considered_challenges: &mut BTreeSet<EventId>,
     founded_pairings: &mut BTreeSet<EventId>,
-    offered_rematches: &mut BTreeMap<EventId, u64>,
     slots: &Arc<Mutex<Slots>>,
     concluded: &mut BTreeSet<EventId>,
     own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
@@ -854,7 +803,6 @@ async fn handle_event(
                     slots,
                     concluded,
                     own_events,
-                    offered_rematches,
                     rng,
                     me,
                     &event,
@@ -891,7 +839,6 @@ async fn handle_event(
                         rng,
                         me,
                         starred_today,
-                        offered_rematches,
                         Some(session_id),
                     )
                     .await;
@@ -903,20 +850,15 @@ async fn handle_event(
 }
 
 /// Terminate a tracked session on its canonical Conclusion: release the
-/// fleet budget slot, move its cadence hold to `Cooling` — the slot stays
-/// with the pair for the rematch window (ADR-0040 §3) — then (if the persona
-/// is willing) propose a rematch.
-#[allow(clippy::too_many_arguments)]
-async fn terminate_session(
-    client: &Client,
+/// fleet budget slot and move its cadence hold to `Cooling` — the slot stays
+/// with the pair for the rematch window (ADR-0040 §3), so a rematch the
+/// OPPONENT proposes finds the bot free. The bot never proposes one itself.
+fn terminate_session(
     ctx: &BotContext,
-    relay_clock: &RelayClock,
     slots: &Arc<Mutex<Slots>>,
     me: PublicKey,
     meta: &SessionMeta,
-    conclusion: &EventId,
     concluded_at: u64,
-    offered: &mut BTreeMap<EventId, u64>,
 ) {
     ctx.ledger.session_changed(&me, &meta.opponent, false);
     // Playing → Cooling(t_end + W). A game that ended long ago — re-observed
@@ -925,125 +867,6 @@ async fn terminate_session(
         &meta.session.id,
         concluded_at.saturating_add(REMATCH_WINDOW_SECS),
     );
-    // The offer is for a player still at the board.
-    if relay_clock.now_secs().saturating_sub(concluded_at) > REMATCH_WINDOW_SECS {
-        return;
-    }
-    maybe_offer_rematch(
-        client,
-        ctx,
-        relay_clock,
-        slots,
-        &meta.session,
-        &meta.terms,
-        conclusion,
-        false,
-        offered,
-    )
-    .await;
-}
-
-/// Challenge the opponent to a rematch of `concluded`, unless our own
-/// challenge for this game is still LIVE, the persona is unwilling (a
-/// per-game decision the `always` flag overrides — reciprocating a human's
-/// explicit proposal is unconditional), the concluded game's cadence slot is
-/// no longer cooling (ADR-0040 §3: a proposal is a founding the bot commits
-/// to, admitted like one — through the hold the game left), or — against a
-/// sibling bot — the bot-vs-bot budget is spent. Shared by both triggers
-/// (the proactive challenge on the verdict and the reply to an incoming
-/// one), which is why the one-live-challenge-per-game guard lives here.
-/// Best-effort: a failure is logged, never propagated.
-#[allow(clippy::too_many_arguments)]
-async fn maybe_offer_rematch(
-    client: &Client,
-    ctx: &BotContext,
-    relay_clock: &RelayClock,
-    slots: &Arc<Mutex<Slots>>,
-    concluded_session: &Event,
-    concluded: &SessionTerms,
-    conclusion: &EventId,
-    always: bool,
-    offered: &mut BTreeMap<EventId, u64>,
-) {
-    let me = ctx.keys.public_key();
-    let Some(opponent) = concluded.opponent_of(&me) else {
-        return;
-    };
-    let now = Timestamp::now().as_secs();
-    if offered
-        .get(&concluded.id)
-        .is_some_and(|deadline| *deadline > now)
-    {
-        return;
-    }
-    if !lock_slots(slots).is_cooling(&concluded.id, relay_clock.now_secs()) {
-        tracing::debug!(rematch_of = %concluded.id, "rematch not proposed: the slot is no longer with the pair");
-        return;
-    }
-    if !always
-        && !rematch::wants_rematch(
-            ctx.bot_seed,
-            &concluded.id,
-            rematch::DEFAULT_REMATCH_PROBABILITY,
-        )
-    {
-        return;
-    }
-    if ctx.ledger.is_member(&opponent) && !ctx.ledger.may_court_sibling() {
-        tracing::debug!(against = %opponent, "rematch not proposed: bot-vs-bot budget spent");
-        return;
-    }
-    // The premium re-check on the proposing side (*Premium* §1.3): a rematch
-    // restates the concluded terms, so an asymmetric imposition is proposed
-    // again only while its original imposer is premium — fail-closed.
-    match original_imposer(client, concluded_session, concluded).await {
-        Ok(None) => {}
-        Ok(Some(imposer)) => {
-            if !admission::is_premium(ctx.fleet.admission_url.as_deref(), &imposer).await {
-                tracing::debug!(rematch_of = %concluded.id, "rematch not proposed: the original imposer is not premium");
-                return;
-            }
-        }
-        Err(reason) => {
-            tracing::debug!(rematch_of = %concluded.id, reason, "rematch not proposed: the chain could not be read");
-            return;
-        }
-    }
-    let terms = concluded.clone();
-    let conclusion = *conclusion;
-    let hint = tags::norm_relay(&ctx.fleet.relay_url).to_owned();
-    let result = publish_self_timed(
-        client,
-        &ctx.keys,
-        relay_clock,
-        Kind::Custom(DIRECT_CHALLENGE_KIND),
-        Pow::Mined(ctx.fleet.pow_difficulty),
-        move |created_at| {
-            let accept_until = created_at.as_secs().saturating_add(REMATCH_WINDOW_SECS);
-            let tags =
-                rematch::rematch_challenge_tags(&terms, &conclusion, &me, accept_until, &hint)
-                    .unwrap_or_default();
-            (tags, String::new())
-        },
-    )
-    .await;
-    match result {
-        Ok(challenge) => {
-            let deadline: u64 = tags::accept_until(&challenge)
-                .and_then(|value| value.parse().ok())
-                .unwrap_or_else(|| now.saturating_add(REMATCH_WINDOW_SECS));
-            offered.insert(concluded.id, deadline);
-            // Our challenge lives until `deadline`: so does the hold.
-            lock_slots(slots).extend_cooling(&concluded.id, deadline);
-            tracing::info!(
-                rematch_of = %concluded.id,
-                against = %opponent,
-                challenge = %challenge.id,
-                "proposed a rematch"
-            );
-        }
-        Err(error) => tracing::warn!(error = %error, "rematch challenge publish failed"),
-    }
 }
 
 /// React to a live pool entry (§6.2): compatibility, fleet budget, async
@@ -1325,7 +1148,6 @@ async fn consider_direct_challenge(
     slots: &Arc<Mutex<Slots>>,
     concluded: &BTreeSet<EventId>,
     own_events: &tokio::sync::mpsc::UnboundedSender<Event>,
-    offered_rematches: &mut BTreeMap<EventId, u64>,
     rng: &mut SplitMix64,
     me: PublicKey,
     challenge: &Event,
@@ -1345,21 +1167,12 @@ async fn consider_direct_challenge(
         COURT_MARGIN_SECS,
         rng,
     )?;
-    // A rematch challenge: its constraints against the concluded session,
-    // and the persona's per-game willingness (a human's explicit proposal is
-    // answered unconditionally).
+    // A rematch challenge: its constraints against the concluded session.
+    // The bot never proposes a rematch, but answers one — human or sibling —
+    // whenever it is free: the cadence slots and, against a sibling, the
+    // bot-vs-bot budget below are the only gates.
     if let Some(refs) = plan.rematch {
         verify_rematch(client, ctx, challenge, refs).await?;
-        let human = !ctx.ledger.is_member(&plan.challenger);
-        if !human
-            && !rematch::wants_rematch(
-                ctx.bot_seed,
-                &refs.concluded,
-                rematch::DEFAULT_REMATCH_PROBABILITY,
-            )
-        {
-            return Err("rematch declined (persona)");
-        }
     }
     // Admission through the cadence slots (ADR-0040 §3): a fresh challenge
     // needs a free hold; a rematch goes through the cooling hold its
@@ -1429,10 +1242,6 @@ async fn consider_direct_challenge(
     // event the client itself sent is never notified, so the subscription
     // would not deliver it.
     let session_plan = founding::accept_direct_challenge(challenge, &plan, me, &ctx.describe)?;
-    if let Some(refs) = plan.rematch {
-        // Accepting theirs supersedes proposing ours.
-        offered_rematches.insert(refs.concluded, u64::MAX);
-    }
     // Committed, keyed by the challenge, until its acceptance window closes:
     // the Game Session is published after the persona's reflection, and the
     // slot must be held meanwhile (a rematch keeps its cooling hold beside
@@ -1660,7 +1469,6 @@ async fn service_all(
     rng: &mut SplitMix64,
     me: PublicKey,
     starred_today: &mut u64,
-    offered_rematches: &mut BTreeMap<EventId, u64>,
     only: Option<EventId>,
 ) {
     let ids: Vec<EventId> = match only {
@@ -1672,23 +1480,12 @@ async fn service_all(
             continue;
         };
         match service_session(client, ctx, relay_clock, meta, rng, starred_today).await {
-            // The canonical Conclusion that ended it — carried through, since
-            // the rematch challenge cites it as its `concluded_by` proof.
-            Ok(Some((conclusion_id, concluded_at))) => {
+            // The cutoff of the canonical Conclusion that ended it: the
+            // cooling hold is measured from it.
+            Ok(Some(concluded_at)) => {
                 if let Some(meta) = sessions.remove(&id) {
                     concluded.insert(id);
-                    terminate_session(
-                        client,
-                        ctx,
-                        relay_clock,
-                        slots,
-                        me,
-                        &meta,
-                        &conclusion_id,
-                        concluded_at,
-                        offered_rematches,
-                    )
-                    .await;
+                    terminate_session(ctx, slots, me, &meta, concluded_at);
                 }
             }
             Ok(None) => {}
@@ -1699,10 +1496,9 @@ async fn service_all(
     }
 }
 
-/// Service one session. Returns `Ok(Some((conclusion, cutoff)))` — the id
-/// and the cutoff of the canonical Conclusion that ended it — when the
-/// session is finished and may be dropped, `Ok(None)` while it is still
-/// running.
+/// Service one session. Returns `Ok(Some(cutoff))` — the cutoff of the
+/// canonical Conclusion that ended it — when the session is finished and may
+/// be dropped, `Ok(None)` while it is still running.
 #[allow(clippy::too_many_arguments)]
 async fn service_session(
     client: &Client,
@@ -1711,7 +1507,7 @@ async fn service_session(
     meta: &mut SessionMeta,
     rng: &mut SplitMix64,
     starred_today: &mut u64,
-) -> Result<Option<(EventId, u64)>> {
+) -> Result<Option<u64>> {
     let session_id = meta.session.id;
     // The relay's clock, as estimated: the cutoff of every question asked
     // of the module, and what deadlines are measured against.
@@ -1753,7 +1549,6 @@ async fn service_session(
         }
     }
     if let Some(canonical) = canonical {
-        let conclusion_id = EventId::from_hex(&canonical.id)?;
         if now.saturating_sub(canonical.cutoff) <= REMATCH_WINDOW_SECS {
             maybe_star(
                 client,
@@ -1773,7 +1568,7 @@ async fn service_session(
             second = canonical.verdict.result.second,
             "session concluded"
         );
-        return Ok(Some((conclusion_id, canonical.cutoff)));
+        return Ok(Some(canonical.cutoff));
     }
 
     let view =

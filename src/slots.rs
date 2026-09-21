@@ -247,10 +247,9 @@ impl Slots {
         });
     }
 
-    /// A rematch challenge of `session` is live until `until` (theirs
-    /// observed, or ours published): the cooling hold lasts at least as long,
-    /// so a challenge published in the window's last second is honoured for
-    /// its whole life.
+    /// The opponent's rematch challenge of `session` is live until `until`:
+    /// the cooling hold lasts at least as long, so a challenge published in
+    /// the window's last second is honoured for its whole life.
     pub fn extend_cooling(&mut self, session: &EventId, until: u64) {
         for hold in &mut self.holds {
             if let Hold::Cooling {
