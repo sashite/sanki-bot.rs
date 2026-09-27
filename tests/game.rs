@@ -189,7 +189,7 @@ async fn play(engine: Option<&EngineSpec>) {
     let game = Game::new(&bench.ctx, terms.clone(), now, Vec::new());
     let (tx, rx) = mpsc::channel(64);
     let ctx = Arc::clone(&bench.ctx);
-    let running = tokio::spawn(game.run(ctx, rx));
+    let running = tokio::spawn(game.run(ctx, rx, false));
 
     // The bot is `first`: its Ply lands, paced at anchor + 2 s.
     let first_ply = wait_for_ply(&bench, 1, &bench.world.first.public_key()).await;
@@ -300,7 +300,7 @@ async fn a_canonical_conclusion_closes_the_game_whoever_signed_it() {
     let terms = session::terms(&session, &pairing).unwrap();
     let game = Game::new(&bench.ctx, terms.clone(), now, Vec::new());
     let (tx, rx) = mpsc::channel(64);
-    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx));
+    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx, false));
     let first_ply = wait_for_ply(&bench, 1, &bench.world.first.public_key()).await;
     // Stamped after the bot's Ply: a resignation after a move, not the
     // residual one against the invoker.
@@ -329,7 +329,7 @@ async fn stop_ends_the_game() {
     let terms = session::terms(&session, &pairing).unwrap();
     let game = Game::new(&bench.ctx, terms, now, Vec::new());
     let (tx, rx) = mpsc::channel(64);
-    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx));
+    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx, false));
     tx.send(GameInput::Stop).await.unwrap();
     let end = tokio::time::timeout(Duration::from_secs(10), running)
         .await
@@ -391,7 +391,7 @@ async fn a_lost_evaluation_on_a_streak_resigns_instead_of_moving() {
     let terms = session::terms(&session, &pairing).unwrap();
     let game = Game::new(&bench.ctx, terms, now, Vec::new());
     let (_tx, rx) = mpsc::channel(64);
-    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx));
+    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx, false));
     let end = tokio::time::timeout(Duration::from_secs(20), running)
         .await
         .expect("the game closes")
@@ -430,7 +430,7 @@ async fn a_standing_offer_is_accepted_when_the_draw_is_judged_likely() {
     let terms = session::terms(&session, &pairing).unwrap();
     let game = Game::new(&bench.ctx, terms.clone(), now, Vec::new());
     let (tx, rx) = mpsc::channel(64);
-    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx));
+    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx, false));
 
     // Without a standing offer the bot moves, whatever its evaluation.
     let first_ply = wait_for_ply(&bench, 1, &bench.world.first.public_key()).await;
@@ -496,7 +496,7 @@ async fn a_co_writers_ply_withdraws_the_answered_turn() {
     let terms = session::terms(&session, &pairing).unwrap();
     let game = Game::new(&bench.ctx, terms.clone(), now, Vec::new());
     let (tx, rx) = mpsc::channel(64);
-    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx));
+    let running = tokio::spawn(game.run(Arc::clone(&bench.ctx), rx, false));
 
     // While the bot's answer waits for its pace (anchor + 2 s), a co-writer
     // acting with the same key publishes a Ply for the step, visible at

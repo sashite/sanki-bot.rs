@@ -17,6 +17,11 @@ publish = false
 name = "players"
 path = "src/main.rs"
 
+# The v4 bot (ADR-0045 §7): `sanki-bot CONFIG.toml`.
+[[bin]]
+name = "sanki-bot"
+path = "src/bin/sanki-bot.rs"
+
 # The v4 bot is built as a library first, module by module, beside the
 # fleet's binary (ADR-0045 Plan, step 4): the SEI host, the fallback, then
 # the configuration, the identity and the runtime. The binary switches to it
@@ -73,13 +78,14 @@ nix = { version = "0.30", features = ["signal"] }
 hmac = "0.12"
 hkdf = "0.12"
 zeroize = "1"
+# The relay's notification stream (the runtime's loop); in the tree already.
+futures-util = "0.3"
 
 [dev-dependencies]
 # The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary
 # connects to, with the one fault injection the §6.5 incident needs. Versions
 # already in the dependency tree (via nostr-sdk), so nothing new compiles.
 tokio-tungstenite = "0.26"
-futures-util = "0.3"
 # The reference module's library face: the same answers as the module, natively,
 # so the module-driven paths are tested without building or shipping a `.wasm`.
 sashite-sanki-kernel-wasm = "0.1"

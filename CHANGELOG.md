@@ -109,6 +109,89 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   turn.
 - `sei::search` takes an `interrupt` (`tokio::sync::Notify`): the caller
   ends the search early, as the hard stop does (`cancel`, then the grace).
+- **`bot`** (ADR-0045 §2, §7 *Start*) — the start-time modules, before the
+  runtime that composes them: `reads` (a read that proves something —
+  `Found`, `ConfirmedAbsent`, `Unknown` — on the client's proven query;
+  `latest` by NIP-01's replaceable rule; `paged` walking `until` back from
+  the newest page, since a relay caps what one `REQ` returns); `adoption`
+  (the three reads that refuse a person's key: a kind `0` without
+  `bot: true`, a kind `3` or `10000` without the library's `client` tag;
+  an unknown read fails the start); `standing` (the profile with
+  `bot: true` and `nip05`, the Challenge Policy `d = sanki`, the contact
+  list under `following`, the mute list — each compared with the relay's
+  copy and published only when it differs, stamped after the copy; an
+  empty mute list only to replace a non-empty one; a copy stamped beyond
+  the relay's future tolerance left, logged at `error`); `echo` (the
+  detector: the bot's four kinds, stamped after the watch began, ours by
+  the publisher's word, the library's tag meaning another instance, any
+  other tag or none a person); `slots` (per family the games open plus
+  the reservations held; rule 8's consumption of the bot's own
+  reservation by the target's challenge, which then holds no slot but
+  stays pending; a founded session always recorded, one over the cap if
+  need be); `rebuild` (the bot's sessions back to the longest game any
+  family allows — six hundred half-moves at a day for correspondence, an
+  hour otherwise —, one query per session for its Plies and Conclusions,
+  the bot's challenges of the last day and of the longest game and every
+  session answering them, the earliest conforming session per founding,
+  a session under other rules or on another relay or attested or stamped
+  after the challenge's `accept_until` ignored, open or closed by
+  `select_conclusion` — a session the module cannot judge resumed by no
+  one —, the bot's pending challenges within `accept_until + L + skew`,
+  the challenges to the bot within `accept_until` for the runtime to
+  re-admit). Four tests over the in-process relay (`tests/start.rs`).
+- **The bot runs** (ADR-0045 §7 *Running a bot*): `Bot::new(config,
+  identity)` takes the lease before any other work; `Bot::run` probes the
+  engine, reads the relay's document, connects, loads the rule system,
+  then `bot::start` runs the start's network steps in the ADR's order —
+  the document checked and the publisher opened with its bounds, the
+  clock check, the quarantine (`upper + lower + 2` s), the subscriptions
+  (the session kinds naming the bot or signed by it, from the
+  quarantine's start), adoption, the rebuild, the standing events, the
+  echo detector's watch — and `bot::runtime` runs the loop until
+  `SIGTERM` or `SIGINT`: the relay's notifications (the echo detector
+  first; a Direct Challenge to the bot through the local checks, its
+  reservation, then the network checks and the founding in a task of
+  their own; a Game Session naming the bot checked against its founding
+  and opened — founded by a target on the bot's challenge, by a person
+  acting with the key, one over the cap if need be; Plies and
+  Conclusions to their game, held for a session not open yet), the games'
+  endings (the slot freed), the challenge work's results, and a
+  one-second tick (incoming reservations lapse; the bot's pending
+  challenges settled by the query §5 prescribes, asked again a minute
+  later when unanswered; a due target challenged at its jittered
+  instant, one a minute, `Unknown` resolved by id before the next;
+  unacknowledged foundings resolved by id; a reconnection read by the
+  relay's status — every open session reads the relay again, the
+  pending challenges are asked again; a halted bot says so each minute).
+  `Halted` (another instance of the library): no admission, no
+  challenge, reservations released, every game told to stop and its
+  engine ended, the work in flight aborted. On stop: no more admissions,
+  every game told to stop, five seconds for the publications in flight,
+  the publisher closed. `bot::challenges` holds the I/O around a
+  challenge: rule 11 (not already founded) and rule 12 (the rating, both
+  players attested by the authority in the `sanki` pool, within
+  `max_delta`), each a proven read, fail-closed; the founding within
+  `[challenge.created_at, accept_until]`; the sending (the mirror form,
+  `accept_until = created_at + accept_secs`); the query on a pending
+  challenge (the earliest conforming session by the target, stamped by
+  `accept_until`; a non-conforming one logged at `warn` and ignored).
+- **`sanki-bot`**, the binary: `sanki-bot CONFIG.toml`, `RUST_LOG`
+  (`info` by default), `--generate-identity` writing the key file and
+  printing the npub; the fleet's `players` stays until its modules go.
+- `game`: a game opened at runtime reads the session from the relay
+  before its first pass, and again on `GameInput::Reread` (a
+  reconnection); a timeout claim, the opponent's as well as the bot's
+  own, rests on a fresh proven read.
+- Five tests end to end over the in-process relay (`tests/bot.rs`): two
+  bots challenging each other by configuration and playing — the
+  challenge, the founding, the game, a resignation, the library's tag on
+  every event, no second challenge or founding; a restart resuming a
+  session a target founded and keeping a pending challenge's
+  reservation, then following the target's late but conforming answer
+  one over the cap; a person's key refused at start; another instance of
+  the library halting the bot — no founding, no further Ply in an open
+  game; a person's challenge founded once, and a session a person founded
+  with the key followed.
 - Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg`, a
   safe wrapper), `hmac`, `hkdf`, `zeroize`; `tokio` gains `process` and
   `io-util`.
@@ -127,6 +210,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Notes
 
+- **The start's order.** `Bot::run` loads the rule system before the
+  publisher measures its bounds (ADR-0045 §7 lists step 3 before step
+  4): the module is needed by the clock check, which the publisher's
+  bounds do not need; nothing is published before either.
+- **The rebuild's bound.** The bot's sessions are read back to six hundred
+  half-moves at the per-move allowance of the families the configuration
+  plays — a day for correspondence, an hour otherwise — as the bot reads
+  the ADR's "longest game its families allow"; a session of a family no
+  longer played, older than that, is not resumed.
 - **The engine's priority.** ADR-0045 §3 launches the engine at a priority
   below the bot's. Lowering it from the bot takes `setpriority`, an `unsafe`
   call this crate forbids (`nix` 0.30 wraps none); the priority is left to

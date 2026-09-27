@@ -59,6 +59,7 @@ use sashite_sanki_client::drafts;
 use sashite_sanki_client::module::{self, Describe, Oracle, Verdict, VerdictAt};
 use sashite_sanki_client::notation;
 use sashite_sanki_client::publisher::{Outcome, Publisher, Resolution};
+use sashite_sanki_client::query;
 use sashite_sanki_client::session::{self, Events, Seat, SessionTerms};
 use serde_json::Value;
 use tokio::sync::{mpsc, Notify};
@@ -70,10 +71,10 @@ use crate::sei::{self, Engine, Host, Probe, SearchRequest, Verdict as EngineVerd
 
 /// The allowance for clock skew before concluding an acceptance or a
 /// resignation (§7), in seconds.
-const SKEW_ALLOWANCE_SECS: u64 = 2;
+pub const SKEW_ALLOWANCE_SECS: u64 = 2;
 
 /// How long a fresh read of the session may take before the decision.
-const REREAD_TIMEOUT: Duration = Duration::from_secs(5);
+pub const REREAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many times a Conclusion finally rejected or unbuildable is drafted
 /// again for the same verdict, with a growing pause.
@@ -193,6 +194,10 @@ pub enum GameEnd {
 pub enum GameInput {
     /// An event of this session, from the relay.
     Event(Event),
+    /// Read the session again from the relay before the next pass: a
+    /// reconnection, or a game opened at runtime (ADR-0045 §7
+    /// *Reconciliation*).
+    Reread,
     /// Stop: end the engine, publish nothing more.
     Stop,
 }
@@ -224,6 +229,8 @@ pub struct Game {
     streaks: Streaks,
     decided: Option<Decided>,
     stopped: bool,
+    /// A fresh read owed before the next pass.
+    reread_owed: bool,
 }
 
 impl Game {
@@ -260,6 +267,7 @@ impl Game {
             streaks: Streaks::default(),
             decided: None,
             stopped: false,
+            reread_owed: false,
         };
         for event in events {
             game.absorb(event);
@@ -284,6 +292,7 @@ impl Game {
     fn take(&mut self, input: GameInput) {
         match input {
             GameInput::Event(event) => self.absorb(event),
+            GameInput::Reread => self.reread_owed = true,
             GameInput::Stop => self.stopped = true,
         }
     }
@@ -306,18 +315,38 @@ impl Game {
             .min()
     }
 
-    /// Runs the game to its end.
+    /// Runs the game to its end. A game opened at runtime (`fresh`: not
+    /// from the rebuild, which read the relay) reads the session first.
     pub async fn run(
         mut self,
         ctx: Arc<GameContext>,
         mut inputs: mpsc::Receiver<GameInput>,
+        fresh: bool,
     ) -> GameEnd {
+        self.reread_owed = fresh;
         // The engine is launched as the session opens (ADR-0045 §5), off
         // the turn's clock.
         self.ensure_engine(&ctx, None).await;
         let end = loop {
             if self.stopped {
                 break GameEnd::Stopped;
+            }
+            if self.reread_owed {
+                // Owed until the relay answers: what is not seen is not
+                // acted on.
+                if self.reread(&ctx).await {
+                    self.reread_owed = false;
+                } else {
+                    tracing::warn!(session = %self.terms.id, "the relay did not answer the read; again in a second");
+                    tokio::select! {
+                        input = inputs.recv() => match input {
+                            Some(input) => self.take(input),
+                            None => break GameEnd::Stopped,
+                        },
+                        () = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    }
+                    continue;
+                }
             }
             let wake = match self.reconcile(&ctx, &mut inputs).await {
                 Ok(wake) => wake,
@@ -819,6 +848,12 @@ impl Game {
                                 interrupt.notify_one();
                             }
                         }
+                        Some(GameInput::Reread) => {
+                            // A reconnection: the search goes on; the read
+                            // comes before the next pass, and the chain
+                            // may prove changed then.
+                            self.reread_owed = true;
+                        }
                         Some(GameInput::Stop) | None => {
                             closed = input.is_none();
                             self.stopped = true;
@@ -1114,9 +1149,9 @@ impl Game {
         let mut request = request.clone();
         if !view.terminal {
             // A timeout: the opponent's, from their flag plus a second; our
-            // own, from our flag plus L plus a second, on a fresh read —
-            // a Ply of ours the relay holds, acknowledged or not, may yet
-            // be selected.
+            // own, from our flag plus L plus a second — on a fresh read: a
+            // Ply the relay holds, theirs unseen or ours unacknowledged,
+            // may yet be selected.
             let ours = view.on_move == self.seat;
             let claim_at = if ours {
                 flag.saturating_add(ctx.past_tolerance()).saturating_add(1)
@@ -1126,12 +1161,12 @@ impl Game {
             if now < claim_at {
                 return Ok(claim_at);
             }
-            if ours {
-                if !self.reread(ctx).await {
-                    return Ok(now.saturating_add(5));
-                }
-                request = self.request(ctx);
+            // A claim rests on a fresh, proven read: the opponent's Ply
+            // may be on the relay unseen.
+            if !self.reread(ctx).await {
+                return Ok(now.saturating_add(5));
             }
+            request = self.request(ctx);
         }
         if self.conclusion_attempts >= MAX_CONCLUSION_ATTEMPTS {
             tracing::warn!(session = %self.terms.id, "no more Conclusion attempts; waiting for the opponent's");
@@ -1220,8 +1255,8 @@ impl Game {
         }
     }
 
-    /// Reads the session's events from the relay again; whether the relay
-    /// answered.
+    /// Reads the session's events from the relay again, proven by its
+    /// EOSE; whether the relay answered.
     async fn reread(&mut self, ctx: &GameContext) -> bool {
         let filter = Filter::new()
             .kinds([
@@ -1229,17 +1264,15 @@ impl Game {
                 Kind::Custom(session::KIND_CONCLUSION),
             ])
             .event(self.terms.id);
-        let Ok(Some(relay)) = ctx.client.relay(&ctx.publisher.settings().relay).await else {
-            return false;
-        };
-        match tokio::time::timeout(REREAD_TIMEOUT, relay.fetch_events(vec![filter])).await {
-            Ok(Ok(events)) => {
+        let relay = &ctx.publisher.settings().relay;
+        match query::query(&ctx.client, relay, vec![filter], REREAD_TIMEOUT).await {
+            Some(events) => {
                 for event in events {
                     self.absorb(event);
                 }
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 }
