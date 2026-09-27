@@ -1,16 +1,25 @@
 # Changelog
 
-All notable changes to this service are documented in this file. The format is
-based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+All notable changes to this crate are documented in this file. The format is
+based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
+crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+The versions **0.12.0 and below** are the fleet binary `players`'s — the
+Robotto's private body (`sashite-sanki-player-nostr-bot`), renamed and made
+public on 2026-09-28 as the starting point of this crate (ADR-0045 v4). They
+are kept below for the record; `sashite-sanki-bot` starts at 0.1.0.
+
+## [0.1.0] — 2026-09-28
+
+The first release of the crate ADR-0045 v4 describes: one bot in one
+process — an identity, a TOML configuration, an SEI engine as a child
+process per game (or random play without one) — over the protocol client
+`sashite-sanki-client`.
 
 ### Added
 
-- **The v4 bot begins as a library** beside the fleet's binary (ADR-0045
-  Plan, step 4): `src/lib.rs` grows module by module until the runtime
-  exists and the binary switches to it; the fleet's modules are untouched
-  until then. Two modules land first:
+- **The v4 bot**, built module by module beside the fleet's binary
+  (ADR-0045 Plan, step 4) until the runtime existed:
   - **`sei`** — the SEI host (ADR-0045 §3; SEI 1.0.0 §5, §8, §11):
     `process` launches the engine as SEI §5 prescribes (the configured
     argument vector, no shell, an empty environment but for the configured
@@ -196,17 +205,28 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   safe wrapper), `hmac`, `hkdf`, `zeroize`; `tokio` gains `process` and
   `io-util`.
 
+### Removed
+
+- **The fleet.** The binary `players`, its supervisor and its modules (the
+  pool courtship, the Pairings, the rematches, the personas, the in-process
+  brain `sashite-sanki-player`), its `fleet.example.toml`, its e2e bench
+  and its cadence vectors: what the v4 bot leaves out of scope (the pool,
+  rematches, personas) waits for the extensions ADR-0045 §Scope names; the
+  Robotto run on the fleet's last release, 0.12.0, until then. With them go
+  the dependencies `sashite-sanki-player`, `nostchmaker`, `wasmi`,
+  `chrono`, `chrono-tz`, `anyhow`, `tracing-appender`, `tokio-tungstenite`,
+  `futures-util` (as a dev-dependency), `sashite-sanki-kernel-wasm` and
+  `wat`.
+
 ### Changed
 
-- The fleet's `config` module moved to `src/fleet_config.rs` (declared
-  with `#[path]` in `main.rs`, so nothing else in the binary changes),
-  making room for the library's `config`.
-
 - **Renamed** to `sashite-sanki-bot` (repository `sanki-bot.rs`), and made
-  public, as the starting point of the crate ADR-0045 v4 describes: the
-  engine as an SEI child process, one bot per process, a TOML configuration.
-  The binary keeps its name `players` until that refactor; nothing else
-  changes for the fleet in this release.
+  public, as the starting point of the crate ADR-0045 v4 describes. The
+  crate is published: `publish = false` is gone, the description, the
+  keywords and the README say what it is now; the `Dockerfile` builds
+  `sanki-bot`.
+- The CI installs the random engine from crates.io
+  (`sashite-sanki-sei-random-engine` 0.1.0) rather than from git.
 
 ### Notes
 

@@ -1,145 +1,110 @@
 # sashite-sanki-bot
 
-> **Renamed on 2026-09-28** from `sashite-sanki-player-nostr-bot`
-> (repository `sanki-player-nostr-bot.rs`), and made public. This is the body
-> of Sashité's Sanki bots — the Robotto's binary as it runs today — and the
-> starting point of the public `sashite-sanki-bot` crate decided by
-> [ADR-0045 v4](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0045-sanki-bot-crate.md):
-> one bot per process, its brain an engine speaking the
-> [Sashité Engine Interface](https://sashite.dev/specs/sei/1.0.0/) as a child
-> process, its behaviour a TOML file. Until that refactor lands, the code
-> below is the fleet's 0.12: the brain is `sashite-sanki-player`, wired in,
-> and the binary is still `players`. Some links point into `web-specs.md`,
-> a private repository whose documents are being published on sashite.dev.
+A **Sanki bot** for [Sashité](https://sashite.com/): one identity, one TOML
+configuration, one engine — a child process speaking the
+[Sashité Engine Interface](https://sashite.dev/specs/sei/1.0.0/) (SEI) —
+per game, in one process. Without an engine it plays at random: the bot of
+a course's first day, before the students write theirs. Decided by
+[ADR-0045 v4](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0045-sanki-bot-crate.md).
 
-The Sashité **player fleet** (ADR-0014): autonomous Nostr players for Sanki.
-One process supervises N configured personas — each an honest player with its
-own keypair, timezone, presence windows, cadence tastes, playing strength and
-temperament — playing sessions end-to-end over the public protocol: the
-matchmaking pool (kind `3418`), the Game Session (`3422`) it founds on a
-Pairing or publishes to accept a Direct Challenge (`3420`, fresh or rematch),
-Plies (`3423`) under the Time Accounting discipline, and the Conclusion
-(`3425`) it publishes **only with the verdict the rule system yields** — the
-suite has no arbiter (ADR-0033).
+## The map
 
-The bots hold no privileged key and are honestly labeled (`bot: true`,
-NIP-24). Nothing on the rules axis is theirs (ADR-0034):
+The bot stack, from the specification down to the binaries. The naming rule
+of the organisation: crate **`sashite-<x>`** ↔ repository **`<x>.<lang>`**.
 
-- the **rule system** — the Rule System event (kind `3417`) the fleet is
-  configured with, and the WebAssembly module it names by digest — is the one
-  oracle of the session: run under [`wasmi`](https://crates.io/crates/wasmi)
-  through the [Kernel ABI — Sanki](https://github.com/sashite/web-specs.md/blob/main/nostr/support/kernel-abi-sanki.md),
-  it answers the natural state of the session (the chain, the clocks, whose
-  turn), the legal moves, the prescribed initial position, and the verdict a
-  Conclusion published now must claim;
-- `sashite-sanki-player` — anytime move choice under the clock budget, over
-  the tip the module reached; its choice is played only if the module admits
-  it (a divergence is logged and a move the module admits is played instead).
+| Concept | Specification | Repository | Crate / artefact | Role |
+|---|---|---|---|---|
+| The engine protocol | [SEI 1.0.0](https://sashite.dev/specs/sei/1.0.0/) | `sashite.dev` | — | how a host and an engine talk: JSON Lines, FEEN, PMN, SIN |
+| What SEI means for Sanki | *SEI Rules Document — Sanki* | `web-specs.md` (`rules/sei-sanki.md`) | identifier `sashite.sanki.kernel/1` | canonical FEEN and PMN, styles, pairings, modules |
+| The rules | *Kernel — Sanki*, *Kernel ABI — Sanki* | [`sanki-engine.rs`](https://github.com/sashite/sanki-engine.rs), `sanki-kernel-wasm.rs` | [`sashite-sanki-engine`](https://crates.io/crates/sashite-sanki-engine), [`sashite-sanki-kernel-wasm`](https://crates.io/crates/sashite-sanki-kernel-wasm) (the module) | the only oracle; the PMN ↔ content converters |
+| The protocol client | ADR-0045 §1, the NIPs of [`sashite/nostr`](https://github.com/sashite/nostr) | [`sanki-client.rs`](https://github.com/sashite/sanki-client.rs) | [`sashite-sanki-client`](https://crates.io/crates/sashite-sanki-client) | the verbs: rule system, relay information, readers, drafts, publisher |
+| **The bot** | ADR-0045 §2–§7 | **`sanki-bot.rs`** (this repository) | **`sashite-sanki-bot`**, binary `sanki-bot` | one identity, one configuration, one SEI engine per game |
+| The engine to fork | SEI, the rules document | [`sanki-sei-random-engine.rs`](https://github.com/sashite/sanki-sei-random-engine.rs) | [`sashite-sanki-sei-random-engine`](https://crates.io/crates/sashite-sanki-sei-random-engine) | a complete SEI engine that plays at random; the students' starting point |
+| The reference brain | ADR-0015 | `sanki-player.rs` | `sashite-sanki-player` | search; wrapped as an SEI engine, the sparring partner |
+
+*Vocabulary.* **Engine** is SEI's word: a process that answers `search` with
+a Move. The rules are `sanki-engine` — a name that predates SEI and is kept;
+the `sei-` infix of the example engine's name is what tells the two apart.
+
+## What the bot does
+
+Over the public protocol, with no privileged key, honestly labelled
+(`bot: true`, NIP-24), under **one rule system** — the Rule System event
+(kind `3417`) it is configured with, whose WebAssembly module is the only
+oracle of state, legality and verdict (ADR-0034):
+
+- **Answers Direct Challenges** (kind `3420`) under its **Challenge Policy**
+  (kind `30420`: `everyone`, `following`, `rating`, `nobody`) and its mute
+  list, one cap per cadence family, the local checks in order and the
+  network checks fail-closed; the acceptance *is* the founding of the Game
+  Session (kind `3422`).
+- **Sends Direct Challenges** to configured targets, so that two bots meet
+  without a person — one a minute, at a jittered instant, at most one
+  pending per target.
+- **Plays** each session re-derived from the relay through the module on
+  every event and timer: the engine's `search` under the session's clock,
+  the hard stop before the flag, the fallback move when the engine gives no
+  answer, one content per step, never a stamp backdated.
+- **Concludes** only with the verdict the module yields — a rule ending, a
+  timeout — and **offers, accepts and resigns** on the engine's scores,
+  each policy enabled by the configuration, an acceptance or a resignation
+  concluded only once no earlier candidate can re-select the chain.
+- **Keeps its standing events** — profile, policy, contact list under
+  `following`, mute list — equal to the configuration, published only where
+  the relay's copy differs.
+- **Refuses a person's key** (adoption), fails with `KeyInUse` when another
+  instance holds the key on the host, and **halts** when another instance
+  of the library writes with it from elsewhere.
+- **Restarts stateless**: its open sessions, its pending challenges and the
+  challenges to it are rebuilt from the relay.
+
+Out of scope, each for a later ADR on top of this one: the matchmaking pool,
+rematches, personas and social acts, the profile abroad, premium variant
+imposition, several bots per process, pondering.
 
 ## Running
 
 ```sh
-cp fleet.example.toml ~/sanki-e2e/fleet.local.toml   # outside every repo
-$EDITOR ~/sanki-e2e/fleet.local.toml                 # personas, rules, key env names
-set -a; source ~/sanki-e2e/bots.local.env; set +a    # PLAYER_NSEC_* variables
-FLEET_CONFIG_PATH=~/sanki-e2e/fleet.local.toml cargo run --bin players
+cargo install sashite-sanki-bot
+cargo install sashite-sanki-sei-random-engine      # an engine, or none: random play
+cp sanki-bot.example.toml ~/sanki/kitsune.toml     # outside every repository
+$EDITOR ~/sanki/kitsune.toml                       # the relay, the rules, the engine, the policy, the caps
+sanki-bot --generate-identity ~/sanki/kitsune.toml # writes the key file (0600), prints the npub
+sanki-bot ~/sanki/kitsune.toml                     # until SIGTERM
 ```
 
-Environment: `FLEET_CONFIG_PATH` (required), one `PLAYER_NSEC_*` per bot
-(named by each `[[bot]]`'s `nsec_env`; never logged), `RUST_LOG` (optional),
-`PLAYERS_LOG_DIR` (optional: daily log files there, the last fourteen kept;
-stdout when unset). Every ten minutes each persona logs a `pulse` — its
-tracked sessions, each cadence's load against its cap, the relay's silence.
+`RUST_LOG` filters the log (`info` by default). The key never leaves its
+file: no environment variable, since the engine — a child process — would
+inherit it. The start refuses a relay that is not self-timed (its NIP-11
+`created_at_lower_limit` missing or above 5 s), a host whose latency or
+mining would stamp stale, a person's key, and a read the relay does not
+answer — nothing is written on an unknown state.
 
-The fleet file's optional `admission_url` names the admission service the
-premium checks ask (one GET, only on an asymmetric variant imposition or the
-rematch of one; absent, such impositions are refused without a request).
+## The configuration
 
-The fleet file names the rule system (`fleet.rules`, the kind-`3417` event id
-— the same id the app, the matchmaker and the rater are configured with) and
-where its event and module are cached (`fleet.rules_cache_dir`, default
-`./rules`). Both are loaded at start-up — the event from the cache or the
-relay, the module from the cache or the event's `url` hints — verified
-(signature, digest, ABI, `describe.game`) and instantiated once for the whole
-process; a fleet that cannot load them does not start, since a client MUST
-hold the module before entering a pool, challenging, founding or accepting.
-
-## What a persona does
-
-- **Courts** the pool (kind `3418`): mirrors a compatible entry — same
-  matchmaker, same rule system, same timing relay, a cadence and a variant of
-  the persona — within the fleet's bot-vs-bot budget.
-- **Founds** the session a Pairing (kind `3419`) naming it declares, as soon
-  as it is observed, unless a canonical Game Session for it already exists;
-  the content is the initial position the module prescribes.
-- **Accepts** a Direct Challenge (kind `3420`) addressed to it by publishing
-  the Game Session — the acceptance IS the founding — supplying what the
-  challenge delegated (an open variant, an open seat), whenever it can play
-  its **own** variant; the challenger's is theirs, so a cross-variant game
-  by delegation is accepted, and an **asymmetric** imposition of the bot's
-  variant is honoured iff the challenger is premium, asked of the admission
-  service (`fleet.admission_url`, fail-closed — *Premium* §1.3, ADR-0040 §2). A rematch challenge is
-  verified against the concluded session (both players, terms inherited,
-  seats swapped, its `concluded_by` checked by the module) before it is
-  accepted; a human's is answered unconditionally, a sibling bot's per the
-  persona's per-game willingness.
-- **Plays**: on each tick, the session's Plies and Conclusions are fetched,
-  the module's `natural_state` at the present instant gives the view, the
-  search chooses, the module's `legal_moves` has the last word, and the Ply
-  is published with the per-slot idempotence discipline (one slot, one
-  search; a lost publish is re-sent with the same content).
-- **Concludes** only when it wants the verdict the module predicts for a
-  Conclusion signed by it now: a terminal chain (either player states it),
-  the win on time (as the winner, after a courtesy delay —
-  `timeout_courtesy_secs`), the opponent's standing draw offer (per
-  temperament), its own resignation (per the sustained assessment). The
-  module's `select_conclusion` then decides the session is over; a
-  non-conforming Conclusion — the opponent's or a stranger's — is logged and
-  ignored.
-- **Never proposes a rematch.** It accepts one — from a human or a sibling —
-  whenever it is free: the concluded game's cadence slot stays with the pair
-  for the rematch window, then any free slot of the cadence will do; against
-  a sibling, the bot-vs-bot budget applies too.
-- **Stars** a notable game (kind `7`), rarely.
-
-## Design notes
-
-See ADR-0014 for the full design, ADR-0033 and ADR-0034 for the arbiterless
-protocol and the module, ADR-0039 for the cadence families and ADR-0040 for
-the slots, the direct-path variant rule and the Robotto roster. Notable v1 choices: self-timed only, a single relay,
-no premoves, no outbound Direct Challenges (fresh or rematch), stateless restart
-from relay replay (sessions and pending Pairings are recovered).
-Concurrency is capped **per cadence family** — `[bot.play.max_concurrent]`,
-one table of four (ADR-0039 §6) — through the **cadence slots** of ADR-0040
-§3 (`src/slots.rs`): every founding, an accepted rematch included,
-is admitted through a per-(bot, cadence) automaton — committed, playing,
-cooling — that keeps a concluded game's slot with the pair for the rematch
-window (`REMATCH_WINDOW_SECS = 60`, the app's number too) and with nobody
-else. The family of a founding is read by the one classifier of
-[Cadence — Sanki](https://github.com/sashite/web-specs.md/blob/main/nostr/support/cadence-sanki.md)
-(`src/cadence.rs`), pinned to the app's by the shared category-G vectors
-(`conformance/cadence.json`, vendored from `web-specs.md`).
-Timed behavior (think pacing, correspondence scheduling, win-on-time wakes)
-runs through a coarse periodic tick so the notification loop never blocks;
-per-bot randomness is seeded from the bot's pubkey, so a persona stays
-consistent with itself across restarts.
+One file, `schema = 1`, read into a `Config` whose types forbid the
+incoherent cases (ADR-0045 §4): the lists' bounds and intersections, the
+engine's command resolved to an executable and its `cwd` kept away from the
+data directory and the key, the score policies only with an engine, the
+outgoing time control playable by the per-move share rule, and the
+**capacity inequality** — the caps against the relay's rate limit. See
+`sanki-bot.example.toml`, every key commented.
 
 ## Development
 
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
-cargo test
+SANKI_SEI_RANDOM_ENGINE="$(which sanki-sei-random-engine)" cargo test
 cargo deny check
 ```
 
-The unit tests drive the module-driven paths with the reference module's
-**library face** (`sashite-sanki-kernel-wasm` as a dev-dependency — the same
-answers as the module, natively). The e2e benches (`tests/e2e/`) run the real
-binary against an in-process relay and need the module's bytes:
-`SANKI_MODULE=<path to sashite_sanki_kernel_wasm.wasm> cargo test --test e2e`
-— without it they are skipped. They pin the founding on a Pairing and the
-per-slot idempotence discipline, and the win-on-time Conclusion.
+The tests drive the module-driven paths with the reference module's native
+face and an in-process relay, both from `sashite-sanki-client`'s `testing`
+feature: the SEI host against real processes (the random engine when
+`SANKI_SEI_RANDOM_ENGINE` names one, scripted engines otherwise), whole
+games, the start's reads, and bots end to end — two of them challenging
+each other and playing.
 
 ## License
 

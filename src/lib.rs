@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `sashite-sanki-bot` — one bot: an identity, a configuration and an SEI
-//! engine command, in one process (ADR-0045).
-//!
-//! The library is built module by module beside the fleet's binary
-//! (`players`), which keeps running the Robotto until the v4 runtime exists:
+//! engine command, in one process (ADR-0045). The binary `sanki-bot` runs
+//! one ([`bot::Bot`]); the library is what it is made of:
 //!
 //! | Module | ADR-0045 | What it does |
 //! |---|---|---|
@@ -12,7 +10,7 @@
 //! | [`outgoing`] | §5 | which target is due for a challenge, and when to fire within the minute |
 //! | [`policy`] | §7 | draw offers, draw acceptance and resignation, decided on the current turn's evaluation and its streaks |
 //! | [`game`] | §7 | one open session: re-derived through the module on every event and timer, its engine process, the turn, the Conclusions |
-//! | [`bot`] | §2, §7 | the start: the reads that prove something, adoption, the standing events, the echo detector, the slots, the rebuild |
+//! | [`bot`] | §2, §7 | the bot: the start in its order (adoption, the rebuild, the standing events, the echo detector), the runtime (the challenges, the games, the slots), the stop |
 //! | [`identity`] | §2 | the key, read from a private file and never given out; the derived secrets |
 //! | [`sei`] | §3 | the SEI host: the engine's process, the opening, the probe, the search of a turn with its clock, the safety net, the hard stop, the failures |
 //! | [`fallback`] | §3 | the move the bot plays with no answer: `HMAC(k_fallback, session ‖ step)` over the module's legal moves |

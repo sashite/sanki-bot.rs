@@ -1,31 +1,22 @@
 [package]
 name = "sashite-sanki-bot"
-version = "0.12.0"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
 repository = "https://github.com/sashite/sanki-bot.rs"
-description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014, ADR-0034). One supervisor, N personas — pool courtship (kind 3418), founding and acceptance by Game Session (3422), full session play (3423) with clock discipline, Conclusions (3425) the rule system yields, rematch challenges (3420) — over the session's rule system: the module named by a Rule System event (3417), run under wasmi, is the only rules oracle; sashite-sanki-player chooses the moves."
-# Not on crates.io yet: the crate is published with the SEI refactor of
-# ADR-0045 v4 (the engine as a child process, one bot per process).
-publish = false
+homepage = "https://sashite.com/"
+readme = "README.md"
+keywords = ["sashite", "sanki", "nostr", "bot", "sei"]
+categories = ["games", "command-line-utilities"]
+exclude = ["/.github", "/deny.toml", "/Dockerfile"]
+description = "A Sanki bot for Sashité (ADR-0045): one identity, one TOML configuration, one SEI engine as a child process per game — or random play without one. Over the Nostr protocol client `sashite-sanki-client`: it answers and sends Direct Challenges under a Challenge Policy, founds, plays and concludes self-timed sessions with the verdict the rule system yields, offers, accepts and resigns on the engine's scores."
 
-# The binary keeps its historical name until the SEI refactor, which the
-# fleet's deployment scripts (`~/sanki-fleet/players`) rely on; it becomes
-# `sanki-bot` then (ADR-0045 v4).
-[[bin]]
-name = "players"
-path = "src/main.rs"
-
-# The v4 bot (ADR-0045 §7): `sanki-bot CONFIG.toml`.
+# One bot in one process: `sanki-bot CONFIG.toml` (ADR-0045 §7).
 [[bin]]
 name = "sanki-bot"
 path = "src/bin/sanki-bot.rs"
 
-# The v4 bot is built as a library first, module by module, beside the
-# fleet's binary (ADR-0045 Plan, step 4): the SEI host, the fallback, then
-# the configuration, the identity and the runtime. The binary switches to it
-# once the runtime exists; the fleet's modules are deleted then.
 [lib]
 name = "sashite_sanki_bot"
 path = "src/lib.rs"
@@ -36,39 +27,20 @@ path = "src/lib.rs"
 # used to pull is unmaintained (RUSTSEC-2026-0243).
 nostr-sdk = "0.45"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "process", "io-util"] }
-anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Daily log files with retention when `PLAYERS_LOG_DIR` is set (ADR-0040 §6:
-# launchd redirects stdout to a file nothing rotates; the bot rotates its own).
-tracing-appender = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# Timezone-aware presence windows (personas live in their own timezones).
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-chrono-tz = "0.10"
-
-# The rule system (ADR-0034): the kind-3417 Rule System parser and the kind-3418
-# Open Challenge parser (`nostchmaker`); the WebAssembly interpreter the session's
-# module runs under (pure Rust, deterministic, no JIT — the runtime the module's
-# own conformance run uses); the module's digest check; fetching the module's
-# bytes from the event's `url` hints (rustls, like the relay connection).
-nostchmaker = "0.9"
-wasmi = { version = "2", features = ["deterministic"] }
-sha2 = "0.10"
+# The relay's NIP-11 document and the rule system's module bytes, over HTTPS
+# (rustls, like the relay connection).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# The relay's notification stream (the runtime's loop); in the tree already.
+futures-util = "0.3"
 
-# Move choice (ADR-0015): the anytime search over the native engine. It is the
-# bot's brain, never its rules: the tip position it searches from, the legality
-# of the move it picks, the state of the session and every verdict come from the
-# session's module (ADR-0034), and the search's choice is checked against the
-# module's `legal_moves` before it is played. Fleet binary only: the v4 bot
-# hosts an SEI engine instead.
-sashite-sanki-player = "0.5"
-
-# The v4 bot (ADR-0045). The protocol client: the rule system and its module,
-# the session views, the notation, the relay's information, publishing.
+# The protocol client (ADR-0045 §1): the rule system and its module, the
+# session views, the notation, the relay's information, the readers, the
+# drafts, the Publisher, the proven query.
 sashite-sanki-client = "0.1"
 # The SEI host (ADR-0045 §3): killing the engine's process group, through a
 # safe wrapper (the crate forbids `unsafe`).
@@ -77,27 +49,20 @@ nix = { version = "0.30", features = ["signal"] }
 # the identity's derived secrets (§2) by HKDF, zeroed on drop.
 hmac = "0.12"
 hkdf = "0.12"
+sha2 = "0.10"
 zeroize = "1"
-# The relay's notification stream (the runtime's loop); in the tree already.
-futures-util = "0.3"
 
 [dev-dependencies]
-# The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary
-# connects to, with the one fault injection the §6.5 incident needs. Versions
-# already in the dependency tree (via nostr-sdk), so nothing new compiles.
-tokio-tungstenite = "0.26"
-# The reference module's library face: the same answers as the module, natively,
-# so the module-driven paths are tested without building or shipping a `.wasm`.
-sashite-sanki-kernel-wasm = "0.1"
-# Hand-written modules of the wrong shape, for the runtime's refusal tests.
-wat = "1"
 # The SEI host's tests judge the engine's moves with the native rules (the
 # bot judges them with the module); `tests/sei_host.rs`.
 sashite-sanki-engine = "0.12"
+# The in-process relay, the reference module's native face and the signed
+# suite events the bot's tests drive the client with.
 sashite-sanki-client = { version = "0.1", features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
 
 [lints.clippy]
 unwrap_used = "deny"
