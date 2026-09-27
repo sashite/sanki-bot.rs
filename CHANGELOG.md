@@ -3,6 +3,16 @@
 All notable changes to this service are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **Renamed** to `sashite-sanki-bot` (repository `sanki-bot.rs`), and made
+  public, as the starting point of the crate ADR-0045 v4 describes: the
+  engine as an SEI child process, one bot per process, a TOML configuration.
+  The binary keeps its name `players` until that refactor; nothing else
+  changes in this release.
+
 ## [0.12.0] — 2026-09-21
 
 The bots answer rematches; they no longer ask for them — so two members of

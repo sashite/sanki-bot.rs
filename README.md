@@ -1,4 +1,16 @@
-# sashite-sanki-player-nostr-bot
+# sashite-sanki-bot
+
+> **Renamed on 2026-09-28** from `sashite-sanki-player-nostr-bot`
+> (repository `sanki-player-nostr-bot.rs`), and made public. This is the body
+> of Sashité's Sanki bots — the Robotto's binary as it runs today — and the
+> starting point of the public `sashite-sanki-bot` crate decided by
+> [ADR-0045 v4](https://github.com/sashite/web-specs.md/blob/main/adr/adr-0045-sanki-bot-crate.md):
+> one bot per process, its brain an engine speaking the
+> [Sashité Engine Interface](https://sashite.dev/specs/sei/1.0.0/) as a child
+> process, its behaviour a TOML file. Until that refactor lands, the code
+> below is the fleet's 0.12: the brain is `sashite-sanki-player`, wired in,
+> and the binary is still `players`. Some links point into `web-specs.md`,
+> a private repository whose documents are being published on sashite.dev.
 
 The Sashité **player fleet** (ADR-0014): autonomous Nostr players for Sanki.
 One process supervises N configured personas — each an honest player with its

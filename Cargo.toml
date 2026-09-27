@@ -1,16 +1,18 @@
 [package]
-name = "sashite-sanki-player-nostr-bot"
+name = "sashite-sanki-bot"
 version = "0.12.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
-repository = "https://github.com/sashite/sanki-player-nostr-bot.rs"
+repository = "https://github.com/sashite/sanki-bot.rs"
 description = "Sashité player-bot fleet: autonomous Nostr players for Sanki (ADR-0014, ADR-0034). One supervisor, N personas — pool courtship (kind 3418), founding and acceptance by Game Session (3422), full session play (3423) with clock discipline, Conclusions (3425) the rule system yields, rematch challenges (3420) — over the session's rule system: the module named by a Rule System event (3417), run under wasmi, is the only rules oracle; sashite-sanki-player chooses the moves."
-# Internal service, not a library for crates.io.
+# Not on crates.io yet: the crate is published with the SEI refactor of
+# ADR-0045 v4 (the engine as a child process, one bot per process).
 publish = false
 
-# Short binary name (`cargo run` / `players`) while the package keeps the
-# descriptive name.
+# The binary keeps its historical name until the SEI refactor, which the
+# fleet's deployment scripts (`~/sanki-fleet/players`) rely on; it becomes
+# `sanki-bot` then (ADR-0045 v4).
 [[bin]]
 name = "players"
 path = "src/main.rs"
