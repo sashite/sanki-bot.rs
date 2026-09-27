@@ -13,20 +13,17 @@
 //!   the public key: the fallback move (§3), the open seat of a founding
 //!   and the jitter of an outgoing challenge (§5). Each is unpredictable to
 //!   others and identical after a crash.
-//! - **One writer on the host.** [`Lease::take`] holds an advisory lock on
-//!   `<data_dir>/<pubkey>.lock` and a process-wide registry; a second
-//!   instance fails with [`IdentityError::KeyInUse`].
 //!
-//! Adoption — the refusal of a person's key by what the relay holds — and
-//! the echo detector across hosts need the relay; they are the runtime's.
+//! The lease of the key on the host is the Publisher's
+//! (`sashite_sanki_client::publisher::Lease`, taken by `Publisher::open`);
+//! adoption — the refusal of a person's key by what the relay holds — and
+//! the echo detector across hosts need the relay: they are the runtime's.
 
-use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -51,8 +48,6 @@ pub enum IdentityError {
     NotAKey(PathBuf),
     /// The file exists already (`generate` never overwrites).
     Exists(PathBuf),
-    /// Another instance holds the key on this host.
-    KeyInUse(PathBuf),
 }
 
 impl fmt::Display for IdentityError {
@@ -70,11 +65,6 @@ impl fmt::Display for IdentityError {
                 path.display()
             ),
             Self::Exists(path) => write!(f, "{}: exists already", path.display()),
-            Self::KeyInUse(path) => write!(
-                f,
-                "another instance holds this key on this host ({})",
-                path.display()
-            ),
         }
     }
 }
@@ -248,84 +238,6 @@ impl SignEvent for Identity {
     }
 }
 
-/// The keys leased in this process.
-fn registry() -> &'static Mutex<BTreeSet<PublicKey>> {
-    static REGISTRY: OnceLock<Mutex<BTreeSet<PublicKey>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(BTreeSet::new()))
-}
-
-/// The lease of a key on this host: held until dropped.
-#[derive(Debug)]
-pub struct Lease {
-    pubkey: PublicKey,
-    path: PathBuf,
-    _lock: nix::fcntl::Flock<File>,
-}
-
-impl Lease {
-    /// Takes the lease of `pubkey` under `data_dir`.
-    ///
-    /// # Errors
-    ///
-    /// [`IdentityError::KeyInUse`] when this process or another holds it;
-    /// [`IdentityError::Io`] when the lock file cannot be opened.
-    pub fn take(data_dir: &Path, pubkey: PublicKey) -> Result<Self, IdentityError> {
-        let path = data_dir.join(format!("{}.lock", pubkey.to_hex()));
-        {
-            let mut held = registry()
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if !held.insert(pubkey) {
-                return Err(IdentityError::KeyInUse(path));
-            }
-        }
-        let file = match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(e) => {
-                Self::release(pubkey);
-                return Err(IdentityError::Io(path, e));
-            }
-        };
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Self {
-                pubkey,
-                path,
-                _lock: lock,
-            }),
-            Err((_, _)) => {
-                Self::release(pubkey);
-                Err(IdentityError::KeyInUse(path))
-            }
-        }
-    }
-
-    /// The lock file.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn release(pubkey: PublicKey) {
-        let mut held = registry()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        held.remove(&pubkey);
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        Self::release(self.pubkey);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -420,24 +332,5 @@ mod tests {
             .unwrap();
         assert_eq!(event.pubkey, identity.public_key());
         assert!(event.verify().is_ok());
-    }
-
-    #[test]
-    fn a_lease_is_exclusive_in_the_process_and_on_the_host() {
-        let dir = temp_dir();
-        let pubkey = Keys::generate().public_key();
-        let lease = Lease::take(&dir, pubkey).unwrap();
-        assert!(lease.path().ends_with(format!("{}.lock", pubkey.to_hex())));
-        assert!(matches!(
-            Lease::take(&dir, pubkey),
-            Err(IdentityError::KeyInUse(_))
-        ));
-        // Another key is free.
-        let other = Lease::take(&dir, Keys::generate().public_key()).unwrap();
-        drop(other);
-        drop(lease);
-        // Released: taken again.
-        let again = Lease::take(&dir, pubkey).unwrap();
-        drop(again);
     }
 }

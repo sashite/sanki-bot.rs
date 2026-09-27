@@ -56,13 +56,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   derived secrets are zeroed on drop; it signs (`SignEvent`) and gives the
   key to no one. The derived secrets by HKDF-SHA256 from the secret key:
   the fallback key, the open seat (`HMAC(k_seat, challenge_id) & 1`), the
-  jitter of an outgoing challenge. `Lease::take`: a process-wide registry
-  and an advisory lock on `<data_dir>/<pubkey>.lock`, `KeyInUse` otherwise.
-  Adoption and the echo detector need the relay; they come with the
-  runtime.
-- Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg` and
-  the lease's `flock`, safe wrappers), `hmac`, `hkdf`, `zeroize`; `tokio`
-  gains `process` and `io-util`.
+  jitter of an outgoing challenge. The lease on the host is the client's
+  `Publisher`'s (`sashite_sanki_client::publisher::Lease`), taken at
+  `Publisher::open`; adoption and the echo detector need the relay and come
+  with the runtime.
+- Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg`, a
+  safe wrapper), `hmac`, `hkdf`, `zeroize`; `tokio` gains `process` and
+  `io-util`.
 
 ### Changed
 
