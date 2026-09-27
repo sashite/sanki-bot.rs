@@ -1,0 +1,70 @@
+# sanki-bot — the configuration (ADR-0045 §4). One file, no secret: the key
+# lives in `identity.file`. No defaults except `blocks = []`, the absent
+# cadence families (0) and the absent sections whose absence is a behaviour
+# (`engine`: random play; `outgoing`, `resign`, `offer_draw`, `accept_draw`:
+# never). Every other key is required; an unknown key is refused.
+schema = 1
+
+[connection]
+relay           = "wss://relay.sanki.app"      # the only relay, and every session's timing relay
+rules           = "7777777777777777777777777777777777777777777777777777777777777777"  # the kind-3417 Rule System event id
+data_dir        = "/var/lib/sanki-bot"         # absolute: rules cache, lease file
+rate_per_minute = 30                           # the relay's per-key limit (NIP-11 does not advertise it)
+
+[identity]
+file = "/var/lib/sanki-bot/key.nsec"           # absolute; no group/other permission bits
+
+[profile]                                      # kind 0; `bot: true` is always written
+name    = "kitsune"
+about   = "A student bot that plays chess against everyone."
+picture = "https://example.com/kitsune.png"
+# nip05 = "kitsune@sanki.app"                  # optional
+
+[engine]                                       # absent: the bot plays its fallback — at random
+command = "/usr/local/bin/sanki-sei-random-engine"  # absolute, or a name resolved in the bot's own PATH at start
+args    = []
+cwd     = "/var/lib/sanki-engine"              # absolute; the engine may write there; outside data_dir and the key's directory
+env     = {}                                   # the only variables the engine receives
+options = { seed = 0 }                         # SEI options, sent by `configure`; each must be announced
+# strength = 1500                              # only with the `strength` feature
+max_relaunches_per_game = 2
+launch_ms = 5000                               # hello and configure acknowledged within this
+
+[challenges]                                   # kind 30420, published and enforced
+policy = "everyone"                            # everyone | following | rating | nobody
+# follows          = ["<hex pubkey>", …]       # following only; non-empty
+# max_delta        = 200                       # rating only; 1..=1000
+# rating_authority = "<hex pubkey>"            # rating only
+blocks = []                                    # kind 10000; applied before the policy
+
+  # [challenges.outgoing]                      # absent: the bot never challenges
+  # targets       = ["<hex pubkey>", …]        # non-empty, distinct, none in `blocks`
+  # time_control  = [[180, 2]]                 # the periods, as kind 3420 writes them
+  # variant       = "chess"                    # fixed for both players (the mirror form); in `variants` and in `opponents`
+  # every_secs    = 600                        # between two challenges to the same target
+  # accept_secs   = 120                        # accept_until = created_at + accept_secs
+  # max_per_day   = 24                         # over all targets
+
+[play]
+variants      = ["chess"]
+preferred     = "chess"                        # played when the challenger leaves the bot's variant open
+opponents     = ["chess", "ogi", "xiongqi"]
+min_move_secs = 5                              # the least time per move a game must offer, and the bot's own pace
+margin_ms     = 300                            # between the hard stop and the flag instant; part of SEI's `overhead`
+
+  [play.max_concurrent]                        # per cadence family; 0 or absent: not played
+  byoyomi        = 1
+  blitz          = 1
+  rapid          = 0
+  correspondence = 0
+
+  # [play.resign]                              # absent: never resigns
+  # max_win  = 20                              # ‰ (wdl)
+  # min_loss = 900                             # ‰ (wdl)
+  # streak   = 3                               # consecutive own turns
+  # [play.offer_draw]                          # absent: never offers
+  # min_draw   = 800                           # ‰
+  # streak     = 3
+  # after_ply  = 40
+  # [play.accept_draw]                         # absent: never accepts
+  # min_draw = 600                             # ‰

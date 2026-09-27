@@ -39,10 +39,36 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     `HMAC-SHA256(k_fallback, session ‖ step)` over the module's legal
     moves, unpredictable to others and identical after a crash; one vector
     pinned.
-- Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg`,
-  a safe wrapper), `hmac`; `tokio` gains `process` and `io-util`.
+- **`config`** (ADR-0045 §4) — one TOML file with `schema = 1`, parsed into
+  a private `RawConfig` (unknown keys refused) and converted into a `Config`
+  whose types forbid the incoherent cases: the policy's shape, the variant
+  lists, the lists' bounds and intersections, the engine's command resolved
+  to an executable and its `cwd` kept away from `data_dir` and the key, the
+  score policies only with an engine, the outgoing time control well-formed
+  and playable by the per-move share rule (§5) with a capped family, every
+  bounded value, the caps and the **capacity inequality**. The example of
+  §4 ships as `sanki-bot.example.toml`, read by a test. What only the
+  identity can tell — the bot's own key in none of the lists — is
+  `Config::excludes`.
+- **`identity`** (ADR-0045 §2) — `Identity::from_file` (a private file,
+  `nsec1…` or hex), `Identity::generate` (`0600`, never over an existing
+  file); neither `Clone` nor `Serialize`, `Debug` shows the npub, the
+  derived secrets are zeroed on drop; it signs (`SignEvent`) and gives the
+  key to no one. The derived secrets by HKDF-SHA256 from the secret key:
+  the fallback key, the open seat (`HMAC(k_seat, challenge_id) & 1`), the
+  jitter of an outgoing challenge. `Lease::take`: a process-wide registry
+  and an advisory lock on `<data_dir>/<pubkey>.lock`, `KeyInUse` otherwise.
+  Adoption and the echo detector need the relay; they come with the
+  runtime.
+- Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg` and
+  the lease's `flock`, safe wrappers), `hmac`, `hkdf`, `zeroize`; `tokio`
+  gains `process` and `io-util`.
 
 ### Changed
+
+- The fleet's `config` module moved to `src/fleet_config.rs` (declared
+  with `#[path]` in `main.rs`, so nothing else in the binary changes),
+  making room for the library's `config`.
 
 - **Renamed** to `sashite-sanki-bot` (repository `sanki-bot.rs`), and made
   public, as the starting point of the crate ADR-0045 v4 describes: the

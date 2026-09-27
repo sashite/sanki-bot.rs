@@ -65,11 +65,15 @@ sashite-sanki-player = "0.5"
 # The v4 bot (ADR-0045). The protocol client: the rule system and its module,
 # the session views, the notation, the relay's information, publishing.
 sashite-sanki-client = "0.1"
-# The SEI host (ADR-0045 §3): killing the engine's process group, through a
-# safe wrapper (the crate forbids `unsafe`).
-nix = { version = "0.30", features = ["signal"] }
-# The fallback move (ADR-0045 §3): `HMAC-SHA256(k_fallback, session ‖ step)`.
+# The SEI host (ADR-0045 §3): killing the engine's process group; the
+# identity's lease (§2): an advisory file lock — both through safe wrappers
+# (the crate forbids `unsafe`).
+nix = { version = "0.30", features = ["signal", "fs"] }
+# The fallback move (ADR-0045 §3): `HMAC-SHA256(k_fallback, session ‖ step)`;
+# the identity's derived secrets (§2) by HKDF, zeroed on drop.
 hmac = "0.12"
+hkdf = "0.12"
+zeroize = "1"
 
 [dev-dependencies]
 # The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary

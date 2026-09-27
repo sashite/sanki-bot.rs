@@ -39,6 +39,9 @@ mod cadence;
 mod chain;
 mod clockmath;
 mod conclusion;
+// The fleet's configuration keeps its module name; its file moved aside
+// for the v4 library's `config` (ADR-0045 §4).
+#[path = "fleet_config.rs"]
 mod config;
 mod courtship;
 mod fleet;
