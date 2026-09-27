@@ -145,6 +145,14 @@ impl<T> NonEmpty<T> {
     }
 }
 
+impl<T> NonEmpty<T> {
+    /// A list for tests, unchecked.
+    #[cfg(test)]
+    pub(crate) fn test(items: Vec<T>) -> Self {
+        Self(items)
+    }
+}
+
 impl<T: PartialEq> NonEmpty<T> {
     /// Whether `item` is listed.
     #[must_use]

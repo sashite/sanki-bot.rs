@@ -154,6 +154,7 @@ async fn turn_with_grace(mode: &str, hard_stop_ms: u64, grace: Duration) -> (sei
         judge(CHESS_CHESS),
         started + Duration::from_millis(hard_stop_ms),
         grace,
+        &tokio::sync::Notify::new(),
     )
     .await;
     let took = started.elapsed();
@@ -302,6 +303,7 @@ async fn an_info_after_the_done_is_caught_at_the_next_read() {
         judge(CHESS_CHESS),
         Instant::now() + Duration::from_secs(2),
         sei::turn::STOP_GRACE,
+        &tokio::sync::Notify::new(),
     )
     .await;
     assert_eq!(turn.verdict, Verdict::InOrder);
@@ -488,6 +490,7 @@ async fn the_random_engine_passes_the_probe_and_plays() {
             judge(&feen),
             Instant::now() + Duration::from_secs(2),
             sei::turn::STOP_GRACE,
+            &tokio::sync::Notify::new(),
         )
         .await;
         assert_eq!(turn.verdict, Verdict::InOrder, "ply {ply}");

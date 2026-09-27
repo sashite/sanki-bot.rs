@@ -60,6 +60,55 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Publisher`'s (`sashite_sanki_client::publisher::Lease`), taken at
   `Publisher::open`; adoption and the echo detector need the relay and come
   with the runtime.
+- **`admit`** (ADR-0045 §5) — the admission of a direct challenge, the
+  rules in the ADR's order (halted; game, rules, timing; `accept_until` at
+  least ten seconds away; a rematch refused; the variants and the seats —
+  a fixed `opponent_variant` refused unless the challenger also fixes its
+  own, the mirror rule; a cadence, a family played, a time control
+  playable by the per-move share; a free slot, the hold on the challenger
+  freed when its kind and family match; blocks; the policy — `rating` left
+  to the network's check), and what the acceptance needs: the seats, the
+  variants, the cadence, `accept_until`.
+- **`policy`** (ADR-0045 §7) — the draw offer, the acceptance and the
+  resignation, each on the current turn's evaluation only (the first
+  variation's `wdl` and `mate`, the advice when announced); the streaks,
+  reset by a fallback, a withdrawn turn or a restart; never a resignation
+  while an offer stands (an acceptance with the section, a move without).
+- **`outgoing`** (ADR-0045 §5 *Sending one*) — when a target is due, the
+  first due target in the configured order under the global gates (a free
+  slot, the day's quota, a minute since the last), the firing instant
+  jittered within the minute.
+- **`game`** (ADR-0045 §7) — the runtime of one open session: re-derived
+  from the relay through the module on every event and at every timer;
+  one engine process of its own, launched as the session opens and
+  relaunched on the opponent's time or under a turn's hard stop; the turn
+  as a state machine (`Idle`, `Answered` waiting for its pace — withdrawn
+  when the tip changes under it —, `Committed` acknowledged or `Unknown`,
+  `Failed`), the search interrupted by `cancel` when the chain changes
+  under it, the answer or the fallback, the pace floor
+  `min(anchor + min_move_secs, ⌈H⌉)`, the Ply's window `[pace, F]`; an
+  `Unknown` Ply resolved by id then by a fresh read of the session and
+  sent again with the same content while the window allows; the timers
+  (the opponent's flag plus a second, the bot's own flag plus `L` plus a
+  second, a paced Ply's stamp, a held event still ahead of the relay's
+  clock, a decided act's instant); the Conclusions (a rule ending, a
+  timeout — the bot's own only after a fresh read, an `agreement` the bot
+  did not decide never; `Moot` at any stamp where the verdict no longer
+  holds; an `Unknown` Conclusion resolved before anything else and never
+  believed; at most three attempts, with a growing pause, before the
+  bot leaves the claim to the opponent); the acceptance and the
+  resignation decided by `policy`, concluded no earlier than
+  `anchor + L + 1 s + 2 s` after a fresh read and only if the module then
+  yields the verdict the act means; a module failure ends the game's acts
+  (`Unverified`), `Stop` ends the engine and publishes nothing more.
+  Seven tests over the in-process relay: a game played at random and
+  concluded on the opponent's flag, the same with the random engine, the
+  opponent's resignation closing the game, `Stop`, a scripted engine's
+  lost evaluation resigning on a streak, a standing offer accepted when
+  the draw is judged likely, a co-writer's Ply withdrawing the answered
+  turn.
+- `sei::search` takes an `interrupt` (`tokio::sync::Notify`): the caller
+  ends the search early, as the hard stop does (`cancel`, then the grace).
 - Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg`, a
   safe wrapper), `hmac`, `hkdf`, `zeroize`; `tokio` gains `process` and
   `io-util`.

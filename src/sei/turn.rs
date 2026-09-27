@@ -26,6 +26,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
+use tokio::sync::Notify;
 
 use super::announce::RULES;
 use super::process::Engine;
@@ -218,13 +219,15 @@ fn first_variation(fields: &Map<String, Value>) -> (Option<&str>, Option<Score>)
 /// `judge` maps a PMN the engine names to the module's content when it is
 /// the canonical PMN of a legal move of the turn, and to `None` otherwise.
 /// `hard_stop` is `H` (ADR-0045 §6): past it the caller plays what it has.
-/// `grace` is the bounded-stop grace after `cancel`.
+/// `grace` is the bounded-stop grace after `cancel`. `interrupt`, when
+/// notified, ends the search the way the hard stop does (a withdrawn turn).
 pub async fn search(
     engine: &mut Engine,
     request: &SearchRequest,
     mut judge: impl FnMut(&str) -> Option<String>,
     hard_stop: Instant,
     grace: Duration,
+    interrupt: &Notify,
 ) -> Turn {
     let mut provisional: Option<Answer> = None;
     let id = match engine.send("search", request.fields()).await {
@@ -268,7 +271,13 @@ pub async fn search(
             next_ping = now.checked_add(PING_EVERY).unwrap_or(hard_stop);
         }
         let until = hard_stop.min(next_ping).min(ping_due.unwrap_or(hard_stop));
-        let event = match engine.recv(until).await {
+        // An interruption by the caller (a withdrawn turn) ends the search
+        // as the hard stop does: `cancel`, then the grace.
+        let received = tokio::select! {
+            received = engine.recv(until) => received,
+            () = interrupt.notified() => break,
+        };
+        let event = match received {
             Ok(Some(event)) => event,
             Ok(None) => {
                 if ping_due.is_some_and(|due| Instant::now() >= due) {
