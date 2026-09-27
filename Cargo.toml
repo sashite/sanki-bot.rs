@@ -17,12 +17,20 @@ publish = false
 name = "players"
 path = "src/main.rs"
 
+# The v4 bot is built as a library first, module by module, beside the
+# fleet's binary (ADR-0045 Plan, step 4): the SEI host, the fallback, then
+# the configuration, the identity and the runtime. The binary switches to it
+# once the runtime exists; the fleet's modules are deleted then.
+[lib]
+name = "sashite_sanki_bot"
+path = "src/lib.rs"
+
 [dependencies]
 # Networking client; bundles `nostr` 0.45 (Event, EventBuilder, Tag, Kind, Keys, …).
 # 0.45 is where the relay pool lives: the standalone `nostr-relay-pool` crate it
 # used to pull is unmaintained (RUSTSEC-2026-0243).
 nostr-sdk = "0.45"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time", "process", "io-util"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -50,8 +58,18 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # bot's brain, never its rules: the tip position it searches from, the legality
 # of the move it picks, the state of the session and every verdict come from the
 # session's module (ADR-0034), and the search's choice is checked against the
-# module's `legal_moves` before it is played.
+# module's `legal_moves` before it is played. Fleet binary only: the v4 bot
+# hosts an SEI engine instead.
 sashite-sanki-player = "0.5"
+
+# The v4 bot (ADR-0045). The protocol client: the rule system and its module,
+# the session views, the notation, the relay's information, publishing.
+sashite-sanki-client = "0.1"
+# The SEI host (ADR-0045 §3): killing the engine's process group, through a
+# safe wrapper (the crate forbids `unsafe`).
+nix = { version = "0.30", features = ["signal"] }
+# The fallback move (ADR-0045 §3): `HMAC-SHA256(k_fallback, session ‖ step)`.
+hmac = "0.12"
 
 [dev-dependencies]
 # The e2e bench (tests/e2e/): an in-process NIP-01 mini relay the real binary
@@ -64,6 +82,10 @@ futures-util = "0.3"
 sashite-sanki-kernel-wasm = "0.1"
 # Hand-written modules of the wrong shape, for the runtime's refusal tests.
 wat = "1"
+# The SEI host's tests judge the engine's moves with the native rules (the
+# bot judges them with the module); `tests/sei_host.rs`.
+sashite-sanki-engine = "0.12"
+sashite-sanki-client = { version = "0.1", features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"

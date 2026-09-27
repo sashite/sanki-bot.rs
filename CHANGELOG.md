@@ -5,13 +5,57 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The v4 bot begins as a library** beside the fleet's binary (ADR-0045
+  Plan, step 4): `src/lib.rs` grows module by module until the runtime
+  exists and the binary switches to it; the fleet's modules are untouched
+  until then. Two modules land first:
+  - **`sei`** — the SEI host (ADR-0045 §3; SEI 1.0.0 §5, §8, §11):
+    `process` launches the engine as SEI §5 prescribes (the configured
+    argument vector, no shell, an empty environment but for the configured
+    variables, three piped descriptors, its own process group), reads its
+    output continuously, drains its error stream under bounds, and ends the
+    session by closing its input then killing the group after two seconds;
+    `wire` reads events tolerantly and writes requests strictly; `announce`
+    reads the `done` of `hello` and names the gaps between it and what the
+    configuration needs; `probe` opens an engine (`hello`, `configure`,
+    `ping` within `launch_ms`) and runs the probe at start (the gaps,
+    `engine_rtt` as the largest of twenty pings); `clock` maps the session's
+    clocks onto SEI's `clock` at the emission — bank and quota periods,
+    rollovers, `deadline` exact from `max_affordable`; `turn` runs one
+    search: every Move the engine names is judged by the caller
+    (`parse_canonical`, then membership in the module's `legal_moves`), the
+    safety-net `info` is the provisional answer, the `done`'s `best` is the
+    answer, an attached error is a refusal that says whether the two
+    disagree on the rules, the hard stop sends `cancel` and waits the
+    bounded-stop grace, `ping` runs every second. Twenty-three tests over real
+    processes: the random engine (probe, then a game with `roots`), and
+    scripted engines that never answer `hello`, answer `ping` but never
+    `done`, emit an illegal or a non-canonical `best`, exit mid-search,
+    flood their output, violate the envelope, refuse the search, hang, fail
+    fatally, or answer only within the grace after `cancel`.
+  - **`fallback`** — the move the bot plays with no answer:
+    `HMAC-SHA256(k_fallback, session ‖ step)` over the module's legal
+    moves, unpredictable to others and identical after a crash; one vector
+    pinned.
+- Dependencies: `sashite-sanki-client` (the protocol), `nix` (`killpg`,
+  a safe wrapper), `hmac`; `tokio` gains `process` and `io-util`.
+
 ### Changed
 
 - **Renamed** to `sashite-sanki-bot` (repository `sanki-bot.rs`), and made
   public, as the starting point of the crate ADR-0045 v4 describes: the
   engine as an SEI child process, one bot per process, a TOML configuration.
   The binary keeps its name `players` until that refactor; nothing else
-  changes in this release.
+  changes for the fleet in this release.
+
+### Notes
+
+- **The engine's priority.** ADR-0045 §3 launches the engine at a priority
+  below the bot's. Lowering it from the bot takes `setpriority`, an `unsafe`
+  call this crate forbids (`nix` 0.30 wraps none); the priority is left to
+  the deployment, as SEI §5 leaves the process's confinement to it.
 
 ## [0.12.0] — 2026-09-21
 

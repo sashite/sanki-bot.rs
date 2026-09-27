@@ -1,3 +1,5 @@
 /target
 *.local.env
 *.local.toml
+# Local only: the crates.io patches toward checkouts of sanki-engine.rs and sanki-client.rs, until they are published.
+/.cargo/config.toml

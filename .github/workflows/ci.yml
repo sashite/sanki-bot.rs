@@ -47,7 +47,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
+      # The SEI host's tests drive the random engine as a real process
+      # (tests/sei_host.rs); without the variable those tests are skipped.
+      - run: cargo install --git https://github.com/sashite/sanki-sei-random-engine.rs --locked
       - run: cargo test
+        env:
+          SANKI_SEI_RANDOM_ENGINE: /home/runner/.cargo/bin/sanki-sei-random-engine
 
   deny:
     name: cargo-deny
