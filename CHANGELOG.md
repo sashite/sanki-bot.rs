@@ -9,6 +9,22 @@ Robotto's private body (`sashite-sanki-player-nostr-bot`), renamed and made
 public on 2026-09-28 as the starting point of this crate (ADR-0045 v4). They
 are kept below for the record; `sashite-sanki-bot` starts at 0.1.0.
 
+## [0.2.1] — 2026-09-28
+
+### Fixed
+
+- **A Ply the bot never answered.** The game's loop judged its view at
+  one instant and its next wake at another, after the module had
+  answered: an opponent's Ply stamped between the two — a relay client
+  stamps a second ahead — was neither in the view nor pending, and the
+  bot slept to the opponent's flag, then conceded its own timeout there
+  (two games of 2026-09-28 on `relay.sanki.app`, at the eleventh and the
+  fourteenth Ply, the module's reading of a long chain taking more than a
+  second in a debug build). The wake is now judged at the view's instant;
+  `tests/game.rs` proves it with a module that answers past two second
+  boundaries. `tests/replay.rs` replays the first of those games as
+  recorded — a promotion by capture, the app's tags — to the end.
+
 ## [0.2.0] — 2026-09-28
 
 The bot anyone runs: `sanki-bot`, and it plays. ADR-0045 v4.2: the

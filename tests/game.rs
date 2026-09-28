@@ -98,7 +98,35 @@ struct Bench {
 /// The bank, in seconds, of the games' time control (`bank + 1`).
 const BANK: u64 = 12;
 
+/// The reference module, slow to read a session: its answer comes once
+/// the clock has crossed two second boundaries — a module in an
+/// interpreter, on a long chain, in a debug build, as the games of
+/// 2026-09-28 met at their eleventh and fourteenth Plies.
+struct Slow;
+
+impl Oracle for Slow {
+    fn answer(&mut self, request: &[u8]) -> Option<Vec<u8>> {
+        if request.windows(15).any(|w| w == b"\"natural_state\"") {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            let until = Duration::from_secs(now.as_secs() + 2) + Duration::from_millis(50);
+            std::thread::sleep(until - now);
+        }
+        Native.answer(request)
+    }
+}
+
 async fn bench(engine: Option<&EngineSpec>, extra_play: &str, bank: u64) -> Bench {
+    bench_with(engine, extra_play, bank, Box::new(Native)).await
+}
+
+async fn bench_with(
+    engine: Option<&EngineSpec>,
+    extra_play: &str,
+    bank: u64,
+    oracle: Box<dyn Oracle + Send>,
+) -> Bench {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -127,7 +155,7 @@ async fn bench(engine: Option<&EngineSpec>, extra_play: &str, bank: u64) -> Benc
             .await
             .unwrap(),
     );
-    let oracle: SharedOracle = Arc::new(Mutex::new(Box::new(Native) as Box<dyn Oracle + Send>));
+    let oracle: SharedOracle = Arc::new(Mutex::new(oracle));
     let describe = module::describe(&mut Native).unwrap();
     let probe = match engine {
         Some(spec) => {
@@ -276,6 +304,57 @@ async fn wait_for_ply(bench: &Bench, step: u32, signer: &PublicKey) -> Event {
 #[tokio::test]
 async fn a_game_without_an_engine_is_played_at_random_and_concluded() {
     play(None).await;
+}
+
+#[tokio::test]
+async fn a_slow_module_leaves_no_ply_behind() {
+    // Reading the session takes the module past two second boundaries —
+    // a reconciliation straddles them — and the opponent's Ply — stamped a second ahead,
+    // as a relay client's is — falls between the instant the view was
+    // judged at and the instant the wake would have been. The bot must
+    // still answer it, at its pace, not at the flag.
+    let bench = bench_with(None, "", 60, Box::new(Slow)).await;
+    let now = bench.ctx.publisher.now();
+    let pairing = bench.world.pairing();
+    let session = bench.world.session(&pairing, now);
+    let terms = session::terms(&session, &pairing).unwrap();
+    let game = Game::new(&bench.ctx, terms.clone(), now, Vec::new());
+    let (tx, rx) = mpsc::channel(64);
+    let ctx = Arc::clone(&bench.ctx);
+    let running = tokio::spawn(game.run(ctx, rx, false));
+    let first_ply = wait_for_ply(&bench, 1, &bench.world.first.public_key()).await;
+    let mut position = module::apply(&mut Native, &terms.position, &first_ply.content)
+        .unwrap()
+        .position;
+    for step in 1..=3u32 {
+        // The game idle, its reconciliations after its own Ply over: the
+        // opponent's Ply is what wakes it.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let reply = module::legal_moves(&mut Native, &position).unwrap()[0].clone();
+        let stamp = bench.ctx.publisher.now() + 1;
+        let ply = bench
+            .world
+            .ply(&terms.id, &bench.world.second, step, &reply, stamp);
+        inject(&bench, &tx, ply).await;
+        position = module::apply(&mut Native, &position, &reply)
+            .unwrap()
+            .position;
+        let ours = wait_for_ply(&bench, step + 1, &bench.world.first.public_key()).await;
+        // Answered within the pace and a few reconciliations — never at
+        // the flag, sixty seconds on.
+        assert!(
+            ours.created_at.as_secs() <= stamp + 25,
+            "step {}: answered at {} to a Ply of {}",
+            step + 1,
+            ours.created_at.as_secs(),
+            stamp
+        );
+        position = module::apply(&mut Native, &position, &ours.content)
+            .unwrap()
+            .position;
+    }
+    tx.send(GameInput::Stop).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), running).await;
 }
 
 #[tokio::test]

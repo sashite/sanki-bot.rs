@@ -348,20 +348,25 @@ impl Game {
                     continue;
                 }
             }
-            let wake = match self.reconcile(&ctx, &mut inputs).await {
+            // The view, and the wake it decides, are judged at ONE instant:
+            // an event stamped after it — not in the view — is pending
+            // whatever the clock says once the module has answered (a slow
+            // module takes a second and more), and wakes the loop at once
+            // rather than at the next flag.
+            let now = ctx.publisher.now();
+            let wake = match self.reconcile(&ctx, &mut inputs, now).await {
                 Ok(wake) => wake,
                 Err(end) => break end,
             };
             if self.stopped {
                 break GameEnd::Stopped;
             }
-            let now = ctx.publisher.now();
             let wake = wake.unwrap_or_else(|| now.saturating_add(60));
             let wake = self
                 .pending_stamp(now)
                 .map_or(wake, |stamp| wake.min(stamp.saturating_add(1)));
             let sleep = Duration::from_millis(
-                wake.saturating_sub(now)
+                wake.saturating_sub(ctx.publisher.now())
                     .saturating_mul(1000)
                     .clamp(200, 3_600_000),
             );
@@ -443,9 +448,8 @@ impl Game {
         &mut self,
         ctx: &Arc<GameContext>,
         inputs: &mut mpsc::Receiver<GameInput>,
+        now: u64,
     ) -> Result<Option<u64>, GameEnd> {
-        let now = ctx.publisher.now();
-
         // A Conclusion of ours never acknowledged: resolved first.
         if let Some(pending) = self.pending_conclusion.clone() {
             match ctx.publisher.resolve(pending.id).await {
