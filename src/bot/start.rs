@@ -26,6 +26,11 @@ use crate::game::{GameContext, SharedOracle, SKEW_ALLOWANCE_SECS};
 use crate::identity::Identity;
 use crate::sei::Probe;
 
+/// How far before the quarantine's start the subscriptions reach: the
+/// relay's clock is estimated from the host's until a rejection teaches
+/// the skew, and an event replayed twice costs nothing.
+const SUBSCRIPTION_MARGIN_SECS: u64 = 60;
+
 /// What a bot prepared before any network step.
 pub struct Prepared {
     /// The configuration.
@@ -132,15 +137,17 @@ pub async fn start(prepared: Prepared) -> Result<Started, StartError> {
     tracing::info!(secs = quarantine.as_secs(), "quarantine");
     tokio::time::sleep(quarantine).await;
 
-    // The subscriptions, from the quarantine's start: what lands during
-    // the rebuild is seen twice, never missed. The notification channel
-    // first: what the relay replays before it exists is lost to it.
+    // The subscriptions, from before the quarantine's start — a minute
+    // back, since the relay's clock is only estimated until a rejection
+    // teaches its skew: what lands during the rebuild is seen twice, never
+    // missed. The notification channel first: what the relay replays
+    // before it exists is lost to it.
     let notifications = client.notifications();
     let since = Timestamp::from(
         publisher
             .now()
             .saturating_sub(quarantine.as_secs())
-            .saturating_sub(SKEW_ALLOWANCE_SECS),
+            .saturating_sub(SUBSCRIPTION_MARGIN_SECS),
     );
     let kinds = SESSION_KINDS.map(Kind::Custom);
     let to_me = Filter::new().kinds(kinds).pubkey(me).since(since);

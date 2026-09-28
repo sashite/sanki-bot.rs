@@ -1502,9 +1502,9 @@ dependencies = [
 
 [[package]]
 name = "sashite-sanki-client"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c61056bcc1ad166dc6416a041ac6a5a7843195b51b13b7012c24966bfb073977"
+checksum = "8df5ad8635079fa27f76961fb778d0f659dceb4338e5bee49be3c8a75c9ceba5"
 dependencies = [
  "anyhow",
  "futures-util",

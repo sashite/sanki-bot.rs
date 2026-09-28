@@ -191,6 +191,20 @@ process per game (or random play without one) — over the protocol client
   before its first pass, and again on `GameInput::Reread` (a
   reconnection); a timeout claim, the opponent's as well as the bot's
   own, rests on a fresh proven read.
+- **The tests of ADR-0045 §9** the other benches left out
+  (`tests/nine.rs`), with instant opponents that replay the chain as the
+  kernel selects it: three concurrent games at the capacity limit under
+  the relay's rate limit — paced at the floor, one content per step,
+  never rate-limited, no fourth founding; an engine dying at every turn —
+  relaunched once, then the fallbacks, both games on, the launches
+  counted; a clock skew under the relay's strict window, ±3 s and ±10 s —
+  at most one rejection, no step lost; a `kill -9` with a Ply in transit
+  and an immediate restart — the quarantine longer than the transit, the
+  Ply seen by the rebuild, nothing repeated, the second instance not
+  halted. The e2e bench is shared (`tests/common`).
+- The subscriptions at start reach a minute before the quarantine: the
+  relay's clock is only estimated until a rejection teaches its skew, and
+  an event replayed twice costs nothing.
 - Five tests end to end over the in-process relay (`tests/bot.rs`): two
   bots challenging each other by configuration and playing — the
   challenge, the founding, the game, a resignation, the library's tag on
