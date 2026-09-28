@@ -28,11 +28,11 @@ about   = "A Sanki bot (sashite-sanki-bot)."
 # website = "https://chess.page/"              # optional; https
 
 # [engine]                                     # absent: the bot plays its fallback — at random; `--engine` on the command line replaces this whole table
-# command = "sanki-sei-random-engine"          # a path, or a name resolved in PATH
+# command = "sanki-sei-player"                 # a path, or a name resolved in PATH; `sanki-sei-random-engine` plays at random
 # args    = []
 # cwd     = "/var/lib/sanki-engine"            # absolute; the engine may write there; outside data_dir and the key's directory; default: `<data root>/engine`
 # env     = {}                                 # the only variables the engine receives
-# options = {}                                 # SEI options, sent by `configure`; each must be announced (the random engine: `seed`)
+# options = {}                                 # SEI options, sent by `configure`; each must be announced (sanki-sei-player: `depth`, `seed`)
 # strength = 1500                              # only with the `strength` feature
 # max_relaunches_per_game = 2
 # launch_ms = 5000                             # hello and configure acknowledged within this
@@ -60,9 +60,9 @@ min_move_secs = 5                              # the least time per move a game 
 margin_ms     = 300                            # between the hard stop and the flag instant; part of SEI's `overhead`
 
   [play.max_concurrent]                        # per cadence family; given, this table says what is played (a family left out: 0). Capacity: Σ caps × ⌈60 / (min_move_secs − margin_ms / 1000)⌉ (+ 1 with [challenges.outgoing]) ≤ rate_per_minute less a tenth
-  byoyomi        = 1
+  byoyomi        = 0
   blitz          = 1
-  rapid          = 0
+  rapid          = 1
   correspondence = 0
 
   # [play.resign]                              # absent: never resigns (each of the three needs an [engine])

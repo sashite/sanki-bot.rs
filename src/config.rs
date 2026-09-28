@@ -758,9 +758,9 @@ struct RawCaps {
 impl Default for RawCaps {
     fn default() -> Self {
         Self {
-            byoyomi: Some(1),
+            byoyomi: None,
             blitz: Some(1),
-            rapid: None,
+            rapid: Some(1),
             correspondence: None,
         }
     }
@@ -1415,9 +1415,9 @@ min_move_secs = 5
 margin_ms     = 300
 
   [play.max_concurrent]
-  byoyomi        = 1
+  byoyomi        = 0
   blitz          = 1
-  rapid          = 0
+  rapid          = 1
   correspondence = 0
 "#,
             "7".repeat(64)
@@ -1708,16 +1708,16 @@ margin_ms     = 300
     fn caps_and_capacity() {
         // Every cap at 0 needs nobody and no outgoing.
         let err = replaced(
-            "byoyomi        = 1\n  blitz          = 1",
-            "byoyomi        = 0\n  blitz          = 0",
+            "blitz          = 1\n  rapid          = 1",
+            "blitz          = 0\n  rapid          = 0",
         )
         .unwrap_err();
         assert_eq!(err.key, "play.max_concurrent");
         let quiet = Config::from_toml(
             &example()
                 .replace(
-                    "byoyomi        = 1\n  blitz          = 1",
-                    "byoyomi        = 0\n  blitz          = 0",
+                    "blitz          = 1\n  rapid          = 1",
+                    "blitz          = 0\n  rapid          = 0",
                 )
                 .replace("policy = \"everyone\"", "policy = \"nobody\""),
         )
@@ -1727,7 +1727,7 @@ margin_ms     = 300
         let err = Config::from_toml(
             &example()
                 .replace("min_move_secs = 5", "min_move_secs = 3")
-                .replace("rapid          = 0", "rapid          = 1"),
+                .replace("byoyomi        = 0", "byoyomi        = 1"),
         )
         .unwrap_err();
         assert_eq!(err.key, "play.max_concurrent");
@@ -1738,7 +1738,7 @@ margin_ms     = 300
         assert!(Config::from_toml(
             &example()
                 .replace("min_move_secs = 5", "min_move_secs = 3")
-                .replace("rapid          = 0", "rapid          = 1")
+                .replace("byoyomi        = 0", "byoyomi        = 1")
                 .replace("rate_per_minute = 30", "rate_per_minute = 120")
         )
         .is_ok());
@@ -1852,15 +1852,15 @@ margin_ms     = 300
                 .key,
             "challenges.outgoing.time_control"
         );
-        // Its family has no cap.
+        // Its family has no cap: byōyomi is not played by the built-in bot.
         assert_eq!(
-            with(&outgoing.replace("[[180, 2]]", "[[900, 10]]"))
+            with(&outgoing.replace("[[180, 2]]", "[[0, 10, 1]]"))
                 .unwrap_err()
                 .key,
             "challenges.outgoing.time_control"
         );
-        // Byōyomi 10 s per move: playable, family capped.
-        assert!(with(&outgoing.replace("[[180, 2]]", "[[0, 10, 1]]")).is_ok());
+        // Rapid, 15 + 10: playable, family capped.
+        assert!(with(&outgoing.replace("[[180, 2]]", "[[900, 10]]")).is_ok());
         assert_eq!(
             with(&outgoing.replace("[[180, 2]]", "[[0, 10]]"))
                 .unwrap_err()

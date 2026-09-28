@@ -1480,7 +1480,7 @@ checksum = "d3c64dab0f7e9471b7ace3b496da79024f44e2f4933ebe39d294d0984f309f3c"
 
 [[package]]
 name = "sashite-sanki-bot"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "hkdf",

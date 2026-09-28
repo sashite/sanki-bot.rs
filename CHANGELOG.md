@@ -9,6 +9,29 @@ Robotto's private body (`sashite-sanki-player-nostr-bot`), renamed and made
 public on 2026-09-28 as the starting point of this crate (ADR-0045 v4). They
 are kept below for the record; `sashite-sanki-bot` starts at 0.1.0.
 
+## [0.3.0] — 2026-09-28
+
+The built-in bot plays blitz and rapid, and the documentation takes anyone
+from nothing to a bot that thinks, in the background, on their own
+computer.
+
+### Changed
+
+- **The built-in bot's caps are `blitz = 1`, `rapid = 1`** (were byōyomi 1,
+  blitz 1): the two cadences the app offers first — a ten-minute challenge
+  to a bot run without a file was refused. Byōyomi stays a configuration
+  away; the capacity rule is unchanged (two games at a time on the free
+  tier).
+- The example LaunchAgent and the example file name `sanki-sei-player`,
+  the engine that thinks, in place of the random engine.
+
+### Added
+
+- **`GUIDE.md`** — running your own bot: the install, the one-command bot,
+  the configuration file and every one of its keys with its default,
+  domain and meaning, the LaunchAgent, the two engines and how to bring
+  yours, and what the usual errors mean. Linked from the README.
+
 ## [0.2.1] — 2026-09-28
 
 ### Fixed

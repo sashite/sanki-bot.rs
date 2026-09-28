@@ -20,7 +20,8 @@ of the organisation: crate **`sashite-<x>`** ↔ repository **`<x>.<lang>`**.
 | The protocol client | ADR-0045 §1, the NIPs of [`sashite/nostr`](https://github.com/sashite/nostr) | [`sanki-client.rs`](https://github.com/sashite/sanki-client.rs) | [`sashite-sanki-client`](https://crates.io/crates/sashite-sanki-client) | the verbs: rule system, relay information, readers, drafts, publisher |
 | **The bot** | ADR-0045 §2–§7 | **`sanki-bot.rs`** (this repository) | **`sashite-sanki-bot`**, binary `sanki-bot` | one identity, one configuration, one SEI engine per game |
 | The engine to fork | SEI, the rules document | [`sanki-sei-random-engine.rs`](https://github.com/sashite/sanki-sei-random-engine.rs) | [`sashite-sanki-sei-random-engine`](https://crates.io/crates/sashite-sanki-sei-random-engine) | a complete SEI engine that plays at random; the students' starting point |
-| The reference brain | ADR-0015 | `sanki-player.rs` | `sashite-sanki-player` | search; wrapped as an SEI engine, the sparring partner |
+| The reference brain | ADR-0015 | [`sanki-player.rs`](https://github.com/sashite/sanki-player.rs) | [`sashite-sanki-player`](https://crates.io/crates/sashite-sanki-player) | search: iterative deepening, alpha-beta, anytime |
+| The engine that thinks | SEI, the rules document | [`sanki-sei-player.rs`](https://github.com/sashite/sanki-sei-player.rs) | [`sashite-sanki-sei-player`](https://crates.io/crates/sashite-sanki-sei-player) | the brain under SEI's clock; the sparring partner |
 
 *Vocabulary.* **Engine** is SEI's word: a process that answers `search` with
 a Move. The rules are `sanki-engine` — a name that predates SEI and is kept;
@@ -65,22 +66,25 @@ imposition, several bots per process, pondering.
 ## Running
 
 ```sh
-cargo install sashite-sanki-bot
-sanki-bot                                          # the built-in bot: random play, until SIGTERM
+cargo install sashite-sanki-bot sashite-sanki-sei-player
+sanki-bot --engine sanki-sei-player                # a bot that thinks, until SIGTERM
+sanki-bot                                          # the built-in bot alone: random play
 ```
 
 That is a bot: on Sashité's relay, open to everyone, playing the three
-variants at random — a key created at the first start, under
+variants in blitz and rapid — a key created at the first start, under
 `~/Library/Application Support/sanki-bot` on macOS (`~/.local/share/sanki-bot`
 elsewhere), its npub in the log. Keep a copy of the key file. Two
 parameters make it yours:
 
 ```sh
-cargo install sashite-sanki-sei-random-engine      # an engine, or none: random play
 sanki-bot --defaults > ~/sanki/kitsune.toml        # the built-in bot, every key at its default
-$EDITOR ~/sanki/kitsune.toml                       # the name, the picture, the caps, the paths
-sanki-bot --config ~/sanki/kitsune.toml --engine sanki-sei-random-engine
+$EDITOR ~/sanki/kitsune.toml                       # the name, the picture, the engine and its depth, the caps
+sanki-bot --config ~/sanki/kitsune.toml
 ```
+
+**[GUIDE.md](GUIDE.md)** takes you from nothing to a bot in the background
+and explains every key of the file.
 
 `--config` overrides the built-in bot key by key (an unknown key is
 refused); `--engine` names the SEI engine — a command and its arguments,
@@ -111,7 +115,8 @@ inequality of ADR-0045 §4.
 
 ## The configuration
 
-One file, read into a `Config` whose types forbid the incoherent cases
+One file, every key explained in [GUIDE.md](GUIDE.md), read into a
+`Config` whose types forbid the incoherent cases
 (ADR-0045 §4): the lists' bounds and intersections, the engine's command
 resolved to an executable and its `cwd` kept away from the data directory
 and the key, the score policies only with an engine, the outgoing time

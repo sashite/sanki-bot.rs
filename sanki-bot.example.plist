@@ -19,9 +19,10 @@
 	<key>Label</key>
 	<string>com.sashite.sanki-bot.kitsune</string>
 
-	<!-- The configuration and the engine are the two parameters; without
-	     the first the built-in bot runs, without the second it plays at
-	     random. The bot is the job's process itself, so that launchd's
+	<!-- The configuration is the one parameter here: the engine is the
+	     file's [engine] table (an --engine flag would replace that whole
+	     table, its options included), by its absolute path — launchd's PATH
+	     is minimal. The bot is the job's process itself, so that launchd's
 	     SIGTERM reaches it (a wrapper such as caffeinate would not pass it
 	     on); a Mac that must not idle-sleep with a game open is set so in
 	     System Settings, Energy. -->
@@ -30,8 +31,6 @@
 		<string>/Users/you/.cargo/bin/sanki-bot</string>
 		<string>--config</string>
 		<string>/Users/you/sanki/kitsune.toml</string>
-		<string>--engine</string>
-		<string>/Users/you/.cargo/bin/sanki-sei-random-engine</string>
 	</array>
 
 	<key>RunAtLoad</key>
