@@ -4,13 +4,16 @@
 //! forbid the incoherent cases. An error is a [`ConfigError`] naming the
 //! key. The file holds no secret.
 //!
-//! **No defaults** except `blocks = []`, the absent cadence families (`0`),
-//! and the absent sections whose absence is a behaviour (`engine`: random
-//! play; `outgoing`, `resign`, `offer_draw`, `accept_draw`: never). Within a
-//! present section, the optional keys are exactly `profile.nip05`,
-//! `engine.args`, `engine.env`, `engine.options` and `engine.strength`;
-//! every other key is required, and an unknown key is refused: a default
-//! is a decision no one made.
+//! **Every key has a default** (ADR-0045 v4.2): the file overrides the
+//! built-in bot — the one `sanki-bot` runs without a file — key by key, and
+//! an unknown key is refused. The built-in bot: Sashité's relay and its
+//! current Rule System ([`DEFAULT_RULES`]), the key and the data under
+//! [`data_root`], named `sanki-bot`, open to everyone, the three variants,
+//! one game per cadence family at five seconds a move, no engine (random
+//! play) — what [`Config::defaults`] yields, and `sanki-bot --defaults`
+//! prints. The absent sections whose absence is a behaviour stay so:
+//! `engine` (random play), `outgoing`, `resign`, `offer_draw`,
+//! `accept_draw` (never).
 //!
 //! What only the engine can tell — an option announced and in its domain,
 //! `strength` announced and within its bounds — is the probe's
@@ -31,6 +34,46 @@ use crate::sei::Launch;
 
 /// The one schema this crate reads.
 const SCHEMA: u64 = 1;
+
+/// The built-in relay: Sashité's.
+pub const DEFAULT_RELAY: &str = "wss://relay.sanki.app";
+
+/// The built-in Rule System: the kind-`3417` event Sashité's app founds
+/// under at this release. A bot under another rule system than the one a
+/// challenge names refuses it (`OtherRules`): after a revision of the
+/// module, configure `connection.rules`, or update the crate.
+pub const DEFAULT_RULES: &str = "000006e9da2118b7fdcdb87e13f0e30b1120676957b0b5ca9932e7b4756f9322";
+
+/// The built-in per-key rate: the relay's free tier.
+pub const DEFAULT_RATE_PER_MINUTE: u32 = 30;
+
+/// Where the built-in bot keeps its key, its data and its engine's working
+/// directory: `~/Library/Application Support/sanki-bot` on macOS,
+/// `$XDG_DATA_HOME/sanki-bot` (else `~/.local/share/sanki-bot`) elsewhere.
+///
+/// # Errors
+///
+/// `HOME` (and `XDG_DATA_HOME`) unset.
+pub fn data_root() -> Result<PathBuf, ConfigError> {
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .ok_or_else(|| {
+                ConfigError::new(
+                    "",
+                    "HOME is not set: set connection.data_dir, identity.file and engine.cwd",
+                )
+            })
+    };
+    if cfg!(target_os = "macos") {
+        return Ok(home()?.join("Library/Application Support/sanki-bot"));
+    }
+    match std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        Some(xdg) if xdg.is_absolute() => Ok(xdg.join("sanki-bot")),
+        _ => Ok(home()?.join(".local/share/sanki-bot")),
+    }
+}
 
 /// Why a configuration is refused: the key, and the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,14 +220,18 @@ pub struct Connection {
 /// `[profile]` (kind `0`; `bot: true` is always written).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
-    /// 1 to 64 characters.
+    /// The handle; 1 to 64 characters.
     pub name: String,
+    /// The name shown; 1 to 64 characters, when set.
+    pub display_name: Option<String>,
     /// 0 to 1,000 characters.
     pub about: String,
-    /// An `https` URL.
-    pub picture: String,
+    /// An `https` URL, when set.
+    pub picture: Option<String>,
     /// `local@domain`, when set.
     pub nip05: Option<String>,
+    /// An `https` URL, when set.
+    pub website: Option<String>,
 }
 
 /// `[engine]`.
@@ -370,17 +417,70 @@ impl Config {
         Self::from_toml(&text)
     }
 
-    /// Reads and checks a TOML text.
+    /// Reads and checks a TOML text: the built-in bot, overridden key by
+    /// key by what the text says.
     ///
     /// # Errors
     ///
     /// The first key that is wrong, as a [`ConfigError`].
     pub fn from_toml(text: &str) -> Result<Self, ConfigError> {
-        let raw: RawConfig = toml::from_str(text).map_err(|e| {
-            let key = e.span().map(|_| String::new()).unwrap_or_default();
-            ConfigError::new(key, e.message().to_owned())
-        })?;
+        Self::try_from(RawConfig::parse(text)?)
+    }
+
+    /// The built-in bot: what an empty file yields.
+    ///
+    /// # Errors
+    ///
+    /// The paths cannot be defaulted ([`data_root`]).
+    pub fn defaults() -> Result<Self, ConfigError> {
+        Self::from_toml("")
+    }
+
+    /// What the command line asks: the file (or the built-in bot), with
+    /// `[engine]` replaced by `argv` when one is given — the command, a
+    /// path or a name in `PATH`, and its arguments — under the section's
+    /// defaults (the working directory under [`data_root`], an empty
+    /// environment, no option, two relaunches, five seconds to launch).
+    ///
+    /// # Errors
+    ///
+    /// The first key that is wrong; an empty `argv`, or a command that is
+    /// not an executable file.
+    pub fn load(file: Option<&Path>, argv: Option<&[String]>) -> Result<Self, ConfigError> {
+        let text = match file {
+            Some(path) => std::fs::read_to_string(path)
+                .map_err(|e| ConfigError::new("", format!("{}: {e}", path.display())))?,
+            None => String::new(),
+        };
+        let mut raw = RawConfig::parse(&text)?;
+        if let Some(argv) = argv {
+            let (command, args) = argv
+                .split_first()
+                .ok_or_else(|| ConfigError::new("engine.command", "empty"))?;
+            raw.engine = Some(RawEngine {
+                command: command.clone(),
+                args: args.to_vec(),
+                ..RawEngine::default()
+            });
+        }
         Self::try_from(raw)
+    }
+
+    /// Creates the directories the bot writes to — the data directory, the
+    /// key's, the engine's working directory — where they do not exist.
+    ///
+    /// # Errors
+    ///
+    /// The directories cannot be created.
+    pub fn prepare(&self) -> std::io::Result<()> {
+        std::fs::create_dir_all(&self.connection.data_dir)?;
+        if let Some(dir) = self.identity_file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if let Some(engine) = &self.engine {
+            std::fs::create_dir_all(&engine.launch.cwd)?;
+        }
+        Ok(())
     }
 
     /// `[connection]`.
@@ -479,10 +579,19 @@ pub fn plies_per_minute(min_move_secs: u64, margin_ms: u64) -> u32 {
 
 // ---- the raw file ----
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Every key defaults to the built-in bot's (the `Default` impls below);
+// a path left empty is resolved under `data_root()` at conversion.
+
+impl RawConfig {
+    fn parse(text: &str) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|e| ConfigError::new("", e.message().to_owned()))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 struct RawConfig {
-    schema: u64,
+    schema: Option<u64>,
     connection: RawConnection,
     identity: RawIdentity,
     profile: RawProfile,
@@ -492,7 +601,7 @@ struct RawConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawConnection {
     relay: String,
     rules: String,
@@ -500,47 +609,97 @@ struct RawConnection {
     rate_per_minute: u32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl Default for RawConnection {
+    fn default() -> Self {
+        Self {
+            relay: DEFAULT_RELAY.to_owned(),
+            rules: DEFAULT_RULES.to_owned(),
+            data_dir: PathBuf::new(),
+            rate_per_minute: DEFAULT_RATE_PER_MINUTE,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 struct RawIdentity {
     file: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawProfile {
     name: String,
+    display_name: Option<String>,
     about: String,
-    picture: String,
+    picture: Option<String>,
     nip05: Option<String>,
+    website: Option<String>,
+}
+
+impl Default for RawProfile {
+    fn default() -> Self {
+        Self {
+            name: "sanki-bot".to_owned(),
+            display_name: None,
+            about: "A Sanki bot (sashite-sanki-bot).".to_owned(),
+            picture: None,
+            nip05: None,
+            website: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawEngine {
     command: String,
-    #[serde(default)]
     args: Vec<String>,
     cwd: PathBuf,
-    #[serde(default)]
     env: BTreeMap<String, String>,
-    #[serde(default)]
     options: BTreeMap<String, toml::Value>,
     strength: Option<i64>,
     max_relaunches_per_game: u8,
     launch_ms: u64,
 }
 
+impl Default for RawEngine {
+    fn default() -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            cwd: PathBuf::new(),
+            env: BTreeMap::new(),
+            options: BTreeMap::new(),
+            strength: None,
+            max_relaunches_per_game: 2,
+            launch_ms: 5000,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawChallenges {
     policy: String,
     follows: Option<Vec<String>>,
     max_delta: Option<u32>,
     rating_authority: Option<String>,
-    #[serde(default)]
     blocks: Vec<String>,
     outgoing: Option<RawOutgoing>,
+}
+
+impl Default for RawChallenges {
+    fn default() -> Self {
+        Self {
+            policy: "everyone".to_owned(),
+            follows: None,
+            max_delta: None,
+            rating_authority: None,
+            blocks: Vec::new(),
+            outgoing: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,7 +714,7 @@ struct RawOutgoing {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawPlay {
     variants: Vec<String>,
     preferred: String,
@@ -568,6 +727,25 @@ struct RawPlay {
     accept_draw: Option<RawAcceptDraw>,
 }
 
+impl Default for RawPlay {
+    fn default() -> Self {
+        let all = || ["chess", "ogi", "xiongqi"].map(str::to_owned).to_vec();
+        Self {
+            variants: all(),
+            preferred: "chess".to_owned(),
+            opponents: all(),
+            min_move_secs: 5,
+            margin_ms: 300,
+            max_concurrent: RawCaps::default(),
+            resign: None,
+            offer_draw: None,
+            accept_draw: None,
+        }
+    }
+}
+
+// The one table that is not overridden key by key: given, it says what is
+// played — a family left out is 0. Absent, the built-in bot's.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawCaps {
@@ -575,6 +753,17 @@ struct RawCaps {
     blitz: Option<u32>,
     rapid: Option<u32>,
     correspondence: Option<u32>,
+}
+
+impl Default for RawCaps {
+    fn default() -> Self {
+        Self {
+            byoyomi: Some(1),
+            blitz: Some(1),
+            rapid: None,
+            correspondence: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -667,21 +856,21 @@ fn absolute(key: &str, path: &Path) -> Result<PathBuf, ConfigError> {
     Ok(path.to_owned())
 }
 
-/// Resolves `command`: an absolute path, or a name looked up in the bot's
-/// own `PATH` at start; either way an existing, executable file.
+/// Resolves `command`: a path (a relative one from the current directory,
+/// made absolute), or a name looked up in the bot's own `PATH` at start;
+/// either way an existing, executable file.
 fn resolve_command(command: &str) -> Result<PathBuf, ConfigError> {
     let key = "engine.command";
     let candidates: Vec<PathBuf> = if Path::new(command).is_absolute() {
         vec![PathBuf::from(command)]
     } else if command.contains('/') {
-        return Err(ConfigError::new(
-            key,
-            "a relative path; give an absolute one or a bare name in PATH",
-        ));
+        vec![std::fs::canonicalize(command)
+            .map_err(|e| ConfigError::new(key, format!("{command:?}: {e}")))?]
     } else {
         std::env::var_os("PATH")
             .map(|paths| {
                 std::env::split_paths(&paths)
+                    .filter(|dir| dir.is_absolute())
                     .map(|dir| dir.join(command))
                     .collect()
             })
@@ -722,14 +911,93 @@ fn period(key: &str, row: &[u64]) -> Result<[Option<u64>; 3], ConfigError> {
     }
 }
 
+/// `[engine]`, checked against the data directory and the key's.
+fn engine(
+    raw_engine: RawEngine,
+    data_dir: &Path,
+    identity_file: &Path,
+) -> Result<EngineConfig, ConfigError> {
+    if raw_engine.command.is_empty() {
+        return Err(ConfigError::new("engine.command", "empty"));
+    }
+    let command = resolve_command(&raw_engine.command)?;
+    let cwd = if raw_engine.cwd.as_os_str().is_empty() {
+        data_root()?.join("engine")
+    } else {
+        absolute("engine.cwd", &raw_engine.cwd)?
+    };
+    if cwd.starts_with(data_dir) {
+        return Err(ConfigError::new(
+            "engine.cwd",
+            format!("{} is under connection.data_dir", cwd.display()),
+        ));
+    }
+    if let Some(key_dir) = identity_file.parent() {
+        if cwd == key_dir || cwd.starts_with(key_dir) && key_dir != Path::new("/") {
+            return Err(ConfigError::new(
+                "engine.cwd",
+                format!("{} is in the directory of identity.file", cwd.display()),
+            ));
+        }
+    }
+    let mut env = Vec::with_capacity(raw_engine.env.len());
+    for (name, value) in &raw_engine.env {
+        if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
+            return Err(ConfigError::new(
+                format!("engine.env.{name}"),
+                "not a variable name",
+            ));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(ConfigError::new(
+                format!("engine.env.{name}"),
+                "control characters",
+            ));
+        }
+        env.push((name.clone(), value.clone()));
+    }
+    let mut options = BTreeMap::new();
+    for (name, value) in &raw_engine.options {
+        let scalar = match value {
+            toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
+            toml::Value::Integer(i) => serde_json::Value::from(*i),
+            toml::Value::String(s) => serde_json::Value::from(s.as_str()),
+            _ => {
+                return Err(ConfigError::new(
+                    format!("engine.options.{name}"),
+                    "a bool, an integer or a string",
+                ))
+            }
+        };
+        options.insert(name.clone(), scalar);
+    }
+    Ok(EngineConfig {
+        launch: Launch {
+            command,
+            args: raw_engine.args,
+            cwd,
+            env,
+        },
+        options,
+        strength: raw_engine.strength,
+        max_relaunches_per_game: within(
+            "engine.max_relaunches_per_game",
+            raw_engine.max_relaunches_per_game,
+            0,
+            10,
+        )?,
+        launch_ms: within("engine.launch_ms", raw_engine.launch_ms, 1000, 60_000)?,
+    })
+}
+
 impl TryFrom<RawConfig> for Config {
     type Error = ConfigError;
 
     fn try_from(raw: RawConfig) -> Result<Self, Self::Error> {
-        if raw.schema != SCHEMA {
+        if let Some(schema) = raw.schema.filter(|s| *s != SCHEMA) {
             return Err(ConfigError::new(
                 "schema",
-                format!("{} is not the schema this bot reads ({SCHEMA})", raw.schema),
+                format!("{schema} is not the schema this bot reads ({SCHEMA})"),
             ));
         }
 
@@ -738,7 +1006,11 @@ impl TryFrom<RawConfig> for Config {
             .map_err(|e| ConfigError::new("connection.relay", e.to_string()))?;
         let rules = EventId::from_hex(&raw.connection.rules)
             .map_err(|_| ConfigError::new("connection.rules", "not a 64-hex event id"))?;
-        let data_dir = absolute("connection.data_dir", &raw.connection.data_dir)?;
+        let data_dir = if raw.connection.data_dir.as_os_str().is_empty() {
+            data_root()?.join("data")
+        } else {
+            absolute("connection.data_dir", &raw.connection.data_dir)?
+        };
         let rate_per_minute = within(
             "connection.rate_per_minute",
             raw.connection.rate_per_minute,
@@ -753,7 +1025,11 @@ impl TryFrom<RawConfig> for Config {
         };
 
         // [identity]
-        let identity_file = absolute("identity.file", &raw.identity.file)?;
+        let identity_file = if raw.identity.file.as_os_str().is_empty() {
+            data_root()?.join("identity/key.nsec")
+        } else {
+            absolute("identity.file", &raw.identity.file)?
+        };
 
         // [profile]
         let name_len = raw.profile.name.chars().count();
@@ -766,8 +1042,23 @@ impl TryFrom<RawConfig> for Config {
                 "at most 1,000 characters",
             ));
         }
-        if !raw.profile.picture.starts_with("https://") || raw.profile.picture.len() < 9 {
-            return Err(ConfigError::new("profile.picture", "an https URL"));
+        if let Some(display_name) = &raw.profile.display_name {
+            if !(1..=64).contains(&display_name.chars().count()) {
+                return Err(ConfigError::new(
+                    "profile.display_name",
+                    "1 to 64 characters",
+                ));
+            }
+        }
+        for (key, url) in [
+            ("profile.picture", &raw.profile.picture),
+            ("profile.website", &raw.profile.website),
+        ] {
+            if let Some(url) = url {
+                if !url.starts_with("https://") || url.len() < 9 {
+                    return Err(ConfigError::new(key, "an https URL"));
+                }
+            }
         }
         if let Some(nip05) = &raw.profile.nip05 {
             let well_formed = nip05.split_once('@').is_some_and(|(local, domain)| {
@@ -782,83 +1073,17 @@ impl TryFrom<RawConfig> for Config {
         }
         let profile = Profile {
             name: raw.profile.name,
+            display_name: raw.profile.display_name,
             about: raw.profile.about,
             picture: raw.profile.picture,
             nip05: raw.profile.nip05,
+            website: raw.profile.website,
         };
 
         // [engine]
         let engine = match raw.engine {
             None => None,
-            Some(raw_engine) => {
-                let command = resolve_command(&raw_engine.command)?;
-                let cwd = absolute("engine.cwd", &raw_engine.cwd)?;
-                if !cwd.is_dir() {
-                    return Err(ConfigError::new(
-                        "engine.cwd",
-                        format!("{} is not an existing directory", cwd.display()),
-                    ));
-                }
-                if cwd.starts_with(&connection.data_dir) {
-                    return Err(ConfigError::new("engine.cwd", "under connection.data_dir"));
-                }
-                if let Some(key_dir) = identity_file.parent() {
-                    if cwd == key_dir || cwd.starts_with(key_dir) && key_dir != Path::new("/") {
-                        return Err(ConfigError::new(
-                            "engine.cwd",
-                            "in the directory of identity.file",
-                        ));
-                    }
-                }
-                let mut env = Vec::with_capacity(raw_engine.env.len());
-                for (name, value) in &raw_engine.env {
-                    if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
-                        return Err(ConfigError::new(
-                            format!("engine.env.{name}"),
-                            "not a variable name",
-                        ));
-                    }
-                    if value.chars().any(char::is_control) {
-                        return Err(ConfigError::new(
-                            format!("engine.env.{name}"),
-                            "control characters",
-                        ));
-                    }
-                    env.push((name.clone(), value.clone()));
-                }
-                let mut options = BTreeMap::new();
-                for (name, value) in &raw_engine.options {
-                    let scalar = match value {
-                        toml::Value::Boolean(b) => serde_json::Value::Bool(*b),
-                        toml::Value::Integer(i) => serde_json::Value::from(*i),
-                        toml::Value::String(s) => serde_json::Value::from(s.as_str()),
-                        _ => {
-                            return Err(ConfigError::new(
-                                format!("engine.options.{name}"),
-                                "a bool, an integer or a string",
-                            ))
-                        }
-                    };
-                    options.insert(name.clone(), scalar);
-                }
-                Some(EngineConfig {
-                    launch: Launch {
-                        command,
-                        args: raw_engine.args,
-                        cwd,
-                        env,
-                    },
-                    options,
-                    strength: raw_engine.strength,
-                    max_relaunches_per_game: within(
-                        "engine.max_relaunches_per_game",
-                        raw_engine.max_relaunches_per_game,
-                        0,
-                        10,
-                    )?,
-                    launch_ms: within("engine.launch_ms", raw_engine.launch_ms, 1000, 60_000)?,
-                })
-            }
+            Some(raw_engine) => Some(engine(raw_engine, &connection.data_dir, &identity_file)?),
         };
 
         // [play]
@@ -1224,17 +1449,116 @@ margin_ms     = 300
     }
 
     #[test]
-    fn unknown_keys_and_missing_keys_are_refused() {
+    fn unknown_keys_are_refused_and_missing_keys_default() {
         let err = replaced(
             "min_move_secs = 5\n",
             "min_move_secs = 5\nthinking = true\n",
         )
         .unwrap_err();
         assert!(err.reason.contains("thinking"), "{err}");
-        let err = replaced("min_move_secs = 5\n", "").unwrap_err();
-        assert!(err.reason.contains("min_move_secs"), "{err}");
+        // A key left out takes its default.
+        let config = replaced("min_move_secs = 5\n", "").unwrap();
+        assert_eq!(config.play().min_move_secs, 5);
         let err = replaced("schema = 1", "schema = 2").unwrap_err();
         assert_eq!(err.key, "schema");
+    }
+
+    #[test]
+    fn the_built_in_bot_is_the_example_and_an_empty_file() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/sanki-bot.example.toml"
+        ))
+        .unwrap();
+        let example = Config::from_toml(&text).unwrap();
+        let defaults = Config::defaults().unwrap();
+        assert_eq!(example, defaults);
+        assert_eq!(Config::from_toml("").unwrap(), defaults);
+        assert_eq!(defaults.connection().relay.to_string(), DEFAULT_RELAY);
+        assert_eq!(defaults.connection().rules.to_hex(), DEFAULT_RULES);
+        assert_eq!(defaults.profile().name, "sanki-bot");
+        assert_eq!(defaults.profile().picture, None);
+        assert!(defaults.engine().is_none());
+        assert_eq!(defaults.play().total_cap(), 2);
+        // The paths, under the data root.
+        let root = data_root().unwrap();
+        assert_eq!(defaults.connection().data_dir, root.join("data"));
+        assert_eq!(defaults.identity_file(), root.join("identity/key.nsec"));
+        // A section given overrides only what it says — but the caps table
+        // says what is played: a family left out of it is 0.
+        let config = Config::from_toml("[profile]\nname = \"kitsune\"\n").unwrap();
+        assert_eq!(config.profile().name, "kitsune");
+        assert_eq!(config.profile().about, defaults.profile().about);
+        let config = Config::from_toml("[play.max_concurrent]\nblitz = 2\n").unwrap();
+        assert_eq!(config.play().cap(Cadence::Blitz), 2);
+        assert_eq!(config.play().cap(Cadence::Byoyomi), 0);
+    }
+
+    #[test]
+    fn the_engine_from_the_command_line() {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let argv = vec![sh.clone(), "-c".to_owned(), "cat".to_owned()];
+        let config = Config::load(None, Some(&argv)).unwrap();
+        let engine = config.engine().unwrap();
+        assert_eq!(engine.launch.command, PathBuf::from(&sh));
+        assert_eq!(engine.launch.args, vec!["-c", "cat"]);
+        assert_eq!(engine.launch.cwd, data_root().unwrap().join("engine"));
+        assert_eq!(engine.max_relaunches_per_game, 2);
+        assert_eq!(engine.launch_ms, 5000);
+        // A name in PATH.
+        let config = Config::load(None, Some(&["sh".to_owned()])).unwrap();
+        assert!(config.engine().unwrap().launch.command.is_absolute());
+        let err = Config::load(None, Some(&["no-such-engine-anywhere".to_owned()])).unwrap_err();
+        assert_eq!(err.key, "engine.command");
+        assert_eq!(
+            Config::load(None, Some(&[])).unwrap_err().key,
+            "engine.command"
+        );
+        // A file's score policies, with the engine from the command line.
+        let dir = std::env::temp_dir().join(format!("sanki-bot-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("bot.toml");
+        std::fs::write(
+            &file,
+            "[play.resign]\nmax_win = 20\nmin_loss = 900\nstreak = 3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load(Some(&file), None).unwrap_err().key,
+            "play.resign"
+        );
+        let config = Config::load(Some(&file), Some(&argv)).unwrap();
+        assert!(config.play().resign.is_some());
+        assert_eq!(config.engine().unwrap().launch.args, vec!["-c", "cat"]);
+        // A file's own [engine] is replaced whole.
+        std::fs::write(&file, "[engine]\ncommand = \"nowhere\"\nlaunch_ms = 9000\n").unwrap();
+        let config = Config::load(Some(&file), Some(&argv)).unwrap();
+        assert_eq!(config.engine().unwrap().launch_ms, 5000);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_profile_fields() {
+        let config = Config::from_toml(
+            "[profile]\nname = \"kitsune\"\ndisplay_name = \"Kitsune\"\npicture = \"https://example.com/k.png\"\nnip05 = \"kitsune@sanki.app\"\nwebsite = \"https://chess.page/\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.profile().display_name.as_deref(), Some("Kitsune"));
+        assert_eq!(
+            config.profile().website.as_deref(),
+            Some("https://chess.page/")
+        );
+        for (text, key) in [
+            (
+                "[profile]\nwebsite = \"http://chess.page/\"\n",
+                "profile.website",
+            ),
+            ("[profile]\npicture = \"ftp://x\"\n", "profile.picture"),
+            ("[profile]\ndisplay_name = \"\"\n", "profile.display_name"),
+            ("[profile]\nnip05 = \"kitsune\"\n", "profile.nip05"),
+        ] {
+            assert_eq!(Config::from_toml(text).unwrap_err().key, key, "{text}");
+        }
     }
 
     #[test]
@@ -1579,25 +1903,6 @@ margin_ms     = 300
             .key,
             "play.max_concurrent"
         );
-    }
-
-    #[test]
-    fn the_example_file_reads() {
-        // The shipped example, with its `[engine]` section taken out (its
-        // command is not on this machine) — and with it, refused for that.
-        let text = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/sanki-bot.example.toml"
-        ))
-        .unwrap();
-        let start = text.find("[engine]").unwrap();
-        let end = text.find("[challenges]").unwrap();
-        let without_engine = format!("{}{}", &text[..start], &text[end..]);
-        let config = Config::from_toml(&without_engine).unwrap();
-        assert_eq!(config.profile().name, "kitsune");
-        if !Path::new("/usr/local/bin/sanki-sei-random-engine").exists() {
-            assert_eq!(Config::from_toml(&text).unwrap_err().key, "engine.command");
-        }
     }
 
     #[test]

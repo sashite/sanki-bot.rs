@@ -9,6 +9,47 @@ Robotto's private body (`sashite-sanki-player-nostr-bot`), renamed and made
 public on 2026-09-28 as the starting point of this crate (ADR-0045 v4). They
 are kept below for the record; `sashite-sanki-bot` starts at 0.1.0.
 
+## [0.2.0] — 2026-09-28
+
+The bot anyone runs: `sanki-bot`, and it plays. ADR-0045 v4.2: the
+configuration becomes optional, the engine a parameter.
+
+### Added
+
+- **`sanki-bot [--config FILE] [--engine 'COMMAND ARGS…']`.** Without
+  `--config`, the built-in bot runs; `--engine` names the SEI engine — a
+  path or a name in `PATH`, its arguments after spaces — in place of the
+  file's `[engine]`, under that section's defaults (`Config::load`; the
+  file's score policies stand with it). `--defaults` prints
+  the built-in bot as a commented file (the shipped
+  `sanki-bot.example.toml`, which a test keeps equal to it); `--version`,
+  `--help`.
+- **Every key has a default** — the built-in bot's: Sashité's relay and
+  its current Rule System (`config::DEFAULT_RULES`), the free tier's rate,
+  named `sanki-bot`, open to everyone, the three variants, one byōyomi and
+  one blitz game at five seconds a move, no engine. A file overrides them
+  key by key; an unknown key is still refused. The paths default under a
+  **data root** (`config::data_root`: `~/Library/Application
+  Support/sanki-bot` on macOS, `$XDG_DATA_HOME/sanki-bot` or
+  `~/.local/share/sanki-bot` elsewhere): `data/`, `identity/key.nsec`,
+  `engine/`; the bot creates the directories it writes to
+  (`Config::prepare`).
+- **The key, at the first start.** A key file that does not exist is
+  created then (`0600`), the npub logged at `warn` with the file to keep
+  a copy of. `--generate-identity` is gone.
+- **`[profile]`**: `display_name`, `website`, and `picture` now optional —
+  the fields the Robotto's profiles carry, so that a bot's kind 0 can
+  be complete.
+- `sanki-bot.example.plist`: a macOS LaunchAgent, one per bot.
+
+### Changed
+
+- `engine.command` accepts a relative path with a slash (made absolute
+  from the current directory); `engine.cwd` no longer has to exist — the
+  bot creates it.
+- The Docker image runs `sanki-bot --config /etc/sanki/bot.toml`, with
+  `HOME` at the volume for the built-in paths.
+
 ## [0.1.1] — 2026-09-28
 
 ### Added

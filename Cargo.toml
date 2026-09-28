@@ -1,6 +1,6 @@
 [package]
 name = "sashite-sanki-bot"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -12,7 +12,7 @@ categories = ["games", "command-line-utilities"]
 exclude = ["/.github", "/deny.toml", "/Dockerfile"]
 description = "A Sanki bot for Sashité (ADR-0045): one identity, one TOML configuration, one SEI engine as a child process per game — or random play without one. Over the Nostr protocol client `sashite-sanki-client`: it answers and sends Direct Challenges under a Challenge Policy, founds, plays and concludes self-timed sessions with the verdict the rule system yields, offers, accepts and resigns on the engine's scores."
 
-# One bot in one process: `sanki-bot CONFIG.toml` (ADR-0045 §7).
+# One bot in one process: `sanki-bot [--config FILE] [--engine ARGV]` (ADR-0045 §7).
 [[bin]]
 name = "sanki-bot"
 path = "src/bin/sanki-bot.rs"

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The standing events (ADR-0045 §7 *Standing events*): the profile (kind
-//! `0`, `bot: true`, `nip05` when configured), the Challenge Policy (kind
-//! `30420`, `d = sanki`), under `following` the contact list (kind `3`,
+//! `0`, `bot: true`, the optional fields when configured), the Challenge
+//! Policy (kind `30420`, `d = sanki`), under `following` the contact list (kind `3`,
 //! equal to `follows`), and the mute list (kind `10000`, equal to `blocks`;
 //! an empty list published only to replace a non-empty one). Each is
 //! compared with the relay's copy, read as `Found` or `ConfirmedAbsent`,
@@ -63,10 +63,16 @@ pub fn metadata(config: &Config) -> Map<String, Value> {
     let mut map = Map::new();
     map.insert("name".to_owned(), Value::String(profile.name.clone()));
     map.insert("about".to_owned(), Value::String(profile.about.clone()));
-    map.insert("picture".to_owned(), Value::String(profile.picture.clone()));
     map.insert("bot".to_owned(), Value::Bool(true));
-    if let Some(nip05) = &profile.nip05 {
-        map.insert("nip05".to_owned(), Value::String(nip05.clone()));
+    for (key, value) in [
+        ("display_name", &profile.display_name),
+        ("picture", &profile.picture),
+        ("nip05", &profile.nip05),
+        ("website", &profile.website),
+    ] {
+        if let Some(value) = value {
+            map.insert(key.to_owned(), Value::String(value.clone()));
+        }
     }
     map
 }

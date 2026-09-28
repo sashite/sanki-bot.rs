@@ -66,12 +66,29 @@ imposition, several bots per process, pondering.
 
 ```sh
 cargo install sashite-sanki-bot
-cargo install sashite-sanki-sei-random-engine      # an engine, or none: random play
-cp sanki-bot.example.toml ~/sanki/kitsune.toml     # outside every repository
-$EDITOR ~/sanki/kitsune.toml                       # the relay, the rules, the engine, the policy, the caps
-sanki-bot --generate-identity ~/sanki/kitsune.toml # writes the key file (0600), prints the npub
-sanki-bot ~/sanki/kitsune.toml                     # until SIGTERM
+sanki-bot                                          # the built-in bot: random play, until SIGTERM
 ```
+
+That is a bot: on Sashité's relay, open to everyone, playing the three
+variants at random — a key created at the first start, under
+`~/Library/Application Support/sanki-bot` on macOS (`~/.local/share/sanki-bot`
+elsewhere), its npub in the log. Keep a copy of the key file. Two
+parameters make it yours:
+
+```sh
+cargo install sashite-sanki-sei-random-engine      # an engine, or none: random play
+sanki-bot --defaults > ~/sanki/kitsune.toml        # the built-in bot, every key at its default
+$EDITOR ~/sanki/kitsune.toml                       # the name, the picture, the caps, the paths
+sanki-bot --config ~/sanki/kitsune.toml --engine sanki-sei-random-engine
+```
+
+`--config` overrides the built-in bot key by key (an unknown key is
+refused); `--engine` names the SEI engine — a command and its arguments,
+separated by spaces (a path with a space goes in the file's `[engine]`),
+a path or a name in `PATH` — in place of the file's `[engine]`. Another
+bot is another file: its own name, its own key and data (the paths under
+`[connection]` and `[identity]`, and `engine.cwd` if the engine writes
+files), its own process.
 
 `RUST_LOG` filters the log (`info` by default). The key never leaves its
 file: no environment variable, since the engine — a child process — would
@@ -80,15 +97,28 @@ inherit it. The start refuses a relay that is not self-timed (its NIP-11
 mining would stamp stale, a person's key, and a read the relay does not
 answer — nothing is written on an unknown state.
 
+**In the background, on macOS.** `sanki-bot.example.plist` is a LaunchAgent:
+started at login, restarted when it exits. Copy it, replace `kitsune` and
+`/Users/you`, `mkdir -p ~/Library/Logs/sanki-bot`, then
+`launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.sashite.sanki-bot.kitsune.plist`.
+One file per bot.
+
+**The rate.** A key plays under the relay's per-key limit (30 events a
+minute on Sashité's free tier): at five seconds a move that is two games
+at a time (`[play.max_concurrent]`); the bot refuses a configuration
+that asks for more than its `rate_per_minute` allows — the capacity
+inequality of ADR-0045 §4.
+
 ## The configuration
 
-One file, `schema = 1`, read into a `Config` whose types forbid the
-incoherent cases (ADR-0045 §4): the lists' bounds and intersections, the
-engine's command resolved to an executable and its `cwd` kept away from the
-data directory and the key, the score policies only with an engine, the
-outgoing time control playable by the per-move share rule, and the
-**capacity inequality** — the caps against the relay's rate limit. See
-`sanki-bot.example.toml`, every key commented.
+One file, read into a `Config` whose types forbid the incoherent cases
+(ADR-0045 §4): the lists' bounds and intersections, the engine's command
+resolved to an executable and its `cwd` kept away from the data directory
+and the key, the score policies only with an engine, the outgoing time
+control playable by the per-move share rule, and the **capacity
+inequality** — the caps against the relay's rate limit. Every key has a
+default, the built-in bot's; `sanki-bot.example.toml` is that bot, every
+key commented — what `sanki-bot --defaults` prints.
 
 ## Development
 
