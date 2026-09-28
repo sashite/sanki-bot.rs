@@ -184,7 +184,11 @@ pub async fn prepared(relay: &MiniRelay, keys: &Keys, spec: &Spec<'_>) -> Prepar
     let client = Client::builder()
         .notification_channel_size(sashite_sanki_bot::bot::NOTIFICATION_CHANNEL)
         .build();
-    client.add_relay(&relay.url).await.unwrap();
+    client
+        .add_relay(&relay.url)
+        .retry_interval(sashite_sanki_bot::bot::RECONNECT_INTERVAL)
+        .await
+        .unwrap();
     client.connect().and_wait(Duration::from_secs(5)).await;
     let oracle: SharedOracle = Arc::new(Mutex::new(Box::new(Native) as Box<dyn Oracle + Send>));
     let describe = module::describe(&mut Native).unwrap();

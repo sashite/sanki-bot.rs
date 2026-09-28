@@ -47,6 +47,11 @@ use crate::sei::{self, Host, Needs, Probe, ProbeError};
 /// How long the relay gets to connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How soon the client tries again after losing the relay: a blitz game
+/// waits on it (the client backs off from there, up to a minute, while
+/// the relay stays away).
+pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The relay client's notification channel: the events of a rebuild (up
 /// to six hundred half-moves per open session, the closed sessions'
 /// Conclusions) and of a live replay, without a lag.
@@ -188,6 +193,7 @@ impl Bot {
             .build();
         client
             .add_relay(connection.relay.clone())
+            .retry_interval(RECONNECT_INTERVAL)
             .await
             .map_err(|e| StartError::Connect(e.to_string()))?;
         client.connect().and_wait(CONNECT_TIMEOUT).await;

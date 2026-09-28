@@ -3,7 +3,7 @@
 //! concurrent games at the capacity limit under the relay's rate limit; an
 //! engine that dies at every turn; a clock skew under the relay's strict
 //! window, small and large, both ways; a `kill -9` with a Ply in transit,
-//! followed by an immediate restart.
+//! followed by an immediate restart; a network cut and a relay restart.
 
 #![allow(
     clippy::unwrap_used,
@@ -571,4 +571,106 @@ async fn a_kill_with_a_ply_in_transit_and_an_immediate_restart_repeat_nothing() 
     stop.store(true, Ordering::Relaxed);
     let _ = opponent.await;
     second.stop().await;
+}
+
+/// The bot's Plies on `session`: the relay's `(step, content)` pairs, in
+/// stamp order — a step twice is a repeated content.
+fn bot_ply_contents(
+    stored: &[serde_json::Value],
+    me: &PublicKey,
+    session: &str,
+) -> Vec<(u64, String)> {
+    of_kind(stored, 3423, me)
+        .into_iter()
+        .filter(|e| {
+            e["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t[0] == "e" && t[1] == session)
+        })
+        .map(|e| {
+            (
+                step_of(e).parse().unwrap(),
+                e["content"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_network_cut_and_a_relay_restart_lose_no_step() {
+    let relay = Arc::new(MiniRelay::start().await);
+    relay.set_window(Some(Window::REFERENCE)).await;
+    let me = Keys::generate();
+    let spec = Spec::new("tenacity", everyone(), String::new());
+    let bot = run_bot(&relay, &me, &spec).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let person = Keys::generate();
+    let (session, terms, seat) = founded(&relay, &me.public_key(), &person, 120).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let opponent = instant_opponent(
+        Arc::clone(&relay),
+        person,
+        terms,
+        session.created_at.as_secs(),
+        seat,
+        Arc::clone(&stop),
+    );
+    let id = session.id.to_hex();
+    let plies = |s: &[serde_json::Value]| bot_plies(s, &me.public_key(), &id).len();
+    let _ = wait_for(&relay, 30, |s| plies(s) >= 2).await;
+
+    // Two cuts of four seconds, each as the opponent has just moved: the
+    // bot either saw the Ply — and its answer, paced, waits in the
+    // publisher's queue for the relay, stamped at the reconnection — or
+    // sees it only once reconnected. The opponent keeps moving on the
+    // relay's side of the wire.
+    for _ in 0..2 {
+        let before = plies(&relay.stored().await);
+        let _ = wait_for(&relay, 30, |s| plies(s) > before).await;
+        let opponent_plies = |s: &[serde_json::Value]| {
+            stamps_by_step(s, &id)
+                .keys()
+                .filter(|(pubkey, _)| *pubkey != me.public_key().to_hex())
+                .count()
+        };
+        let theirs = opponent_plies(&relay.stored().await);
+        let _ = wait_for(&relay, 30, |s| opponent_plies(s) > theirs).await;
+        relay.cut().await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        relay.restore().await;
+        // Reconnected, and the game goes on: two more of the bot's.
+        let _ = wait_for(&relay, 40, |s| plies(s) >= before + 3).await;
+    }
+
+    // The relay restarts: every connection and subscription lost at once,
+    // the store kept. The client reconnects and subscribes again.
+    let before = plies(&relay.stored().await);
+    relay.cut().await;
+    relay.restore().await;
+    let stored = wait_for(&relay, 40, |s| plies(s) >= before + 3).await;
+
+    // One content per step, every step once, nothing rejected; the game
+    // not lost on time — no Conclusion at all while the opponent plays.
+    let contents = bot_ply_contents(&stored, &me.public_key(), &id);
+    let steps: Vec<u64> = contents.iter().map(|(step, _)| *step).collect();
+    let mut sorted = steps.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), steps.len(), "a step twice: {contents:?}");
+    assert_eq!(sorted, (1..=sorted.len() as u64).collect::<Vec<_>>());
+    // Two before, one more before each cut, two after each, three after
+    // the restart.
+    assert!(sorted.len() >= 11, "{sorted:?}");
+    assert!(
+        bot_rejections(&relay, &me.public_key()).await.is_empty(),
+        "{:?}",
+        bot_rejections(&relay, &me.public_key()).await
+    );
+    assert!(of_kind(&stored, 3425, &me.public_key()).is_empty());
+    stop.store(true, Ordering::Relaxed);
+    let _ = opponent.await;
+    bot.stop().await;
 }

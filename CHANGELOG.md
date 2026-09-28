@@ -9,6 +9,25 @@ Robotto's private body (`sashite-sanki-player-nostr-bot`), renamed and made
 public on 2026-09-28 as the starting point of this crate (ADR-0045 v4). They
 are kept below for the record; `sashite-sanki-bot` starts at 0.1.0.
 
+## [0.1.1] — 2026-09-28
+
+### Added
+
+- **A network cut and a relay restart** (ADR-0045 §9), in `tests/nine.rs`:
+  two four-second cuts as the opponent has just moved — the bot's paced
+  answer waiting in the publisher's queue, stamped at the reconnection —
+  then every connection and subscription lost at once; one content per
+  step, every step once, nothing rejected, nothing conceded. On
+  `sashite-sanki-client` 0.1.2 (`MiniRelay::cut`), whose publisher signs
+  and sends nothing while the relay is away.
+
+### Changed
+
+- **The reconnection.** The relay is retried five seconds after a loss
+  (`bot::RECONNECT_INTERVAL`; ±3 s of the client's
+  jitter), the client's ten halved: a blitz game waits on it. The client
+  backs off from there, up to a minute, while the relay stays away.
+
 ## [0.1.0] — 2026-09-28
 
 The first release of the crate ADR-0045 v4 describes: one bot in one

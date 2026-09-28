@@ -1,6 +1,6 @@
 [package]
 name = "sashite-sanki-bot"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.96"
 license = "Apache-2.0"
@@ -41,7 +41,7 @@ futures-util = "0.3"
 # The protocol client (ADR-0045 §1): the rule system and its module, the
 # session views, the notation, the relay's information, the readers, the
 # drafts, the Publisher, the proven query.
-sashite-sanki-client = "0.1"
+sashite-sanki-client = "0.1.2"
 # The SEI host (ADR-0045 §3): killing the engine's process group, through a
 # safe wrapper (the crate forbids `unsafe`).
 nix = { version = "0.30", features = ["signal"] }
@@ -58,7 +58,7 @@ zeroize = "1"
 sashite-sanki-engine = "0.12"
 # The in-process relay, the reference module's native face and the signed
 # suite events the bot's tests drive the client with.
-sashite-sanki-client = { version = "0.1", features = ["testing"] }
+sashite-sanki-client = { version = "0.1.2", features = ["testing"] }
 
 [lints.rust]
 unsafe_code = "forbid"

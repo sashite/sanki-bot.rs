@@ -1480,7 +1480,7 @@ checksum = "d3c64dab0f7e9471b7ace3b496da79024f44e2f4933ebe39d294d0984f309f3c"
 
 [[package]]
 name = "sashite-sanki-bot"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "futures-util",
  "hkdf",
@@ -1502,9 +1502,9 @@ dependencies = [
 
 [[package]]
 name = "sashite-sanki-client"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8df5ad8635079fa27f76961fb778d0f659dceb4338e5bee49be3c8a75c9ceba5"
+checksum = "ccac989350f34cbba80af60106212806fa663b02f64cb396c2ab3b2e2d187533"
 dependencies = [
  "anyhow",
  "futures-util",
